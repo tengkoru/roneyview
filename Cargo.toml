@@ -1,0 +1,38 @@
+[package]
+name = "roneyview"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Penampil gambar cepat bergaya Honeyview untuk Linux (folder, ZIP/CBZ)"
+license = "MIT"
+
+[features]
+# dialogs: dialog berkas GTK3            (butuh libgtk-3-dev saat kompilasi)
+# heif:    AVIF + HEIC/HEIF lewat libheif (butuh libheif-dev >= 1.17)
+# rar:     arsip RAR/CBR lewat unrar      (butuh g++, sudah ada di build-essential)
+# Bangun tanpa semuanya:  cargo build --release --no-default-features
+default = ["dialogs", "heif", "rar"]
+dialogs = ["dep:rfd"]
+heif = ["dep:libheif-rs"]
+rar = ["dep:unrar"]
+
+[dependencies]
+eframe = { version = "=0.33.3", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "qoi", "tga", "ico"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = { version = "0.15", default-features = false, features = ["gtk3"], optional = true }
+libheif-rs = { version = "2", default-features = false, features = ["v1_17"], optional = true }
+unrar = { version = "0.5", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Dekoder gambar sangat dipengaruhi optimasi; pakai opt-level tinggi juga saat debug
+# supaya `cargo run` tidak terasa lambat.
+[profile.dev.package."*"]
+opt-level = 2

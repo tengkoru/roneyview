@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Roneyview
+GenericName=Penampil Gambar
+Comment=Penampil gambar cepat untuk folder dan arsip ZIP/CBZ
+Exec=roneyview %f
+Icon=roneyview
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;image/x-qoi;image/x-tga;image/vnd.microsoft.icon;image/avif;image/heic;image/heif;application/zip;application/vnd.comicbook+zip;application/x-cbz;application/vnd.rar;application/x-rar;application/vnd.comicbook-rar;application/x-cbr;
+StartupWMClass=roneyview
