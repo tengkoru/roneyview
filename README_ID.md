@@ -2,6 +2,9 @@
 
 Penampil gambar alternatif Honeyview untuk Linux, ditulis dengan bahasa pemrograman Rust (egui/eframe).
 
+![Screenshot1](tests/2.png)
+![Screenshot2](tests/3.png)
+
 ## Apa yang Roneyview bisa lakukan?
 - **Membuka gambar**, **folder**, dan **archive**
 - **Mendukung format gambar**: JPEG/JPG, PNG, GIF, WebP, BMP, TIFF, QOI, TGA, ICO, AVIF, HEIC/HEIF
