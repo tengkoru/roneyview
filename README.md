@@ -1,6 +1,6 @@
 # Roneyview (version 0.5.0)
 
-An alternative to Honeyview—an image viewer for Linux—written in the Rust programming language (using egui/eframe).
+An alternative to Honeyview; an image viewer for Linux; written in the Rust programming language (using egui/eframe).
 
 ## What can Roneyview do?
 - **Open images**, **folders**, and **archives**
@@ -36,10 +36,10 @@ source "$HOME/.cargo/env"
 
 # 3. Compile and install to ~/.local (without sudo)
 ./install.sh
-
+```
 All dependencies required for the smooth operation of roneyview will be downloaded automatically when you run ./install.sh.
 However, if you wish to see which dependencies Roneyview requires, you can view them [here](supporting-roneyview.md)
-```
+
 
 `install.sh` checks for available packages and enables only the features that can be built,
 then displays which features were skipped along with the `apt` commands to install them.

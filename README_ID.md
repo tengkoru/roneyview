@@ -36,10 +36,10 @@ source "$HOME/.cargo/env"
 
 # 3. Kompilasi dan pasang ke ~/.local (tanpa sudo)
 ./install.sh
-
+```
 Semua alat bantu untuk kelancaran aplikasi roneyview akan diunduh otomatis saat Anda menjalankan ./install.sh. 
 Namun apabila ingin melihat alat bantu apa saja yang diperlukan oleh Roneyview, Anda dapat melihatnya [disini](supporting-roneyview.md)
-```
+
 
 `install.sh` memeriksa paket yang tersedia dan hanya mengaktifkan fitur yang bisa dibangun,
 lalu menampilkan fitur mana yang dilewati beserta perintah `apt` untuk memasangnya.
