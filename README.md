@@ -39,7 +39,7 @@ source "$HOME/.cargo/env"
 ./install.sh
 ```
 All dependencies required for the smooth operation of roneyview will be downloaded automatically when you run ./install.sh.
-However, if you wish to see which dependencies Roneyview requires, you can view them [here](supporting-roneyview.txt)
+However, if you wish to see which dependencies Roneyview requires, you can view them [here](dependencies-roneyview.txt)
 
 
 `install.sh` checks for available packages and enables only the features that can be built,
