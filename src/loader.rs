@@ -124,6 +124,10 @@ pub enum Command {
         index: usize,
         primary: bool,
         max_side: usize,
+        /// Halaman yang sedang dilihat. Dikirim di SETIAP permintaan: halaman yang sudah
+        /// ada di cache tidak diminta ulang, jadi fokus tidak boleh bergantung pada
+        /// permintaan utama saja (kalau tidak, prefetch/pasangan dianggap "terlalu jauh").
+        focus: usize,
     },
 }
 
@@ -142,6 +146,8 @@ pub struct Pixels {
     pub frames: Option<Vec<AnimFrame>>,
     /// Animasi dipotong karena melewati anggaran memori / jumlah frame.
     pub truncated: bool,
+    /// Nama format untuk jendela Properties ("JPEG", "GIF (animasi, 12 frame)", ...).
+    pub format: String,
 }
 
 pub struct Decoded {
@@ -246,13 +252,14 @@ impl Worker {
                 index,
                 primary,
                 max_side,
+                focus,
             } => {
                 if session != self.session {
                     return;
                 }
                 self.seq += 1;
+                self.focus = focus;
                 if primary {
-                    self.focus = index;
                     for j in &mut self.queue {
                         j.primary = false; // hanya satu permintaan utama
                     }
@@ -327,6 +334,40 @@ impl Worker {
 /// `max_side` diperkecil agar tidak melebihi batas tekstur GPU (kalau tidak,
 /// egui akan panik).
 pub fn decode(bytes: &[u8], max_side: usize) -> Result<Pixels, String> {
+    let mut p = decode_inner(bytes, max_side)?;
+    let name = format_name(bytes);
+    p.format = match &p.frames {
+        Some(f) => format!("{name} (animasi, {} frame)", f.len()),
+        None => name,
+    };
+    Ok(p)
+}
+
+/// Nama format dari isi berkas (bukan ekstensi).
+pub fn format_name(bytes: &[u8]) -> String {
+    if looks_like_heif(bytes) {
+        return if matches!(&bytes[8..12], b"avif" | b"avis") {
+            "AVIF".to_string()
+        } else {
+            "HEIC/HEIF".to_string()
+        };
+    }
+    match image::guess_format(bytes) {
+        Ok(ImageFormat::Jpeg) => "JPEG",
+        Ok(ImageFormat::Png) => "PNG",
+        Ok(ImageFormat::Gif) => "GIF",
+        Ok(ImageFormat::WebP) => "WebP",
+        Ok(ImageFormat::Bmp) => "BMP",
+        Ok(ImageFormat::Tiff) => "TIFF",
+        Ok(ImageFormat::Qoi) => "QOI",
+        Ok(ImageFormat::Tga) => "TGA",
+        Ok(ImageFormat::Ico) => "ICO",
+        _ => "Tidak diketahui",
+    }
+    .to_string()
+}
+
+fn decode_inner(bytes: &[u8], max_side: usize) -> Result<Pixels, String> {
     let max_side = max_side.clamp(1024, 16384) as u32;
 
     #[cfg(feature = "heif")]
@@ -367,6 +408,11 @@ fn fit_target(w: u32, h: u32, max_side: u32, max_pixels: usize) -> (u32, u32) {
 }
 
 fn decode_static(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
+    finish_static(load_dynamic(bytes)?, max_side)
+}
+
+/// Dekode penuh (dengan batas memori) dan terapkan orientasi EXIF.
+fn load_dynamic(bytes: &[u8]) -> Result<DynamicImage, String> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("Gagal membaca berkas: {e}"))?;
@@ -381,7 +427,7 @@ fn decode_static(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
     let mut img = DynamicImage::from_decoder(decoder)
         .map_err(|e| describe(&e, "Gambar rusak atau tidak lengkap"))?;
     img.apply_orientation(orientation);
-    finish_static(img, max_side)
+    Ok(img)
 }
 
 fn finish_static(img: DynamicImage, max_side: u32) -> Result<Pixels, String> {
@@ -395,6 +441,7 @@ fn finish_static(img: DynamicImage, max_side: u32) -> Result<Pixels, String> {
         orig: [w, h],
         frames: None,
         truncated: false,
+        format: String::new(),
     })
 }
 
@@ -499,6 +546,7 @@ fn decode_animated(bytes: &[u8], max_side: u32) -> Result<Option<Pixels>, String
         orig: canvas,
         frames: Some(out),
         truncated,
+        format: String::new(),
     }))
 }
 
@@ -533,6 +581,11 @@ fn is_heif(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "heif")]
 fn decode_heif(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
+    finish_static(DynamicImage::ImageRgba8(load_heif_rgba(bytes)?), max_side)
+}
+
+#[cfg(feature = "heif")]
+fn load_heif_rgba(bytes: &[u8]) -> Result<RgbaImage, String> {
     use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 
     thread_local! {
@@ -571,9 +624,37 @@ fn decode_heif(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
             .ok_or_else(|| "Data piksel HEIC/AVIF terpotong".to_string())?;
         buf.extend_from_slice(row);
     }
-    let rgba = RgbaImage::from_raw(w as u32, h as u32, buf)
-        .ok_or_else(|| "Ukuran data piksel tidak cocok".to_string())?;
-    finish_static(DynamicImage::ImageRgba8(rgba), max_side)
+    RgbaImage::from_raw(w as u32, h as u32, buf)
+        .ok_or_else(|| "Ukuran data piksel tidak cocok".to_string())
+}
+
+/// Dekode ke RGBA untuk wallpaper: dibatasi `max_side` dan `max_pixels`.
+/// GIF/WebP/APNG beranimasi diambil frame pertamanya.
+pub fn decode_rgba(bytes: &[u8], max_side: u32, max_pixels: usize) -> Result<RgbaImage, String> {
+    #[cfg(feature = "heif")]
+    let img = if is_heif(bytes) {
+        DynamicImage::ImageRgba8(load_heif_rgba(bytes)?)
+    } else {
+        load_dynamic(bytes)?
+    };
+    #[cfg(not(feature = "heif"))]
+    let img = {
+        if looks_like_heif(bytes) {
+            return Err("HEIC/AVIF tidak ikut dikompilasi (bangun dengan fitur \"heif\")".into());
+        }
+        load_dynamic(bytes)?
+    };
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return Err("Gambar berukuran nol".into());
+    }
+    let (nw, nh) = fit_target(w, h, max_side, max_pixels);
+    let img = if (nw, nh) == (w, h) {
+        img
+    } else {
+        img.resize_exact(nw, nh, FilterType::Triangle)
+    };
+    Ok(img.into_rgba8())
 }
 
 #[cfg(test)]
@@ -781,5 +862,34 @@ mod tests {
         let mut rusak = png_bytes(64, 64);
         rusak.truncate(rusak.len() / 2);
         assert!(decode(&rusak, 4096).is_err());
+    }
+
+    #[test]
+    fn nama_format_dikenali_dari_isi_bukan_ekstensi() {
+        assert_eq!(format_name(&png_bytes(4, 4)), "PNG");
+        assert_eq!(format_name(b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"), "GIF");
+        assert_eq!(format_name(b"bukan gambar"), "Tidak diketahui");
+        let p = decode(&png_bytes(4, 4), 4096).unwrap();
+        assert_eq!(p.format, "PNG");
+        let g = gif_bytes(&[([1, 2, 3, 255], 50), ([4, 5, 6, 255], 50)], 8, 8);
+        assert_eq!(decode(&g, 4096).unwrap().format, "GIF (animasi, 2 frame)");
+        #[cfg(feature = "heif")]
+        {
+            let heic: &[u8] = include_bytes!("../tests/fixtures/merah.heic");
+            let avif: &[u8] = include_bytes!("../tests/fixtures/merah.avif");
+            assert_eq!(format_name(heic), "HEIC/HEIF");
+            assert_eq!(format_name(avif), "AVIF");
+        }
+    }
+
+    #[test]
+    fn decode_rgba_untuk_wallpaper_dibatasi_ukuran() {
+        let img = decode_rgba(&png_bytes(300, 200), 8192, 40_000_000).unwrap();
+        assert_eq!(img.dimensions(), (300, 200));
+        let small = decode_rgba(&png_bytes(300, 200), 100, 40_000_000).unwrap();
+        assert_eq!(small.dimensions(), (100, 67));
+        assert!(decode_rgba(b"sampah", 8192, 1000).is_err());
+        let g = gif_bytes(&[([9, 9, 9, 255], 50), ([8, 8, 8, 255], 50)], 8, 8);
+        assert_eq!(decode_rgba(&g, 8192, 1_000_000).unwrap().dimensions(), (8, 8));
     }
 }

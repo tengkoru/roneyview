@@ -1,5 +1,6 @@
-//! Penyimpanan state ringan (posisi terakhir per sumber, mode zoom) di
-//! ~/.config/roneyview/state.json. Semua galat I/O diabaikan dengan aman.
+//! Preferensi ringan (mode zoom, bar, mode hemat memori, dua halaman, wallpaper) di
+//! ~/.config/roneyview/state.json. Roneyview TIDAK menyimpan gambar/posisi dari sesi
+//! sebelumnya. Semua galat I/O diabaikan dengan aman.
 
 use std::fs;
 use std::io;
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-const MAX_POSITIONS: usize = 200;
+use crate::wallpaper::WpPrefs;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum FitMode {
@@ -21,47 +22,74 @@ pub enum FitMode {
     Original,
 }
 
-#[derive(Clone, Default, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Position {
-    pub key: String,
-    pub index: usize,
-    pub name: String,
-}
-
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
-    pub last_origin: Option<String>,
     pub fit: FitMode,
     /// Bar navigasi bawah selalu tampil (centang "Kunci").
     pub bar_locked: bool,
-    /// Terbaru di depan.
-    pub positions: Vec<Position>,
+    /// Mode hemat memori: hanya gambar yang sedang dilihat disimpan di RAM.
+    pub low_memory: bool,
+    /// Tampilkan dua halaman berdampingan.
+    pub two_page: bool,
+    /// Arah baca kanan-ke-kiri (manga).
+    pub rtl: bool,
+    /// Pada mode dua halaman, halaman pertama (sampul) tampil sendiri.
+    pub cover_alone: bool,
+    /// Pilihan terakhir di jendela "Set as wallpaper".
+    pub wallpaper: WpPrefs,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            fit: FitMode::default(),
+            bar_locked: false,
+            low_memory: false,
+            two_page: false,
+            rtl: false,
+            cover_alone: true,
+            wallpaper: WpPrefs::default(),
+        }
+    }
 }
 
 pub struct Store {
     path: Option<PathBuf>,
     pub state: State,
+    /// Berkas lama (versi <= 0.4) masih memuat riwayat sesi; tulis ulang untuk menghapusnya.
+    pub had_legacy_history: bool,
 }
 
-fn config_path() -> Option<PathBuf> {
+fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("roneyview").join("state.json"))
+    Some(base.join("roneyview"))
+}
+
+pub fn config_path(name: &str) -> Option<PathBuf> {
+    config_dir().map(|d| d.join(name))
+}
+
+fn has_legacy_history(raw: &str) -> bool {
+    raw.contains("\"positions\"") || raw.contains("\"last_origin\"")
 }
 
 impl Store {
     pub fn load() -> Self {
-        let path = config_path();
-        let state = path
-            .as_ref()
-            .and_then(|p| fs::read_to_string(p).ok())
+        let path = config_path("state.json");
+        let raw = path.as_ref().and_then(|p| fs::read_to_string(p).ok());
+        let had_legacy_history = raw.as_deref().is_some_and(has_legacy_history);
+        let state = raw
             .and_then(|s| serde_json::from_str::<State>(&s).ok())
             .unwrap_or_default();
-        Store { path, state }
+        Store {
+            path,
+            state,
+            had_legacy_history,
+        }
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -78,22 +106,13 @@ impl Store {
         fs::rename(&tmp, path)
     }
 
-    pub fn position_for(&self, key: &str) -> Option<&Position> {
-        self.state.positions.iter().find(|p| p.key == key)
-    }
-
-    pub fn remember(&mut self, key: &str, index: usize, name: &str) {
-        self.state.positions.retain(|p| p.key != key);
-        self.state.positions.insert(
-            0,
-            Position {
-                key: key.to_string(),
-                index,
-                name: name.to_string(),
-            },
-        );
-        self.state.positions.truncate(MAX_POSITIONS);
-        self.state.last_origin = Some(key.to_string());
+    #[cfg(test)]
+    pub fn in_memory() -> Self {
+        Store {
+            path: None,
+            state: State::default(),
+            had_legacy_history: false,
+        }
     }
 }
 
@@ -102,19 +121,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remember_menaruh_terbaru_di_depan_dan_membatasi_jumlah() {
-        let mut s = Store { path: None, state: State::default() };
-        s.remember("a", 1, "x");
-        s.remember("b", 2, "y");
-        s.remember("a", 5, "z");
-        assert_eq!(s.state.positions.len(), 2);
-        assert_eq!(s.state.positions[0].key, "a");
-        assert_eq!(s.position_for("a").unwrap().index, 5);
-        for i in 0..500 {
-            s.remember(&format!("k{i}"), i, "n");
-        }
-        assert_eq!(s.state.positions.len(), MAX_POSITIONS);
-        assert_eq!(s.state.last_origin.as_deref(), Some("k499"));
+    fn berkas_lama_dengan_riwayat_dimuat_tanpa_gagal_dan_riwayat_hilang_saat_disimpan() {
+        let old = r#"{"last_origin":"/foto","fit":"Width","bar_locked":true,
+            "positions":[{"key":"/foto","index":4,"name":"a.jpg"}]}"#;
+        assert!(has_legacy_history(old));
+        let st: State = serde_json::from_str(old).unwrap();
+        assert_eq!(st.fit, FitMode::Width);
+        assert!(st.bar_locked);
+        assert!(st.cover_alone, "bawaan baru harus berlaku untuk berkas lama");
+        let again = serde_json::to_string(&st).unwrap();
+        assert!(!has_legacy_history(&again), "{again}");
+        assert!(!again.contains("/foto"));
     }
 
     #[test]
@@ -122,5 +139,23 @@ mod tests {
         let st: State = serde_json::from_str(r#"{"fit":"Width","bidang_baru":1}"#).unwrap();
         assert_eq!(st.fit, FitMode::Width);
         assert!(serde_json::from_str::<State>("{rusak").is_err());
+        let _ = Store::in_memory();
+    }
+
+    #[test]
+    fn pilihan_dua_halaman_dan_wallpaper_bertahan_bolak_balik() {
+        let st = State {
+            two_page: true,
+            rtl: true,
+            cover_alone: false,
+            wallpaper: WpPrefs {
+                color: [1, 2, 3],
+                ..WpPrefs::default()
+            },
+            ..State::default()
+        };
+        let back: State = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        assert!(back.two_page && back.rtl && !back.cover_alone);
+        assert_eq!(back.wallpaper.color, [1, 2, 3]);
     }
 }

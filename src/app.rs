@@ -3,9 +3,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "dialogs")]
-use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -16,6 +14,8 @@ use eframe::egui::{
 };
 use eframe::glow::HasContext;
 
+use crate::dialogs::{self, Modal, ModalResult, PropsDialog, WallpaperDialog};
+use crate::fileinfo::{self, PageFacts};
 use crate::loader::{self, AnimFrame, Command, Loaded, Outcome};
 use crate::settings::{FitMode, Store};
 use crate::source::Listing;
@@ -24,6 +24,58 @@ const BG: Color32 = Color32::from_gray(22);
 /// Gambar yang disimpan di cache: sekian di belakang dan di depan gambar aktif.
 const KEEP_BEHIND: usize = 2;
 const KEEP_AHEAD: usize = 3;
+
+/// Rentang indeks halaman yang boleh tetap ada di RAM. Mode hemat memori hanya
+/// menyimpan halaman yang sedang dilihat (tanpa prefetch).
+fn keep_window(index: usize, low_memory: bool, spread: bool) -> (usize, usize) {
+    let extra = usize::from(spread);
+    if low_memory {
+        (index, index + extra)
+    } else {
+        (index.saturating_sub(KEEP_BEHIND + extra), index + KEEP_AHEAD + 2 * extra)
+    }
+}
+
+/// Awal "spread" (halaman yang ditampilkan pertama) untuk halaman `t` di mode dua halaman.
+/// Dengan sampul tunggal: spread dimulai di 0, 1, 3, 5, ...; tanpa: 0, 2, 4, ...
+fn snap_start_for(t: usize, two_page: bool, cover_alone: bool) -> usize {
+    if !two_page {
+        t
+    } else if cover_alone {
+        if t == 0 || t % 2 == 1 {
+            t
+        } else {
+            t - 1
+        }
+    } else {
+        t - t % 2
+    }
+}
+
+/// Awal spread sebelum `s`. Halaman dengan dimensi belum diketahui dianggap potret.
+/// Pasangan (s-2, s-1) hanya dibentuk bila keduanya bukan halaman lebar.
+fn prev_start_for(s: usize, two_page: bool, cover_alone: bool, wide: &dyn Fn(usize) -> bool) -> Option<usize> {
+    if s == 0 {
+        return None;
+    }
+    if !two_page {
+        return Some(s - 1);
+    }
+    let min_pair_start = usize::from(cover_alone);
+    if s >= 2 && s - 2 >= min_pair_start && !wide(s - 2) && !wide(s - 1) {
+        Some(s - 2)
+    } else {
+        Some(s - 1)
+    }
+}
+
+/// Lebar tiap halaman setelah tinggi disamakan ke yang tertinggi (dalam satuan yang
+/// sama dengan masukan), beserta tinggi bersama. Dipakai untuk menata dua halaman.
+fn pair_widths(dims: &[(f32, f32)]) -> (Vec<f32>, f32) {
+    let h = dims.iter().map(|d| d.1).fold(0.0_f32, f32::max).max(1.0);
+    let w = dims.iter().map(|d| d.0 * h / d.1.max(1.0)).collect();
+    (w, h)
+}
 const MIN_SCALE: f32 = 0.02;
 const MAX_SCALE: f32 = 32.0;
 const ZOOM_STEP: f32 = 1.25;
@@ -47,6 +99,22 @@ struct Page {
     file_size: u64,
     bytes: usize,
     anim: Option<Anim>,
+    format: String,
+}
+
+/// Isi yang sedang tampil: satu halaman, atau dua halaman berdampingan (urutan baca).
+struct Shown {
+    start: usize,
+    slots: Vec<(usize, Arc<Page>)>,
+}
+
+/// Pilihan di menu klik kanan.
+#[derive(Clone, Copy)]
+enum CtxChoice {
+    Wallpaper,
+    Properties,
+    OpenFolder,
+    Trash,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -73,6 +141,10 @@ enum Action {
     ExitFullscreen,
     TogglePlay,
     ToggleBarLock,
+    ToggleLowMemory,
+    ToggleTwoPage,
+    ToggleRtl,
+    ToggleCover,
     Help,
     Quit,
 }
@@ -106,16 +178,33 @@ pub struct RoneyApp {
     /// Batas total ukuran tekstur di cache (byte). Halaman terjauh dibuang dulu.
     budget: usize,
     low_mem_notified: bool,
+    /// Mode hemat memori (pilihan pengguna, disimpan antar sesi).
+    low_memory_mode: bool,
 
     /// Indeks yang sedang digeser di slider (belum dibuka); dibuka saat dilepas.
     scrub: Option<usize>,
     bar_locked: bool,
     /// Gambar sedang digeser dengan mouse: sembunyikan overlay navigasi.
     panning: bool,
+    /// Mode dua halaman, arah baca kanan-ke-kiri, dan sampul tunggal (preferensi).
+    two_page_mode: bool,
+    rtl: bool,
+    cover_alone: bool,
+    /// Dimensi asli tiap halaman yang pernah didekode (untuk mengenali halaman lebar).
+    dims: HashMap<usize, [u32; 2]>,
+    /// Halaman yang diklik kanan.
+    ctx_target: usize,
+
+    modal: Option<Modal>,
+    props: Option<PropsDialog>,
+    wallpaper: Option<WallpaperDialog>,
+    /// Pesan dari thread latar belakang (mis. gagal membuka folder).
+    note_tx: Sender<String>,
+    note_rx: Receiver<String>,
     pending: HashMap<usize, bool>,
     errors: HashMap<usize, String>,
-    shown: Option<(usize, Arc<Page>)>,
-    placed_for: Option<(u64, usize)>,
+    shown: Option<Arc<Shown>>,
+    placed_for: Option<(u64, usize, usize)>,
 
     cmd_tx: Sender<Command>,
     out_rx: Receiver<Loaded>,
@@ -196,13 +285,17 @@ impl RoneyApp {
         });
 
         let (cmd_tx, out_rx) = loader::spawn(ctx.clone())?;
+        let (note_tx, note_rx) = mpsc::channel::<String>();
         #[cfg(feature = "dialogs")]
         let (dialog_tx, dialog_rx) = mpsc::channel();
 
         let store = Store::load();
         let fit = store.state.fit;
         let bar_locked = store.state.bar_locked;
-        let last_origin = store.state.last_origin.clone();
+        let two_page_mode = store.state.two_page;
+        let rtl = store.state.rtl;
+        let cover_alone = store.state.cover_alone;
+        let low_memory_mode = store.state.low_memory;
 
         let mut app = RoneyApp {
             store,
@@ -215,9 +308,20 @@ impl RoneyApp {
             cache: HashMap::new(),
             budget: loader::cache_budget(),
             low_mem_notified: false,
+            low_memory_mode,
             scrub: None,
             bar_locked,
             panning: false,
+            two_page_mode,
+            rtl,
+            cover_alone,
+            dims: HashMap::new(),
+            ctx_target: 0,
+            modal: None,
+            props: None,
+            wallpaper: None,
+            note_tx,
+            note_rx,
             pending: HashMap::new(),
             errors: HashMap::new(),
             shown: None,
@@ -250,17 +354,11 @@ impl RoneyApp {
             title: String::new(),
         };
 
-        match arg {
-            Some(p) => app.open_path(&ctx, &p),
-            None => {
-                // Tanpa argumen: lanjutkan dari tempat terakhir.
-                if let Some(o) = last_origin {
-                    let p = PathBuf::from(o);
-                    if p.exists() {
-                        app.open_path(&ctx, &p);
-                    }
-                }
-            }
+        if app.store.had_legacy_history {
+            app.store_dirty = true; // tulis ulang berkas pengaturan tanpa riwayat lama
+        }
+        if let Some(p) = arg {
+            app.open_path(&ctx, &p);
         }
         Ok(app)
     }
@@ -279,12 +377,12 @@ impl RoneyApp {
                 return;
             }
         };
-        let index = match start {
-            Some(i) => i,
-            None => self.restore_index(&listing),
-        }
-        .min(listing.len().saturating_sub(1));
+        self.install_listing(ctx, listing, start.unwrap_or(0));
+    }
 
+    /// Pasang daftar gambar baru dan tampilkan gambar ke-`index`.
+    fn install_listing(&mut self, ctx: &Context, listing: Listing, index: usize) {
+        let index = index.min(listing.len().saturating_sub(1));
         self.session += 1;
         let listing = Arc::new(listing);
         let cmd = Command::Open {
@@ -301,24 +399,13 @@ impl RoneyApp {
         self.cache.clear();
         self.pending.clear();
         self.errors.clear();
+        self.dims.clear();
         self.shown = None;
         self.placed_for = None;
         self.rotation = 0;
         self.zoom = Zoom::Fit(self.fit);
         self.land_bottom = false;
         self.after_page_change(ctx);
-    }
-
-    fn restore_index(&self, listing: &Listing) -> usize {
-        let Some(pos) = self.store.position_for(&listing.key) else {
-            return 0;
-        };
-        // Cari berdasarkan nama dulu (tahan terhadap berkas yang bertambah/hilang).
-        listing
-            .names
-            .iter()
-            .position(|n| *n == pos.name)
-            .unwrap_or(pos.index)
     }
 
     #[cfg(feature = "dialogs")]
@@ -399,17 +486,12 @@ impl RoneyApp {
     }
 
     fn after_page_change(&mut self, ctx: &Context) {
-        let Some(l) = self.listing.clone() else {
+        if self.listing.is_none() {
             return;
-        };
-        let lo = self.index.saturating_sub(KEEP_BEHIND);
-        let hi = self.index + KEEP_AHEAD;
+        }
+        let (lo, hi) = keep_window(self.index, self.low_memory_mode, self.two_page_mode);
         self.cache.retain(|i, _| (lo..=hi).contains(i));
         self.request_pages(ctx);
-        if let Some(name) = l.names.get(self.index) {
-            self.store.remember(&l.key, self.index, name);
-            self.store_dirty = true;
-        }
         self.update_title(ctx);
         ctx.request_repaint();
     }
@@ -446,19 +528,33 @@ impl RoneyApp {
         let cur = self.index as isize;
         let (a, b) = if self.dir >= 0 { (1, -1) } else { (-1, 1) };
         let mut wanted: Vec<(usize, bool)> = vec![(self.index, true)];
+        let spread = self.spread_wanted(self.index);
+        if spread {
+            wanted.push((self.index + 1, false)); // pasangan harus siap bersama
+        }
 
         // Pengaman: saat RAM sistem hampir habis, lepaskan cache dan matikan prefetch
         // supaya Roneyview tidak ikut menyeret sistem ke OOM / swap-thrash.
-        let low_memory = loader::available_now().is_some_and(|b| b < loader::LOW_MEMORY);
-        if low_memory {
-            self.cache.retain(|i, _| *i == self.index);
+        let system_low = loader::available_now().is_some_and(|b| b < loader::LOW_MEMORY);
+        if system_low {
+            let partner = self.index + usize::from(spread);
+            self.cache.retain(|i, _| *i == self.index || *i == partner);
             if !self.low_mem_notified {
                 self.low_mem_notified = true;
                 self.notify("Memori sistem hampir habis: prefetch dimatikan");
             }
+        } else if self.low_memory_mode {
+            self.low_mem_notified = false; // mode hemat: hanya halaman aktif, tanpa prefetch
         } else {
             self.low_mem_notified = false;
-            for off in [a, 2 * a, b] {
+            let offsets: [isize; 3] = if !self.two_page_mode {
+                [a, 2 * a, b]
+            } else if self.dir >= 0 {
+                [2, 3, -1]
+            } else {
+                [-1, -2, 2]
+            };
+            for off in offsets {
                 let i = cur + off;
                 if i >= 0 && i < n {
                     wanted.push((i as usize, false));
@@ -480,6 +576,7 @@ impl RoneyApp {
                 index: i,
                 primary,
                 max_side,
+                focus: self.index,
             };
             if self.cmd_tx.send(cmd).is_err() {
                 self.pending.remove(&i);
@@ -506,12 +603,13 @@ impl RoneyApp {
             self.pending.remove(&msg.index);
             match msg.outcome {
                 Outcome::Ready(d) => {
-                    let lo = self.index.saturating_sub(KEEP_BEHIND);
-                    let hi = self.index + KEEP_AHEAD;
+                    let (lo, hi) = keep_window(self.index, self.low_memory_mode, self.two_page_mode);
                     if !(lo..=hi).contains(&msg.index) {
                         continue; // sudah terlalu jauh, buang
                     }
                     let px = d.pixels;
+                    self.dims.insert(msg.index, px.orig);
+                    let format = px.format.clone();
                     let animated = px.frames.is_some();
                     // Mipmap menambah ~1/3 memori GPU.
                     let mip_factor = |b: usize| if self.mipmaps && !animated { b * 4 / 3 } else { b };
@@ -545,6 +643,7 @@ impl RoneyApp {
                         file_size: d.file_size,
                         bytes,
                         anim,
+                        format,
                     });
                     got_current |= msg.index == self.index;
                     self.cache.insert(msg.index, page);
@@ -568,18 +667,45 @@ impl RoneyApp {
         self.listing.as_ref().map_or(0, |l| l.len())
     }
 
-    fn step(&mut self, ctx: &Context, delta: isize, land_bottom: bool) {
-        let n = self.count() as isize;
+    fn is_wide(&self, i: usize) -> bool {
+        self.dims.get(&i).is_some_and(|d| d[0] > d[1])
+    }
+
+    /// Apakah halaman `s` dan `s+1` perlu ditampilkan berdampingan (belum memeriksa lebar).
+    fn spread_wanted(&self, s: usize) -> bool {
+        self.two_page_mode && !(self.cover_alone && s == 0) && s + 1 < self.count()
+    }
+
+    /// Banyak halaman yang sedang tampil (untuk lompat ke spread berikutnya).
+    fn next_span(&self) -> usize {
+        match &self.shown {
+            Some(sh) if sh.start == self.index && sh.slots.len() == 2 => 2,
+            _ => 1,
+        }
+    }
+
+    fn snap_start(&self, t: usize) -> usize {
+        snap_start_for(t, self.two_page_mode, self.cover_alone)
+    }
+
+    fn go_next(&mut self, ctx: &Context) {
+        let n = self.count();
         if n == 0 {
             return;
         }
-        let target = self.index as isize + delta;
-        if target < 0 {
-            self.notify("Ini gambar pertama");
-        } else if target >= n {
+        let target = self.index + self.next_span();
+        if target >= n {
             self.notify("Ini gambar terakhir");
         } else {
-            self.go_to(ctx, target as usize, land_bottom);
+            self.go_to(ctx, target, false);
+        }
+    }
+
+    fn go_prev(&mut self, ctx: &Context, land_bottom: bool) {
+        let wide = |i: usize| self.is_wide(i);
+        match prev_start_for(self.index, self.two_page_mode, self.cover_alone, &wide) {
+            None => self.notify("Ini gambar pertama"),
+            Some(t) => self.go_to(ctx, t, land_bottom),
         }
     }
 
@@ -599,16 +725,28 @@ impl RoneyApp {
         let Some(l) = &self.listing else {
             return;
         };
-        let name = l.names.get(self.index).map_or("", String::as_str);
+        let first = l.names.get(self.index).map_or("", String::as_str);
+        let pair = self
+            .shown
+            .as_ref()
+            .filter(|sh| sh.start == self.index && sh.slots.len() == 2)
+            .map(|sh| sh.slots[1].0);
+        let (name, pos) = match pair {
+            Some(j) => (
+                format!("{first} + {}", l.names.get(j).map_or("", String::as_str)),
+                format!("{}-{}/{}", self.index + 1, j + 1, l.len()),
+            ),
+            None => (first.to_string(), format!("{}/{}", self.index + 1, l.len())),
+        };
         let title = if l.is_archive() {
             let arc = l
                 .origin
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            format!("{name} [{arc}] ({}/{}) - Roneyview", self.index + 1, l.len())
+            format!("{name} [{arc}] ({pos}) - Roneyview")
         } else {
-            format!("{name} ({}/{}) - Roneyview", self.index + 1, l.len())
+            format!("{name} ({pos}) - Roneyview")
         };
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -629,8 +767,53 @@ impl RoneyApp {
         }
     }
 
-    fn geometry(&self, ctx: &Context, page: &Page, view: Rect) -> Geo {
-        let dims = self.page_dims(page, ctx.pixels_per_point());
+    /// Ukuran (poin) isi yang tampil: satu halaman, atau dua halaman dengan tinggi disamakan.
+    fn shown_dims(&self, ctx: &Context, sh: &Shown) -> Vec2 {
+        let ppp = ctx.pixels_per_point();
+        if sh.slots.len() == 1 {
+            return self.page_dims(&sh.slots[0].1, ppp);
+        }
+        let u = 1.0 / ppp;
+        let dims: Vec<(f32, f32)> = sh
+            .slots
+            .iter()
+            .map(|(_, p)| (p.orig[0] as f32 * u, p.orig[1] as f32 * u))
+            .collect();
+        let (w, h) = pair_widths(&dims);
+        vec2(w.iter().sum(), h)
+    }
+
+    /// Persegi tiap halaman di dalam `composite`, dalam urutan visual kiri ke kanan.
+    /// Arah baca kanan-ke-kiri menaruh halaman pertama di sebelah kanan.
+    fn pair_rects(&self, ctx: &Context, sh: &Shown, composite: Rect) -> Vec<(usize, Rect)> {
+        let u = 1.0 / ctx.pixels_per_point();
+        let dims: Vec<(f32, f32)> = sh
+            .slots
+            .iter()
+            .map(|(_, p)| (p.orig[0] as f32 * u, p.orig[1] as f32 * u))
+            .collect();
+        let (widths, _) = pair_widths(&dims);
+        let total: f32 = widths.iter().sum::<f32>().max(1.0);
+        let k = composite.width() / total;
+        let mut order: Vec<usize> = (0..sh.slots.len()).collect();
+        if self.rtl {
+            order.reverse();
+        }
+        let mut x = composite.left();
+        let mut out = Vec::with_capacity(order.len());
+        for i in order {
+            let w = widths[i] * k;
+            out.push((
+                sh.slots[i].0,
+                Rect::from_min_size(pos2(x, composite.top()), vec2(w, composite.height())),
+            ));
+            x += w;
+        }
+        out
+    }
+
+    fn geometry(&self, ctx: &Context, dims: Vec2, view: Rect) -> Geo {
+        let _ = ctx;
         let scale = match self.zoom {
             Zoom::Custom(z) => z,
             Zoom::Fit(m) => fit_scale(m, dims, view.size()),
@@ -645,14 +828,15 @@ impl RoneyApp {
     }
 
     fn zoom_by(&mut self, ctx: &Context, factor: f32, anchor: Option<Pos2>) {
-        let Some((_, page)) = self.shown.clone() else {
+        let Some(sh) = self.shown.clone() else {
             return;
         };
         if !factor.is_finite() || factor <= 0.0 {
             return;
         }
         let view = self.view_rect;
-        let geo = self.geometry(ctx, &page, view);
+        let dims = self.shown_dims(ctx, &sh);
+        let geo = self.geometry(ctx, dims, view);
         let new_scale = (geo.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
         if (new_scale - geo.scale).abs() < 1e-6 {
             return;
@@ -664,26 +848,54 @@ impl RoneyApp {
         self.zoom = Zoom::Custom(new_scale);
     }
 
-    fn current_page(&mut self) -> Option<Arc<Page>> {
-        if let Some(p) = self.cache.get(&self.index) {
-            self.shown = Some((self.index, p.clone()));
-        } else if self.errors.contains_key(&self.index) {
-            self.shown = None;
+    /// Tentukan isi yang tampil untuk halaman aktif. Bila pasangan masih dimuat, isi
+    /// sebelumnya dipertahankan supaya layar tidak berkedip.
+    fn current_content(&mut self) -> Option<Arc<Shown>> {
+        let s = self.index;
+        match self.cache.get(&s).cloned() {
+            None => {
+                if self.errors.contains_key(&s) {
+                    self.shown = None;
+                }
+            }
+            Some(p0) => {
+                let single = |p: Arc<Page>| Some(Arc::new(Shown { start: s, slots: vec![(s, p)] }));
+                let wide = |p: &Page| p.orig[0] > p.orig[1];
+                if !self.spread_wanted(s) || wide(&p0) {
+                    self.shown = single(p0);
+                } else {
+                    match self.cache.get(&(s + 1)).cloned() {
+                        Some(p1) if !wide(&p1) => {
+                            self.shown = Some(Arc::new(Shown {
+                                start: s,
+                                slots: vec![(s, p0), (s + 1, p1)],
+                            }));
+                        }
+                        Some(_) => self.shown = single(p0),
+                        None => {
+                            if self.errors.contains_key(&(s + 1)) {
+                                self.shown = single(p0);
+                            } // else: pasangan sedang dimuat, pertahankan isi sebelumnya
+                        }
+                    }
+                }
+            }
         }
-        self.shown.as_ref().map(|(_, p)| p.clone())
+        self.shown.clone()
     }
 
     // ------------------------------------------------------------- aksi
 
     fn perform(&mut self, ctx: &Context, action: Action) {
         match action {
-            Action::Next => self.step(ctx, 1, false),
-            Action::Prev => self.step(ctx, -1, false),
+            Action::Next => self.go_next(ctx),
+            Action::Prev => self.go_prev(ctx, false),
             Action::First => self.go_to(ctx, 0, false),
             Action::Last => {
                 let n = self.count();
                 if n > 0 {
-                    self.go_to(ctx, n - 1, false);
+                    let t = self.snap_start(n - 1);
+                    self.go_to(ctx, t, false);
                 }
             }
             Action::OpenFile => self.start_dialog(ctx, DialogKind::File),
@@ -697,8 +909,8 @@ impl RoneyApp {
             }
             Action::ZoomIn => self.zoom_by(ctx, ZOOM_STEP, None),
             Action::ZoomOut => self.zoom_by(ctx, 1.0 / ZOOM_STEP, None),
-            Action::RotateCw => self.rotate(1),
-            Action::RotateCcw => self.rotate(3),
+            Action::RotateCw => self.rotate_checked(1),
+            Action::RotateCcw => self.rotate_checked(3),
             Action::PanY(dy) => self.offset.y += dy,
             Action::ToggleFullscreen => {
                 self.fullscreen = !self.fullscreen;
@@ -718,10 +930,22 @@ impl RoneyApp {
                 }
             }
             Action::ToggleBarLock => self.set_bar_lock(!self.bar_locked),
+            Action::ToggleTwoPage => self.set_two_page(ctx, !self.two_page_mode),
+            Action::ToggleRtl => self.set_rtl(ctx, !self.rtl),
+            Action::ToggleCover => self.set_cover(ctx, !self.cover_alone),
+            Action::ToggleLowMemory => self.set_low_memory(ctx, !self.low_memory_mode),
             Action::Help => self.show_help = !self.show_help,
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
         ctx.request_repaint();
+    }
+
+    fn rotate_checked(&mut self, quarter_turns: u8) {
+        if self.shown.as_ref().is_some_and(|s| s.slots.len() == 2) {
+            self.notify("Rotasi tidak tersedia pada mode dua halaman");
+        } else {
+            self.rotate(quarter_turns);
+        }
     }
 
     fn rotate(&mut self, quarter_turns: u8) {
@@ -735,6 +959,7 @@ impl RoneyApp {
 
     fn read_input(&self, ctx: &Context) -> FrameInput {
         let fullscreen = self.fullscreen;
+        let rtl = self.rtl;
         ctx.input_mut(|i| {
             let mut out = FrameInput {
                 zoom: 1.0,
@@ -756,9 +981,9 @@ impl RoneyApp {
                 take(none, Key::R, Action::RotateCw, i);
                 take(shift, Key::Space, Action::Prev, i);
                 take(none, Key::Space, Action::Next, i);
-                take(none, Key::ArrowRight, Action::Next, i);
+                take(none, Key::ArrowRight, if rtl { Action::Prev } else { Action::Next }, i);
                 take(none, Key::PageDown, Action::Next, i);
-                take(none, Key::ArrowLeft, Action::Prev, i);
+                take(none, Key::ArrowLeft, if rtl { Action::Next } else { Action::Prev }, i);
                 take(none, Key::PageUp, Action::Prev, i);
                 take(none, Key::Backspace, Action::Prev, i);
                 take(none, Key::Home, Action::First, i);
@@ -776,6 +1001,9 @@ impl RoneyApp {
                 take(none, Key::H, Action::Fit(FitMode::Height), i);
                 take(none, Key::P, Action::TogglePlay, i);
                 take(none, Key::L, Action::ToggleBarLock, i);
+                take(none, Key::D, Action::ToggleTwoPage, i);
+                take(none, Key::K, Action::ToggleRtl, i);
+                take(none, Key::M, Action::ToggleLowMemory, i);
                 take(none, Key::Enter, Action::ToggleFullscreen, i);
                 take(none, Key::F11, Action::ToggleFullscreen, i);
                 take(none, Key::F1, Action::Help, i);
@@ -828,9 +1056,9 @@ impl RoneyApp {
             self.flip_accum = 0.0;
             self.flip_block_until = now + Duration::from_millis(220);
             if forward {
-                self.step(ctx, 1, false);
+                self.go_next(ctx);
             } else {
-                self.step(ctx, -1, true);
+                self.go_prev(ctx, true);
             }
         }
     }
@@ -887,12 +1115,39 @@ impl RoneyApp {
                 if ui.add(lock).clicked() {
                     acts.push(Action::ToggleBarLock);
                 }
+                let saver = egui::Button::new("Mode hemat memori")
+                    .selected(self.low_memory_mode)
+                    .shortcut_text("M");
+                let two = egui::Button::new("Mode dua halaman")
+                    .selected(self.two_page_mode)
+                    .shortcut_text("D");
+                if ui.add(two).clicked() {
+                    acts.push(Action::ToggleTwoPage);
+                }
+                let rtl = egui::Button::new("Arah baca kanan-ke-kiri (manga)")
+                    .selected(self.rtl)
+                    .shortcut_text("K");
+                if ui.add(rtl).clicked() {
+                    acts.push(Action::ToggleRtl);
+                }
+                let cover = egui::Button::new("Halaman pertama tunggal (sampul)").selected(self.cover_alone);
+                if ui.add(cover).clicked() {
+                    acts.push(Action::ToggleCover);
+                }
+                if ui
+                    .add(saver)
+                    .on_hover_text("Hanya gambar yang sedang dilihat disimpan di RAM; tanpa prefetch")
+                    .clicked()
+                {
+                    acts.push(Action::ToggleLowMemory);
+                }
                 ui.separator();
                 item(ui, "Layar penuh", "Enter", acts, Action::ToggleFullscreen);
             });
             ui.menu_button("Navigasi", |ui| {
-                item(ui, "Sebelumnya", "Kiri", acts, Action::Prev);
-                item(ui, "Berikutnya", "Kanan", acts, Action::Next);
+                let (kp, kn) = if self.rtl { ("Kanan", "Kiri") } else { ("Kiri", "Kanan") };
+                item(ui, "Sebelumnya", kp, acts, Action::Prev);
+                item(ui, "Berikutnya", kn, acts, Action::Next);
                 item(ui, "Pertama", "Home", acts, Action::First);
                 item(ui, "Terakhir", "End", acts, Action::Last);
             });
@@ -909,14 +1164,29 @@ impl RoneyApp {
                 return;
             };
             let name = l.names.get(self.index).map_or("", String::as_str);
-            ui.label(format!("{}/{}", self.index + 1, l.len()));
+            let pair = self
+                .shown
+                .as_ref()
+                .filter(|sh| sh.start == self.index && sh.slots.len() == 2)
+                .map(|sh| sh.slots[1].0);
+            match pair {
+                Some(j) => ui.label(format!("{}-{}/{}", self.index + 1, j + 1, l.len())),
+                None => ui.label(format!("{}/{}", self.index + 1, l.len())),
+            };
             ui.separator();
-            if let Some((_, page)) = &self.shown {
-                if self.cache.contains_key(&self.index) {
-                    let [w, h] = page.orig;
-                    ui.label(format!("{w} x {h} px"));
+            if let Some(sh) = self.shown.as_ref().filter(|sh| sh.start == self.index) {
+                {
+                    let page = &sh.slots[0].1;
+                    let dims_txt = sh
+                        .slots
+                        .iter()
+                        .map(|(_, p)| format!("{} x {}", p.orig[0], p.orig[1]))
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    let total: u64 = sh.slots.iter().map(|(_, p)| p.file_size).sum();
+                    ui.label(format!("{dims_txt} px"));
                     ui.separator();
-                    ui.label(human_size(page.file_size));
+                    ui.label(fileinfo::human_size(total));
                     ui.separator();
                     let scale = self.display_scale;
                     ui.label(format!("{:.0}%", scale * 100.0));
@@ -954,18 +1224,19 @@ impl RoneyApp {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, BG);
 
-        let Some(page) = self.current_page() else {
+        let Some(sh) = self.current_content() else {
             self.draw_placeholder(&painter, rect);
             return;
         };
-        let shown_index = self.shown.as_ref().map_or(0, |(i, _)| *i);
+        let shown_index = sh.start;
+        let dims = self.shown_dims(ctx, &sh);
         let hover = ctx.pointer_hover_pos().filter(|p| rect.contains(*p));
 
         // Penempatan awal tiap kali gambar (atau rotasi/mode) berubah.
-        let key = (self.session, shown_index);
+        let key = (self.session, shown_index, sh.slots.len());
         if self.placed_for != Some(key) {
             self.placed_for = Some(key);
-            let geo = self.geometry(ctx, &page, rect);
+            let geo = self.geometry(ctx, dims, rect);
             let max_y = ((geo.size.y - rect.height()) / 2.0).max(0.0);
             let y = if self.land_bottom {
                 -max_y
@@ -994,7 +1265,7 @@ impl RoneyApp {
         // Roda mouse: geser vertikal bila gambar melebihi jendela,
         // kalau sudah mentok (atau muat) pindah halaman.
         if inp.wheel != 0.0 && resp.hovered() {
-            let geo = self.geometry(ctx, &page, rect);
+            let geo = self.geometry(ctx, dims, rect);
             let max_y = ((geo.size.y - rect.height()) / 2.0).max(0.0);
             let overflow = max_y > 0.5;
             let at_limit = overflow
@@ -1011,7 +1282,7 @@ impl RoneyApp {
             }
         }
 
-        let geo = self.geometry(ctx, &page, rect);
+        let geo = self.geometry(ctx, dims, rect);
         self.offset = geo.offset;
         self.display_scale = geo.scale;
 
@@ -1023,7 +1294,54 @@ impl RoneyApp {
             // Ukuran asli: sejajarkan ke piksel fisik agar tajam.
             img_rect = Rect::from_min_size(pos2(snap(img_rect.min.x), snap(img_rect.min.y)), geo.size);
         }
-        paint_page(&painter, page.tex.id(), img_rect, self.rotation);
+        let mut page_rects: Vec<(usize, Rect)> = Vec::new();
+        if sh.slots.len() == 1 {
+            paint_page(&painter, sh.slots[0].1.tex.id(), img_rect, self.rotation);
+            page_rects.push((sh.slots[0].0, img_rect));
+        } else {
+            for (idx, r) in self.pair_rects(ctx, &sh, img_rect) {
+                if let Some((_, p)) = sh.slots.iter().find(|(i, _)| *i == idx) {
+                    paint_page(&painter, p.tex.id(), r, 0);
+                }
+                page_rects.push((idx, r));
+            }
+        }
+        if resp.secondary_clicked() {
+            let nearest = resp.interact_pointer_pos().and_then(|pp| {
+                page_rects
+                    .iter()
+                    .min_by(|a, b| a.1.distance_to_pos(pp).total_cmp(&b.1.distance_to_pos(pp)))
+                    .map(|(i, _)| *i)
+            });
+            self.ctx_target = nearest.unwrap_or(shown_index);
+        }
+
+        // Menu klik kanan.
+        let mut chosen: Option<CtxChoice> = None;
+        resp.context_menu(|ui| {
+            if ui.button("Set as wallpaper...").clicked() {
+                chosen = Some(CtxChoice::Wallpaper);
+                ui.close();
+            }
+            if ui.button("Properties").clicked() {
+                chosen = Some(CtxChoice::Properties);
+                ui.close();
+            }
+            ui.menu_button("Tindakan", |ui| {
+                if ui.button("Buka di dalam folder").clicked() {
+                    chosen = Some(CtxChoice::OpenFolder);
+                    ui.close();
+                }
+                if ui.button("Pindahkan ke sampah").clicked() {
+                    chosen = Some(CtxChoice::Trash);
+                    ui.close();
+                }
+            });
+        });
+        if let Some(c) = chosen {
+            let target = self.ctx_target;
+            self.handle_ctx(ctx, c, target);
+        }
 
         let can_pan = geo.size.x > rect.width() + 0.5 || geo.size.y > rect.height() + 0.5;
         if can_pan && resp.hovered() {
@@ -1113,6 +1431,10 @@ impl RoneyApp {
                             ("R / Shift+R", "Putar kanan / kiri"),
                             ("P", "Jeda / putar animasi (GIF, WebP, APNG)"),
                             ("L", "Kunci / lepas bar bawah"),
+                            ("M", "Mode hemat memori (buang gambar dari RAM setelah dilihat)"),
+                            ("D", "Mode dua halaman"),
+                            ("K", "Arah baca kanan-ke-kiri (panah kiri = berikutnya)"),
+                            ("Klik kanan", "Set as wallpaper, Properties, Tindakan"),
                             ("Mouse ke tepi kiri/kanan", "Tombol sebelumnya / berikutnya"),
                             ("Mouse ke bawah", "Bar: tombol, slider lompat, Kunci"),
                             ("Enter / F11 / klik ganda", "Layar penuh (Esc keluar)"),
@@ -1133,10 +1455,17 @@ impl RoneyApp {
     /// Majukan frame animasi bila waktunya. Tidak menjadwalkan repaint saat dijeda
     /// atau saat halaman bukan animasi, jadi CPU tetap idle untuk gambar statis.
     fn tick_animation(&mut self, ctx: &Context) {
-        let Some(page) = self.current_page() else {
+        let Some(sh) = self.current_content() else {
             return;
         };
-        let shown_index = self.shown.as_ref().map_or(0, |(i, _)| *i);
+        // Animasi hanya diputar bila yang tampil satu halaman.
+        let (shown_index, page) = match sh.slots.as_slice() {
+            [(i, p)] => (*i, p.clone()),
+            _ => {
+                self.anim_key = None;
+                return;
+            }
+        };
         let Some(anim) = &page.anim else {
             self.anim_key = None;
             return;
@@ -1204,8 +1533,11 @@ impl eframe::App for RoneyApp {
         if let Some(p) = inp.dropped.first() {
             self.open_path(ctx, p);
         }
-        for a in &inp.actions {
-            self.perform(ctx, *a);
+        // Saat kotak konfirmasi terbuka, pintasan keyboard utama tidak berlaku.
+        if self.modal.is_none() {
+            for a in &inp.actions {
+                self.perform(ctx, *a);
+            }
         }
 
         self.tick_animation(ctx);
@@ -1218,12 +1550,14 @@ impl eframe::App for RoneyApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
             .show(ctx, |ui| self.draw_view(ctx, ui, &inp));
+        self.update_title(ctx);
         self.draw_nav_overlays(ctx);
         for a in acts {
             self.perform(ctx, a);
         }
 
         self.draw_overlays(ctx, inp.hovering_files);
+        self.draw_dialogs(ctx);
 
         if self.store_dirty {
             if self.last_save.elapsed() >= Duration::from_millis(1500) {
@@ -1236,18 +1570,6 @@ impl eframe::App for RoneyApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_state();
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    let b = bytes as f64;
-    if b >= KB * KB {
-        format!("{:.2} MB", b / (KB * KB))
-    } else if b >= KB {
-        format!("{:.0} KB", b / KB)
-    } else {
-        format!("{bytes} B")
     }
 }
 
@@ -1384,12 +1706,18 @@ struct BarInput {
     locked: bool,
     /// Lebar isi (di dalam margin bingkai).
     width: f32,
+    /// Arah baca kanan-ke-kiri: slider dicerminkan.
+    rtl: bool,
+    can_left: bool,
+    can_right: bool,
+    /// Halaman terakhir pada spread dua halaman yang sedang tampil.
+    pair_end: Option<usize>,
 }
 
 #[derive(Default)]
 struct BarOutput {
-    prev: bool,
-    next: bool,
+    left: bool,
+    right: bool,
     locked: bool,
     /// Indeks di bawah pointer selama tombol mouse ditahan pada slider.
     scrub: Option<usize>,
@@ -1412,7 +1740,7 @@ fn draw_bar(ui: &mut egui::Ui, inp: &BarInput) -> BarOutput {
 
     ui.spacing_mut().item_spacing.x = gap;
     ui.horizontal(|ui| {
-        out.prev = icon_button(ui, btn, Chevron::Left, inp.index > 0, 6.0, 90).clicked();
+        out.left = icon_button(ui, btn, Chevron::Left, inp.can_left, 6.0, 90).clicked();
 
         // Slider kustom: nilai mengikuti pointer selama tombol ditahan.
         let sense = if inp.n > 1 {
@@ -1427,7 +1755,9 @@ fn draw_bar(ui: &mut egui::Ui, inp: &BarInput) -> BarOutput {
         let down = inp.n > 1 && resp.is_pointer_button_down_on();
         if down {
             if let Some(p) = resp.interact_pointer_pos() {
-                out.scrub = Some(scrub_index(p.x, track_left, track_w, inp.n));
+                // Dicerminkan untuk arah baca kanan-ke-kiri.
+                let x = if inp.rtl { 2.0 * track_left + track_w - p.x } else { p.x };
+                out.scrub = Some(scrub_index(x, track_left, track_w, inp.n));
             }
             out.active = true;
         }
@@ -1436,16 +1766,18 @@ fn draw_bar(ui: &mut egui::Ui, inp: &BarInput) -> BarOutput {
             .or(inp.scrub)
             .unwrap_or(inp.index)
             .min(last);
-        let hx = scrub_x(shown, track_left, track_w, inp.n);
+        let hx_ltr = scrub_x(shown, track_left, track_w, inp.n);
+        let hx = if inp.rtl { 2.0 * track_left + track_w - hx_ltr } else { hx_ltr };
         let cy = rect.center().y;
         let painter = ui.painter();
         let track = Rect::from_min_max(pos2(track_left, cy - 2.0), pos2(track_left + track_w, cy + 2.0));
         painter.rect_filled(track, 2.0, Color32::from_white_alpha(55));
-        painter.rect_filled(
-            Rect::from_min_max(track.min, pos2(hx, track.max.y)),
-            2.0,
-            ACCENT,
-        );
+        let fill = if inp.rtl {
+            Rect::from_min_max(pos2(hx, track.min.y), track.max)
+        } else {
+            Rect::from_min_max(track.min, pos2(hx, track.max.y))
+        };
+        painter.rect_filled(fill, 2.0, ACCENT);
         let r = if down {
             9.0
         } else if resp.hovered() {
@@ -1459,12 +1791,15 @@ fn draw_bar(ui: &mut egui::Ui, inp: &BarInput) -> BarOutput {
         }
         out.slider = Some(rect);
 
-        out.next = icon_button(ui, btn, Chevron::Right, inp.index < last, 6.0, 90).clicked();
+        out.right = icon_button(ui, btn, Chevron::Right, inp.can_right, 6.0, 90).clicked();
 
         ui.add_sized(
             [label_w, btn.y],
             egui::Label::new(
-                egui::RichText::new(format!("{}/{}", shown + 1, inp.n))
+                egui::RichText::new(match (inp.scrub.or(out.scrub), inp.pair_end) {
+                    (None, Some(j)) => format!("{}-{}/{}", shown + 1, j + 1, inp.n),
+                    _ => format!("{}/{}", shown + 1, inp.n),
+                })
                     .monospace()
                     .color(Color32::WHITE),
             ),
@@ -1482,6 +1817,208 @@ fn draw_bar(ui: &mut egui::Ui, inp: &BarInput) -> BarOutput {
 }
 
 impl RoneyApp {
+    fn page_for(&self, index: usize) -> Option<Arc<Page>> {
+        self.cache
+            .get(&index)
+            .cloned()
+            .or_else(|| {
+                self.shown
+                    .as_ref()
+                    .and_then(|sh| sh.slots.iter().find(|(i, _)| *i == index).map(|(_, p)| p.clone()))
+            })
+    }
+
+    fn handle_ctx(&mut self, ctx: &Context, choice: CtxChoice, index: usize) {
+        let Some(listing) = self.listing.clone() else {
+            return;
+        };
+        let Some(page) = self.page_for(index) else {
+            return;
+        };
+        match choice {
+            CtxChoice::Properties => {
+                let facts = PageFacts {
+                    width: page.orig[0],
+                    height: page.orig[1],
+                    file_size: page.file_size,
+                    format: page.format.clone(),
+                };
+                self.props = Some(PropsDialog {
+                    rows: fileinfo::properties_rows(&listing, index, &facts),
+                });
+            }
+            CtxChoice::Wallpaper => {
+                let ppp = ctx.pixels_per_point();
+                let screen = ctx
+                    .input(|i| i.viewport().monitor_size)
+                    .map_or([1920.0, 1080.0], |m| [(m.x * ppp).max(320.0), (m.y * ppp).max(240.0)]);
+                self.wallpaper = Some(WallpaperDialog::new(
+                    listing,
+                    index,
+                    page.tex.id(),
+                    page.orig,
+                    screen,
+                    self.store.state.wallpaper.clone(),
+                ));
+            }
+            CtxChoice::OpenFolder | CtxChoice::Trash => {
+                if listing.is_archive() {
+                    self.modal = Some(Modal::ArchiveWarning {
+                        archive: listing.origin.display().to_string(),
+                    });
+                    return;
+                }
+                let Some(name) = listing.names.get(index).cloned() else {
+                    return;
+                };
+                let path = listing.origin.join(&name);
+                if matches!(choice, CtxChoice::OpenFolder) {
+                    dialogs::open_in_folder(&path, self.note_tx.clone(), ctx.clone());
+                    self.notify("Membuka folder...");
+                } else {
+                    self.modal = Some(Modal::ConfirmTrash { index, path, name });
+                }
+            }
+        }
+    }
+
+    /// Kosongkan tampilan (mis. folder tidak berisi gambar lagi).
+    fn clear_listing(&mut self, ctx: &Context) {
+        self.session += 1;
+        self.listing = None;
+        self.index = 0;
+        self.cache.clear();
+        self.pending.clear();
+        self.errors.clear();
+        self.dims.clear();
+        self.shown = None;
+        self.placed_for = None;
+        self.title = String::new();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("Roneyview".into()));
+    }
+
+    fn after_trash(&mut self, ctx: &Context, index: usize, name: &str) {
+        let Some(listing) = self.listing.clone() else {
+            return;
+        };
+        match Listing::open(&listing.origin) {
+            Ok((l, _)) => self.install_listing(ctx, l, index),
+            Err(_) => self.clear_listing(ctx),
+        }
+        self.notify(format!("Dipindahkan ke Tempat Sampah: {name}"));
+    }
+
+    fn draw_dialogs(&mut self, ctx: &Context) {
+        while let Ok(msg) = self.note_rx.try_recv() {
+            self.modal = Some(Modal::Error(msg));
+        }
+        if let Some(modal) = self.modal.take() {
+            match dialogs::draw_modal(ctx, &modal) {
+                ModalResult::Keep => self.modal = Some(modal),
+                ModalResult::Close => {}
+                ModalResult::ConfirmTrash => {
+                    if let Modal::ConfirmTrash { index, path, name } = modal {
+                        match dialogs::move_to_trash(&path) {
+                            Ok(()) => self.after_trash(ctx, index, &name),
+                            Err(e) => self.modal = Some(Modal::Error(e)),
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(dlg) = self.props.take() {
+            let mut open = true;
+            let mut inner_close = false;
+            dialogs::show_dialog(ctx, "roneyview-properties", "Properties", [520.0, 340.0], &mut open, |_, ui| {
+                if dialogs::draw_properties(ui, &dlg) {
+                    inner_close = true;
+                }
+            });
+            if open && !inner_close {
+                self.props = Some(dlg);
+            }
+        }
+        if let Some(mut dlg) = self.wallpaper.take() {
+            let mut open = true;
+            let mut inner_close = false;
+            dialogs::show_dialog(ctx, "roneyview-wallpaper", "Set as wallpaper", [460.0, 560.0], &mut open, |c, ui| {
+                if dialogs::draw_wallpaper(c, ui, &mut dlg) {
+                    inner_close = true;
+                }
+            });
+            if dlg.prefs != self.store.state.wallpaper {
+                self.store.state.wallpaper = dlg.prefs.clone();
+                self.store_dirty = true;
+            }
+            if open && !inner_close {
+                self.wallpaper = Some(dlg);
+            }
+        }
+    }
+
+    fn set_low_memory(&mut self, ctx: &Context, on: bool) {
+        self.low_memory_mode = on;
+        self.store.state.low_memory = on;
+        self.store_dirty = true;
+        // Buang segera semua halaman selain yang sedang dilihat.
+        let (lo, hi) = keep_window(self.index, on, self.two_page_mode);
+        self.cache.retain(|i, _| (lo..=hi).contains(i));
+        if !on {
+            self.request_pages(ctx); // nyalakan lagi prefetch
+        }
+        self.notify(if on {
+            "Mode hemat memori aktif: hanya gambar yang dilihat disimpan di RAM"
+        } else {
+            "Mode hemat memori mati: gambar sekitar dimuat lebih dulu agar cepat"
+        });
+    }
+
+    fn set_two_page(&mut self, ctx: &Context, on: bool) {
+        self.two_page_mode = on;
+        self.store.state.two_page = on;
+        self.store_dirty = true;
+        self.relayout(ctx);
+        self.notify(if on { "Mode dua halaman aktif" } else { "Mode dua halaman mati" });
+    }
+
+    fn set_rtl(&mut self, ctx: &Context, on: bool) {
+        self.rtl = on;
+        self.store.state.rtl = on;
+        self.store_dirty = true;
+        self.placed_for = None;
+        ctx.request_repaint();
+        self.notify(if on {
+            "Arah baca kanan-ke-kiri (manga): panah kiri = berikutnya"
+        } else {
+            "Arah baca kiri-ke-kanan"
+        });
+    }
+
+    fn set_cover(&mut self, ctx: &Context, on: bool) {
+        self.cover_alone = on;
+        self.store.state.cover_alone = on;
+        self.store_dirty = true;
+        self.relayout(ctx);
+        self.notify(if on {
+            "Halaman pertama tampil sendiri (sampul)"
+        } else {
+            "Halaman pertama dipasangkan dengan kedua"
+        });
+    }
+
+    /// Susun ulang tampilan setelah pengaturan dua halaman berubah: rapatkan awal spread
+    /// ke kisi yang benar lalu muat ulang halaman di sekitarnya.
+    fn relayout(&mut self, ctx: &Context) {
+        self.placed_for = None;
+        self.zoom = Zoom::Fit(self.fit);
+        let t = self.snap_start(self.index);
+        if t != self.index && t < self.count() {
+            self.go_to(ctx, t, false);
+        } else {
+            self.after_page_change(ctx);
+        }
+    }
+
     fn set_bar_lock(&mut self, locked: bool) {
         self.bar_locked = locked;
         self.store.state.bar_locked = locked;
@@ -1502,14 +2039,23 @@ impl RoneyApp {
         let busy = self.panning;
         let over = |z: Rect| !busy && ptr.is_some_and(|p| z.contains(p));
 
+        // Arah baca kanan-ke-kiri menukar fungsi tombol kiri dan kanan.
+        let can_prev = self.index > 0;
+        let can_next = self.index + self.next_span() < n;
+        let (can_left, can_right) = if self.rtl { (can_next, can_prev) } else { (can_prev, can_next) };
+        let (left_act, right_act) = if self.rtl {
+            (Action::Next, Action::Prev)
+        } else {
+            (Action::Prev, Action::Next)
+        };
         let t_left = ctx.animate_bool_with_time(
             egui::Id::new("nav_left"),
-            self.index > 0 && over(zone_l),
+            can_left && over(zone_l),
             FADE_SECS,
         );
         let t_right = ctx.animate_bool_with_time(
             egui::Id::new("nav_right"),
-            self.index + 1 < n && over(zone_r),
+            can_right && over(zone_r),
             FADE_SECS,
         );
         // Bar tetap tampil selama dikunci atau slider sedang ditahan.
@@ -1529,7 +2075,7 @@ impl RoneyApp {
                 })
                 .inner;
             if clicked {
-                action = Some(Action::Prev);
+                action = Some(left_act);
             }
         }
         if t_right > 0.02 {
@@ -1543,19 +2089,28 @@ impl RoneyApp {
                 })
                 .inner;
             if clicked {
-                action = Some(Action::Next);
+                action = Some(right_act);
             }
         }
 
         let mut bar: Option<BarOutput> = None;
         if t_bar > 0.02 {
             let bar_w = (view.width() - 24.0).clamp(220.0, 780.0);
+            let pair_end = self
+                .shown
+                .as_ref()
+                .filter(|sh| sh.start == self.index && sh.slots.len() == 2)
+                .map(|sh| sh.slots[1].0);
             let input = BarInput {
                 n,
                 index: self.index,
                 scrub: self.scrub,
                 locked: self.bar_locked,
                 width: bar_w - 20.0,
+                rtl: self.rtl,
+                can_left,
+                can_right,
+                pair_end,
             };
             let out = egui::Area::new(egui::Id::new("nav_bar_area"))
                 .order(egui::Order::Foreground)
@@ -1582,12 +2137,15 @@ impl RoneyApp {
                 self.scrub = b.scrub.or(self.scrub);
             }
         } else if let Some(target) = self.scrub.take() {
-            self.go_to(ctx, target, false);
+            let t = self.snap_start(target);
+            self.go_to(ctx, t, false);
         }
 
         // Petunjuk melayang di atas pegangan slider saat digeser.
         if let (Some(sc), Some(sl)) = (self.scrub, bar.as_ref().and_then(|b| b.slider)) {
-            let hx = scrub_x(sc, sl.left() + 9.0, (sl.width() - 18.0).max(1.0), n);
+            let (tl, tw) = (sl.left() + 9.0, (sl.width() - 18.0).max(1.0));
+            let hx_ltr = scrub_x(sc, tl, tw, n);
+            let hx = if self.rtl { 2.0 * tl + tw - hx_ltr } else { hx_ltr };
             let name = self
                 .listing
                 .as_ref()
@@ -1609,10 +2167,10 @@ impl RoneyApp {
         }
 
         if let Some(b) = &bar {
-            if b.prev {
-                action = Some(Action::Prev);
-            } else if b.next {
-                action = Some(Action::Next);
+            if b.left {
+                action = Some(left_act);
+            } else if b.right {
+                action = Some(right_act);
             }
             if b.locked != self.bar_locked {
                 self.set_bar_lock(b.locked);
@@ -1655,13 +2213,6 @@ mod tests {
             clamp_offset(vec2(500.0, -500.0), vec2(300.0, 200.0), view),
             vec2(100.0, -50.0)
         );
-    }
-
-    #[test]
-    fn ukuran_berkas_terbaca_manusiawi() {
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(2048), "2 KB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5.00 MB");
     }
 
     #[test]
@@ -1718,5 +2269,86 @@ mod tests {
         let uni = "日本語のとても長いファイル名その二その三その四.png";
         let t = truncate_middle(uni, 12);
         assert_eq!(t.chars().count(), 12);
+    }
+
+    #[test]
+    fn jendela_cache_normal_dan_mode_hemat() {
+        assert_eq!(keep_window(10, false, false), (8, 13));
+        assert_eq!(keep_window(0, false, false), (0, 3));
+        assert_eq!(keep_window(10, true, false), (10, 10));
+        assert_eq!(keep_window(0, true, false), (0, 0));
+        // dua halaman: jendela melebar, mode hemat menyimpan tepat sepasang
+        assert_eq!(keep_window(10, false, true), (7, 15));
+        assert_eq!(keep_window(10, true, true), (10, 11));
+        assert_eq!(keep_window(0, true, true), (0, 1));
+    }
+
+    #[test]
+    fn awal_spread_mengikuti_kisi_dengan_dan_tanpa_sampul() {
+        // dengan sampul tunggal: 0 | 1 2 | 3 4 | 5 6 ...
+        let cover: Vec<usize> = (0..8).map(|t| snap_start_for(t, true, true)).collect();
+        assert_eq!(cover, vec![0, 1, 1, 3, 3, 5, 5, 7]);
+        // tanpa sampul: 0 1 | 2 3 | 4 5 ...
+        let plain: Vec<usize> = (0..8).map(|t| snap_start_for(t, true, false)).collect();
+        assert_eq!(plain, vec![0, 0, 2, 2, 4, 4, 6, 6]);
+        // mode satu halaman tidak mengubah apa pun
+        assert!((0..8).all(|t| snap_start_for(t, false, true) == t));
+    }
+
+    #[test]
+    fn maju_mundur_melewati_spread_tanpa_kehilangan_halaman() {
+        let none = |_: usize| false;
+        // semua halaman potret, 11 halaman, dengan sampul: 0 | 1 2 | 3 4 | 5 6 | 7 8 | 9 10
+        let mut walk = vec![0usize];
+        let mut s = 0;
+        loop {
+            let span = if s == 0 { 1 } else { 2 };
+            if s + span >= 11 {
+                break;
+            }
+            s += span;
+            walk.push(s);
+        }
+        assert_eq!(walk, vec![0, 1, 3, 5, 7, 9]);
+        // mundur dari ujung harus menempuh urutan yang sama
+        let mut back = vec![9usize];
+        let mut cur = 9;
+        while let Some(p) = prev_start_for(cur, true, true, &none) {
+            back.push(p);
+            cur = p;
+        }
+        back.reverse();
+        assert_eq!(back, walk);
+        // tanpa sampul: 0 2 4 ...
+        assert_eq!(prev_start_for(4, true, false, &none), Some(2));
+        assert_eq!(prev_start_for(2, true, false, &none), Some(0));
+        assert_eq!(prev_start_for(1, true, false, &none), Some(0));
+        assert_eq!(prev_start_for(0, true, false, &none), None);
+        // mode satu halaman: mundur satu per satu
+        assert_eq!(prev_start_for(5, false, true, &none), Some(4));
+    }
+
+    #[test]
+    fn halaman_lebar_dilompati_sebagai_tunggal_saat_mundur() {
+        // halaman 4 lebar: pasangan (3,4) tidak boleh terbentuk
+        let wide4 = |i: usize| i == 4;
+        assert_eq!(prev_start_for(5, true, true, &wide4), Some(4));
+        // dengan sampul, dari 2 mundur ke 1 (halaman 1 tampil sendiri), bukan 0
+        assert_eq!(prev_start_for(2, true, true, &|_| false), Some(1));
+        assert_eq!(prev_start_for(1, true, true, &|_| false), Some(0));
+        // pasangan biasa tetap utuh bila tak ada halaman lebar
+        assert_eq!(prev_start_for(7, true, true, &wide4), Some(5));
+    }
+
+    #[test]
+    fn dua_halaman_disamakan_tingginya_dan_tidak_dibagi_nol() {
+        let (w, h) = pair_widths(&[(800.0, 1200.0), (800.0, 1200.0)]);
+        assert_eq!((w.clone(), h), (vec![800.0, 800.0], 1200.0));
+        // halaman kedua lebih pendek: diperbesar agar tingginya sama dengan yang tertinggi
+        let (w, h) = pair_widths(&[(800.0, 1200.0), (400.0, 600.0)]);
+        assert_eq!(h, 1200.0);
+        assert!((w[0] - 800.0).abs() < 1e-3 && (w[1] - 800.0).abs() < 1e-3, "{w:?}");
+        let (w, h) = pair_widths(&[(0.0, 0.0), (10.0, 0.0)]);
+        assert!(h >= 1.0 && w.iter().all(|v| v.is_finite()));
     }
 }

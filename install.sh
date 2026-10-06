@@ -16,9 +16,9 @@ refresh_caches() {
 }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-  rm -f "$BIN" "$DESKTOP" "$ICON"
+  rm -f "$BIN" "$DESKTOP" "$ICON" "$HOME/.config/autostart/roneyview-wallpaper.desktop"
   refresh_caches
-  echo "Roneyview dihapus. (Pengaturan di ~/.config/roneyview dibiarkan.)"
+  echo "Roneyview dihapus. (Pengaturan di ~/.config/roneyview dan wallpaper di ~/.local/share/roneyview dibiarkan.)"
   exit 0
 fi
 

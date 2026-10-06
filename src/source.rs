@@ -43,6 +43,19 @@ pub fn is_archive_path(path: &Path) -> bool {
         .is_some_and(|e| ARCHIVE_EXTS.contains(&e.as_str()))
 }
 
+/// Waktu DOS (dipakai RAR): tanggal di 16 bit atas, jam di 16 bit bawah.
+/// Sudah berupa waktu lokal si pembuat arsip, jadi tidak dikonversi zona waktu.
+#[cfg(feature = "rar")]
+fn dos_stamp(packed: u32) -> Option<String> {
+    let (date, time) = ((packed >> 16) & 0xFFFF, packed & 0xFFFF);
+    let (day, month, year) = (date & 31, (date >> 5) & 15, 1980 + (date >> 9));
+    if !(1..=31).contains(&day) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let (sec, min, hour) = ((time & 31) * 2, (time >> 5) & 63, (time >> 11) & 31);
+    Some(crate::fileinfo::format_stamp(i64::from(year), month, day, hour, min, sec))
+}
+
 fn file_name_string(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -64,10 +77,11 @@ type RarCursor = unrar::OpenArchive<unrar::Process, unrar::CursorBeforeHeader>;
 pub struct Listing {
     /// Folder atau berkas arsip yang dibuka.
     pub origin: PathBuf,
-    /// Kunci stabil (path kanonik) untuk menyimpan posisi terakhir.
-    pub key: String,
     /// Nama tampilan tiap gambar, sudah terurut alami.
     pub names: Vec<String>,
+    /// Tanggal ubah tiap entri ARSIP ("2026-10-05 14:03:09"); kosong untuk folder
+    /// (tanggal berkas folder dibaca langsung dari disk saat dibutuhkan).
+    pub modified: Vec<Option<String>>,
     kind: Kind,
 }
 
@@ -236,13 +250,6 @@ fn rar_error(context: &str, e: &unrar::error::UnrarError) -> String {
     }
 }
 
-fn canonical_key(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
 fn list_folder(dir: &Path, keep_hidden: Option<&str>) -> Result<Listing, String> {
     let rd = fs::read_dir(dir)
         .map_err(|e| format!("Tidak dapat membaca folder {}: {e}", dir.display()))?;
@@ -270,8 +277,8 @@ fn list_folder(dir: &Path, keep_hidden: Option<&str>) -> Result<Listing, String>
     let (names, files): (Vec<_>, Vec<_>) = items.into_iter().unzip();
     Ok(Listing {
         origin: dir.to_path_buf(),
-        key: canonical_key(dir),
         names,
+        modified: Vec::new(),
         kind: Kind::Folder { files },
     })
 }
@@ -315,7 +322,7 @@ fn list_rar(path: &Path) -> Result<Listing, String> {
     let archive = unrar::Archive::new(path)
         .open_for_listing()
         .map_err(|e| rar_error("Arsip RAR tidak dapat dibuka", &e))?;
-    let mut items: Vec<(String, usize)> = Vec::new();
+    let mut items: Vec<(String, usize, Option<String>)> = Vec::new();
     for (ordinal, entry) in archive.enumerate() {
         // Header rusak di tengah arsip: pakai entri yang sudah terbaca.
         let Ok(entry) = entry else { break };
@@ -328,7 +335,7 @@ fn list_rar(path: &Path) -> Result<Listing, String> {
             continue;
         }
         if is_image_name(&name) {
-            items.push((name, ordinal));
+            items.push((name, ordinal, dos_stamp(entry.file_time)));
         }
     }
     if items.is_empty() {
@@ -338,11 +345,18 @@ fn list_rar(path: &Path) -> Result<Listing, String> {
         ));
     }
     items.sort_by(|a, b| natural_cmp(&a.0, &b.0));
-    let (names, ordinals): (Vec<_>, Vec<_>) = items.into_iter().unzip();
+    let mut names = Vec::with_capacity(items.len());
+    let mut ordinals = Vec::with_capacity(items.len());
+    let mut modified = Vec::with_capacity(items.len());
+    for (n, o, m) in items {
+        names.push(n);
+        ordinals.push(o);
+        modified.push(m);
+    }
     Ok(Listing {
         origin: path.to_path_buf(),
-        key: canonical_key(path),
         names,
+        modified,
         kind: Kind::Rar { ordinals },
     })
 }
@@ -351,7 +365,7 @@ fn list_zip(path: &Path) -> Result<Listing, String> {
     let file = File::open(path).map_err(|e| format!("Tidak dapat membuka arsip: {e}"))?;
     let mut archive = ZipArchive::new(BufReader::new(file))
         .map_err(|e| format!("Arsip ZIP tidak valid: {e}"))?;
-    let mut items: Vec<(String, usize)> = Vec::new();
+    let mut items: Vec<(String, usize, Option<String>)> = Vec::new();
     for i in 0..archive.len() {
         let Ok(entry) = archive.by_index_raw(i) else {
             continue;
@@ -365,7 +379,17 @@ fn list_zip(path: &Path) -> Result<Listing, String> {
             continue;
         }
         if is_image_name(&name) {
-            items.push((name, i));
+            let stamp = entry.last_modified().map(|d| {
+                crate::fileinfo::format_stamp(
+                    i64::from(d.year()),
+                    u32::from(d.month()),
+                    u32::from(d.day()),
+                    u32::from(d.hour()),
+                    u32::from(d.minute()),
+                    u32::from(d.second()),
+                )
+            });
+            items.push((name, i, stamp));
         }
     }
     if items.is_empty() {
@@ -375,11 +399,18 @@ fn list_zip(path: &Path) -> Result<Listing, String> {
         ));
     }
     items.sort_by(|a, b| natural_cmp(&a.0, &b.0));
-    let (names, zip_indices): (Vec<_>, Vec<_>) = items.into_iter().unzip();
+    let mut names = Vec::with_capacity(items.len());
+    let mut zip_indices = Vec::with_capacity(items.len());
+    let mut modified = Vec::with_capacity(items.len());
+    for (n, i, m) in items {
+        names.push(n);
+        zip_indices.push(i);
+        modified.push(m);
+    }
     Ok(Listing {
         origin: path.to_path_buf(),
-        key: canonical_key(path),
         names,
+        modified,
         kind: Kind::Archive { zip_indices },
     })
 }
@@ -550,6 +581,35 @@ mod tests {
         let p2 = d.join("sampah.rar");
         fs::write(&p2, b"Rar!\x1a\x07\x01\x00 ini bukan rar sungguhan").unwrap();
         assert!(Listing::open(&p2).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(feature = "rar")]
+    #[test]
+    fn waktu_dos_didekode_dan_nilai_ngawur_ditolak() {
+        // 2026-10-05 14:03:08 -> tanggal ((2026-1980)<<9)|(10<<5)|5, jam (14<<11)|(3<<5)|(8/2)
+        let date: u32 = ((2026 - 1980) << 9) | (10 << 5) | 5;
+        let time: u32 = (14 << 11) | (3 << 5) | 4;
+        assert_eq!(dos_stamp((date << 16) | time).as_deref(), Some("2026-10-05 14:03:08"));
+        assert_eq!(dos_stamp(0), None);
+        assert_eq!(dos_stamp(0xFFFF_FFFF), None); // bulan 15 tidak ada
+    }
+
+    #[test]
+    fn tanggal_entri_zip_terbaca() {
+        let d = tmpdir("zipdate");
+        let zpath = d.join("a.zip");
+        {
+            let f = File::create(&zpath).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let t = zip::DateTime::from_date_and_time(2024, 3, 7, 9, 5, 30).unwrap();
+            let opts = zip::write::SimpleFileOptions::default().last_modified_time(t);
+            w.start_file("x.png", opts).unwrap();
+            w.write_all(b"d").unwrap();
+            w.finish().unwrap();
+        }
+        let (l, _) = Listing::open(&zpath).unwrap();
+        assert_eq!(l.modified, vec![Some("2024-03-07 09:05:30".to_string())]);
         let _ = fs::remove_dir_all(&d);
     }
 }
