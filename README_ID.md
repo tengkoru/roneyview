@@ -38,7 +38,7 @@ source "$HOME/.cargo/env"
 ./install.sh
 ```
 Semua alat bantu untuk kelancaran aplikasi roneyview akan diunduh otomatis saat Anda menjalankan ./install.sh. 
-Namun apabila ingin melihat alat bantu apa saja yang diperlukan oleh Roneyview, Anda dapat melihatnya [disini](supporting-roneyview.md)
+Namun apabila ingin melihat alat bantu apa saja yang diperlukan oleh Roneyview, Anda dapat melihatnya [disini](supporting-roneyview.txt)
 
 
 `install.sh` memeriksa paket yang tersedia dan hanya mengaktifkan fitur yang bisa dibangun,

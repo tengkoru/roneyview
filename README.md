@@ -1,4 +1,5 @@
 # Roneyview (version 0.5.0)
+###### README.md berbahasa Indonesia ada [disini](README_ID.md)
 
 An alternative to Honeyview; an image viewer for Linux; written in the Rust programming language (using egui/eframe).
 
@@ -38,7 +39,7 @@ source "$HOME/.cargo/env"
 ./install.sh
 ```
 All dependencies required for the smooth operation of roneyview will be downloaded automatically when you run ./install.sh.
-However, if you wish to see which dependencies Roneyview requires, you can view them [here](supporting-roneyview.md)
+However, if you wish to see which dependencies Roneyview requires, you can view them [here](supporting-roneyview.txt)
 
 
 `install.sh` checks for available packages and enables only the features that can be built,
