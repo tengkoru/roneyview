@@ -15,19 +15,19 @@ An alternative to Honeyview; an image viewer for Linux; written in the Rust prog
 - **Supports archive formats**: ZIP/CBZ/RAR/CBR; displays only the image files contained within the archive
 - **Does not save viewing history**: no list of images or positions from previous sessions; if you launch Roneyview from the command line without specifying a file or folder path, it will simply open an empty window
 - **Right-clicking on an image displays the following menu**:
-- **Set as wallpaper...**
-- **Properties**
-- **Actions**:
-- Open containing folder
-- Move to trash
+    - **Set as wallpaper...**
+    - **Properties**
+    - **Actions**:
+        - Open containing folder
+        - Move to trash
 - **Two-page mode** and **right-to-left reading direction** for manga/comics
 - Window-fit, width-fit, height-fit, and 100% view modes; zoom to cursor, pan, rotate, and full-screen
 - **Previous/Next buttons on the left/right edges**; appears only when the pointer approaches the edge
 - **Bottom bar**:
-- **prev/next buttons**
-- **seek slider**
-- **'lock' checkbox to keep the 'bottom bar' visible**
-
+    - **prev/next buttons**
+    - **seek slider**
+    - **'lock' checkbox to keep the 'bottom bar' visible**
+    
 ## Debian/Ubuntu/MX Linux/other Debian derivatives
 
 ```bash
