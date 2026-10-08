@@ -129,8 +129,14 @@ impl Listing {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let listing = list_folder(dir, Some(&name))?;
-        let idx = listing.names.iter().position(|n| *n == name).unwrap_or(0);
+        // Jalur relatif terhadap folder (mis. "sub/foto.png") supaya cocok dengan
+        // `names` hasil pemindaian rekursif.
+        let rel = path
+            .strip_prefix(dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| name.clone());
+        let listing = list_folder(dir, Some(rel.as_str()))?;
+        let idx = listing.names.iter().position(|n| *n == rel).unwrap_or(0);
         Ok((listing, Some(idx)))
     }
 
@@ -250,23 +256,12 @@ fn rar_error(context: &str, e: &unrar::error::UnrarError) -> String {
     }
 }
 
+/// Pindai folder SECARA REKURSIF: gambar di sub-folder ikut dimuat.
+/// `names` berisi jalur relatif terhadap `dir` ("sub/foto.png") supaya berkas
+/// bernama sama di folder berbeda tetap bisa dibedakan.
 fn list_folder(dir: &Path, keep_hidden: Option<&str>) -> Result<Listing, String> {
-    let rd = fs::read_dir(dir)
-        .map_err(|e| format!("Tidak dapat membaca folder {}: {e}", dir.display()))?;
     let mut items: Vec<(String, PathBuf)> = Vec::new();
-    for entry in rd.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') && keep_hidden != Some(name.as_str()) {
-            continue;
-        }
-        if !is_image_name(&name) {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_file() {
-            items.push((name, path));
-        }
-    }
+    collect_images(dir, dir, keep_hidden, &mut items)?;
     if items.is_empty() {
         return Err(format!(
             "Tidak ada gambar yang didukung di {}",
@@ -281,6 +276,48 @@ fn list_folder(dir: &Path, keep_hidden: Option<&str>) -> Result<Listing, String>
         modified: Vec::new(),
         kind: Kind::Folder { files },
     })
+}
+
+fn collect_images(
+    root: &Path,
+    dir: &Path,
+    keep_hidden: Option<&str>,
+    items: &mut Vec<(String, PathBuf)>,
+) -> Result<(), String> {
+    let rd = fs::read_dir(dir)
+        .map_err(|e| format!("Tidak dapat membaca folder {}: {e}", dir.display()))?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().into_owned());
+        let Ok(rel) = rel else { continue };
+        // `file_type` tidak mengikuti symlink: symlink ke folder tidak diikuti
+        // (mencegah loop), symlink ke berkas tetap dibuka lewat `is_file`.
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
+            // Lewati folder tersembunyi (.git, .thumbnails, ...) supaya tidak
+            // memindai ribuan berkas yang tidak diinginkan.
+            if base.starts_with('.') {
+                continue;
+            }
+            collect_images(root, &path, keep_hidden, items)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
+        if base.starts_with('.') && keep_hidden != Some(rel.as_str()) {
+            continue;
+        }
+        if !is_image_name(base) {
+            continue;
+        }
+        items.push((rel, path));
+    }
+    Ok(())
 }
 
 #[derive(PartialEq)]
@@ -456,6 +493,50 @@ mod tests {
         let mut r = l.open_reader().unwrap();
         assert_eq!(r.read(0).unwrap(), b"x");
         assert!(r.read(99).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn folder_dipindai_rekursif_dengan_nama_relatif() {
+        let d = tmpdir("rekursif");
+        fs::create_dir_all(d.join("sub/deep")).unwrap();
+        fs::create_dir_all(d.join(".hidden_dir")).unwrap();
+        for n in [
+            "a.png",
+            "sub/b2.png",
+            "sub/b10.png",
+            "sub/deep/c.png",
+            ".hidden_dir/d.png",
+            ".x.png",
+            "catatan.txt",
+        ] {
+            fs::write(d.join(n), b"x").unwrap();
+        }
+        let (l, _) = Listing::open(&d).unwrap();
+        assert_eq!(
+            l.names,
+            vec!["a.png", "sub/b2.png", "sub/b10.png", "sub/deep/c.png"]
+        );
+        // Membuka satu berkas: listing berakar di folder induk berkas itu
+        // (rekursif ke bawah), dan indeksnya menunjuk berkas yang benar.
+        let (l2, start) = Listing::open(&d.join("sub/b10.png")).unwrap();
+        assert_eq!(l2.names, vec!["b2.png", "b10.png", "deep/c.png"]);
+        assert_eq!(start, Some(1));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nama_sama_di_subfolder_berbeda_tetap_dibedakan() {
+        let d = tmpdir("duplikat");
+        fs::create_dir_all(d.join("s1")).unwrap();
+        fs::create_dir_all(d.join("s2")).unwrap();
+        fs::write(d.join("s1/foto.png"), b"satu").unwrap();
+        fs::write(d.join("s2/foto.png"), b"dua").unwrap();
+        let (l, _) = Listing::open(&d).unwrap();
+        assert_eq!(l.names, vec!["s1/foto.png", "s2/foto.png"]);
+        let mut r = l.open_reader().unwrap();
+        assert_eq!(r.read(0).unwrap(), b"satu");
+        assert_eq!(r.read(1).unwrap(), b"dua");
         let _ = fs::remove_dir_all(&d);
     }
 

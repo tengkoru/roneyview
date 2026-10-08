@@ -1,9 +1,9 @@
 [package]
 name = "roneyview"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.88"
-description = "Penampil gambar cepat bergaya Honeyview untuk Linux (folder, ZIP/CBZ)"
+description = "Image viewer; not only for picture, you can see a folder with pictures, archive with pictures, and comic files like CBZ"
 license = "MIT"
 
 [features]
@@ -20,6 +20,11 @@ rar = ["dep:unrar"]
 eframe = { version = "=0.33.3", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "qoi", "tga", "ico"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
+# Resize SIMD ~20x lebih cepat daripada `image::imageops::resize` untuk
+# foto besar (murni Rust, tanpa dependensi sistem). Fitur `image` memberi
+# integrasi langsung dengan `DynamicImage`, dengan fallback ke resize
+# bawaan `image` bila tipe piksel tidak didukung.
+fast_image_resize = { version = "6", features = ["image"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = { version = "0.15", default-features = false, features = ["gtk3"], optional = true }

@@ -408,11 +408,39 @@ fn fit_target(w: u32, h: u32, max_side: u32, max_pixels: usize) -> (u32, u32) {
 }
 
 fn decode_static(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
-    finish_static(load_dynamic(bytes)?, max_side)
+    finish_raw(load_raw(bytes)?, max_side)
 }
 
-/// Dekode penuh (dengan batas memori) dan terapkan orientasi EXIF.
-fn load_dynamic(bytes: &[u8]) -> Result<DynamicImage, String> {
+/// Gambar hasil dekode mentah: piksel BELUM diorientasi menurut EXIF.
+struct RawImage {
+    img: DynamicImage,
+    orientation: Orientation,
+}
+
+/// Apakah orientasi ini menukar sumbu (lebar <-> tinggi).
+fn swaps_axes(o: Orientation) -> bool {
+    matches!(
+        o,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    )
+}
+
+/// Dimensi setelah orientasi EXIF diterapkan.
+fn oriented_dims(w: u32, h: u32, o: Orientation) -> (u32, u32) {
+    if swaps_axes(o) {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+/// Dekode penuh (dengan batas memori). Orientasi EXIF TIDAK diterapkan di sini:
+/// pemanggil memperkecil dulu lalu mengorientasikan gambar kecilnya, supaya foto
+/// berorientasi tidak membayar satu salinan penuh yang sia-sia.
+fn load_raw(bytes: &[u8]) -> Result<RawImage, String> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("Gagal membaca berkas: {e}"))?;
@@ -424,24 +452,87 @@ fn load_dynamic(bytes: &[u8]) -> Result<DynamicImage, String> {
     check_canvas(dw, dh)?;
     check_bytes(decoder.total_bytes())?;
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder)
+    let img = DynamicImage::from_decoder(decoder)
         .map_err(|e| describe(&e, "Gambar rusak atau tidak lengkap"))?;
-    img.apply_orientation(orientation);
-    Ok(img)
+    Ok(RawImage { img, orientation })
 }
 
-fn finish_static(img: DynamicImage, max_side: u32) -> Result<Pixels, String> {
-    let (w, h) = (img.width(), img.height());
+fn finish_raw(raw: RawImage, max_side: u32) -> Result<Pixels, String> {
+    let (w, h) = (raw.img.width(), raw.img.height());
     if w == 0 || h == 0 {
         return Err("Gambar berukuran nol".into());
     }
-    let image = Arc::new(to_color_image(shrink(img, max_side)));
+    let (ow, oh) = oriented_dims(w, h, raw.orientation);
+    // Target dihitung dalam ruang terorientasi, lalu dipetakan kembali ke ruang
+    // sebelum orientasi supaya resize dikerjakan pada gambar yang belum diputar:
+    // foto portrait 6000x4000 tidak lagi disalin 24 MP dua kali.
+    let (tw, th) = fit_target(ow, oh, max_side, max_pixels());
+    let (uw, uh) = if swaps_axes(raw.orientation) {
+        (th, tw)
+    } else {
+        (tw, th)
+    };
+    let mut img = shrink_to(raw.img, uw, uh);
+    img.apply_orientation(raw.orientation);
+    let image = Arc::new(to_color_image(img));
     Ok(Pixels {
         image,
-        orig: [w, h],
+        orig: [ow, oh],
         frames: None,
         truncated: false,
         format: String::new(),
+    })
+}
+
+/// Perkecil ke ukuran pasti dalam format aslinya (mis. RGB8), bukan RGBA:
+/// menghindari salinan RGBA berukuran penuh yang bisa mencapai ratusan MB.
+///
+/// Memakai `fast_image_resize` (SIMD, ~20x lebih cepat daripada
+/// `image::imageops` untuk foto besar); fallback ke resize bawaan `image`
+/// bila tipe piksel tidak didukung.
+fn shrink_to(img: DynamicImage, w: u32, h: u32) -> DynamicImage {
+    let (iw, ih) = (img.width(), img.height());
+    if (w, h) == (iw, ih) {
+        return img;
+    }
+    fast_shrink(img, w, h).unwrap_or_else(|img| img.resize_exact(w, h, FilterType::Triangle))
+}
+
+/// Resize via `fast_image_resize`. `Err` mengembalikan gambar utuh untuk fallback.
+fn fast_shrink(img: DynamicImage, w: u32, h: u32) -> Result<DynamicImage, DynamicImage> {
+    use fast_image_resize::{
+        FilterType as FirFilterType, ResizeAlg, ResizeOptions, Resizer,
+    };
+
+    let mut dst = match blank_like(&img, w, h) {
+        Some(d) => d,
+        None => return Err(img),
+    };
+    // Bilinear: kualitas setara Triangle untuk downscale tampilan,
+    // jauh lebih cepat. `mul_div_alpha` bawaan menangani alfa dengan benar.
+    let opts =
+        ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FirFilterType::Bilinear));
+    match Resizer::new().resize(&img, &mut dst, &opts) {
+        Ok(()) => Ok(dst),
+        Err(_) => Err(img),
+    }
+}
+
+/// Gambar kosong dengan tipe piksel yang sama dengan sumber (syarat
+/// `fast_image_resize`: tipe src dan dst harus sama).
+fn blank_like(img: &DynamicImage, w: u32, h: u32) -> Option<DynamicImage> {
+    Some(match img {
+        DynamicImage::ImageLuma8(_) => DynamicImage::new_luma8(w, h),
+        DynamicImage::ImageLumaA8(_) => DynamicImage::new_luma_a8(w, h),
+        DynamicImage::ImageRgb8(_) => DynamicImage::new_rgb8(w, h),
+        DynamicImage::ImageRgba8(_) => DynamicImage::new_rgba8(w, h),
+        DynamicImage::ImageLuma16(_) => DynamicImage::new_luma16(w, h),
+        DynamicImage::ImageLumaA16(_) => DynamicImage::new_luma_a16(w, h),
+        DynamicImage::ImageRgb16(_) => DynamicImage::new_rgb16(w, h),
+        DynamicImage::ImageRgba16(_) => DynamicImage::new_rgba16(w, h),
+        DynamicImage::ImageRgb32F(_) => DynamicImage::new_rgb32f(w, h),
+        DynamicImage::ImageRgba32F(_) => DynamicImage::new_rgba32f(w, h),
+        _ => return None,
     })
 }
 
@@ -450,10 +541,7 @@ fn finish_static(img: DynamicImage, max_side: u32) -> Result<Pixels, String> {
 fn shrink(img: DynamicImage, max_side: u32) -> DynamicImage {
     let (w, h) = (img.width(), img.height());
     let (nw, nh) = fit_target(w, h, max_side, max_pixels());
-    if (nw, nh) == (w, h) {
-        return img;
-    }
-    img.resize_exact(nw, nh, FilterType::Triangle)
+    shrink_to(img, nw, nh)
 }
 
 fn to_color_image(img: DynamicImage) -> ColorImage {
@@ -581,7 +669,14 @@ fn is_heif(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "heif")]
 fn decode_heif(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
-    finish_static(DynamicImage::ImageRgba8(load_heif_rgba(bytes)?), max_side)
+    finish_raw(
+        RawImage {
+            img: DynamicImage::ImageRgba8(load_heif_rgba(bytes)?),
+            // `decode` libheif sudah menerapkan rotasi/mirror/crop dari berkas.
+            orientation: Orientation::NoTransforms,
+        },
+        max_side,
+    )
 }
 
 #[cfg(feature = "heif")]
@@ -632,40 +727,58 @@ fn load_heif_rgba(bytes: &[u8]) -> Result<RgbaImage, String> {
 /// GIF/WebP/APNG beranimasi diambil frame pertamanya.
 pub fn decode_rgba(bytes: &[u8], max_side: u32, max_pixels: usize) -> Result<RgbaImage, String> {
     #[cfg(feature = "heif")]
-    let img = if is_heif(bytes) {
-        DynamicImage::ImageRgba8(load_heif_rgba(bytes)?)
+    let raw = if is_heif(bytes) {
+        RawImage {
+            // `decode` libheif sudah menerapkan rotasi/mirror/crop dari berkas.
+            img: DynamicImage::ImageRgba8(load_heif_rgba(bytes)?),
+            orientation: Orientation::NoTransforms,
+        }
     } else {
-        load_dynamic(bytes)?
+        load_raw(bytes)?
     };
     #[cfg(not(feature = "heif"))]
-    let img = {
+    let raw = {
         if looks_like_heif(bytes) {
             return Err("HEIC/AVIF tidak ikut dikompilasi (bangun dengan fitur \"heif\")".into());
         }
-        load_dynamic(bytes)?
+        load_raw(bytes)?
     };
-    let (w, h) = (img.width(), img.height());
+    let (w, h) = (raw.img.width(), raw.img.height());
     if w == 0 || h == 0 {
         return Err("Gambar berukuran nol".into());
     }
-    let (nw, nh) = fit_target(w, h, max_side, max_pixels);
-    let img = if (nw, nh) == (w, h) {
-        img
+    // Sama seperti finish_raw: perkecil dulu dalam ruang sebelum orientasi,
+    // lalu orientasikan gambar kecilnya.
+    let (ow, oh) = oriented_dims(w, h, raw.orientation);
+    let (tw, th) = fit_target(ow, oh, max_side, max_pixels);
+    let (uw, uh) = if swaps_axes(raw.orientation) {
+        (th, tw)
     } else {
-        img.resize_exact(nw, nh, FilterType::Triangle)
+        (tw, th)
     };
+    let mut img = shrink_to(raw.img, uw, uh);
+    img.apply_orientation(raw.orientation);
     Ok(img.into_rgba8())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageFormat, Rgba, RgbaImage};
+    use image::{ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {
         let img = RgbaImage::from_pixel(w, h, Rgba([10, 200, 30, 255]));
         let mut out = Cursor::new(Vec::new());
         img.write_to(&mut out, ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    fn jpeg_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = RgbImage::from_pixel(w, h, Rgb([200, 30, 40]));
+        let mut out = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, ImageFormat::Jpeg)
+            .unwrap();
         out.into_inner()
     }
 
@@ -754,6 +867,60 @@ mod tests {
         let p = decode(&png_bytes(3000, 1500), 1024).unwrap();
         assert_eq!(p.orig, [3000, 1500]);
         assert_eq!(p.image.size, [1024, 512]);
+    }
+
+    #[test]
+    fn jpeg_besar_didekode_dengan_dimensi_dan_warna_benar() {
+        let data = jpeg_bytes(3000, 2000);
+        let p = decode(&data, 4096).unwrap();
+        assert_eq!(p.orig, [3000, 2000]);
+        assert_eq!(p.image.size, [3000, 2000]);
+        assert!(p.frames.is_none());
+        // merah solid (toleransi kompresi JPEG)
+        let c = p.image.pixels[0];
+        assert!(c.r() > 150 && c.g() < 100 && c.b() < 100, "{c:?}");
+        assert_eq!(p.format, "JPEG");
+    }
+
+    #[test]
+    fn orientasi_diterapkan_setelah_resize_bukan_sebelum() {
+        // Simulasi foto portrait dengan EXIF Rotate90: piksel 2000x3000,
+        // dimensi terorientasi 3000x2000.
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(2000, 3000, Rgb([1, 2, 3])));
+        let raw = RawImage {
+            img,
+            orientation: Orientation::Rotate90,
+        };
+        let p = finish_raw(raw, 1024).unwrap();
+        assert_eq!(p.orig, [3000, 2000]);
+        assert_eq!(p.image.size, [1024, 683]);
+    }
+
+    #[test]
+    fn shrink_cepat_menurunkan_ukuran_dengan_warna_benar() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(4000, 3000, Rgb([10, 200, 30])));
+        let small = shrink_to(img, 1000, 750);
+        assert_eq!((small.width(), small.height()), (1000, 750));
+        let p = small.into_rgb8().get_pixel(500, 375).0;
+        assert!(p[1] > 150 && p[0] < 100 && p[2] < 100, "{p:?}");
+        // RGBA (ada alfa) juga lewat jalur cepat
+        let a = DynamicImage::ImageRgba8(RgbaImage::from_pixel(2000, 1000, Rgba([1, 2, 3, 255])));
+        let small_a = shrink_to(a, 500, 250);
+        assert_eq!((small_a.width(), small_a.height()), (500, 250));
+    }
+
+    #[test]
+    fn sumbu_bertukar_hanya_untuk_putaran_90_270() {
+        assert!(swaps_axes(Orientation::Rotate90));
+        assert!(swaps_axes(Orientation::Rotate270));
+        assert!(swaps_axes(Orientation::Rotate90FlipH));
+        assert!(swaps_axes(Orientation::Rotate270FlipH));
+        assert!(!swaps_axes(Orientation::NoTransforms));
+        assert!(!swaps_axes(Orientation::Rotate180));
+        assert!(!swaps_axes(Orientation::FlipHorizontal));
+        assert!(!swaps_axes(Orientation::FlipVertical));
+        assert_eq!(oriented_dims(100, 200, Orientation::Rotate90), (200, 100));
+        assert_eq!(oriented_dims(100, 200, Orientation::NoTransforms), (100, 200));
     }
 
     fn gif_bytes(frames: &[([u8; 4], u32)], w: u32, h: u32) -> Vec<u8> {
