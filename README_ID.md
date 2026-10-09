@@ -1,4 +1,4 @@
-# Roneyview (version 0.5.1)
+# Roneyview (version 0.5.4)
 
 Penampil gambar alternatif Honeyview untuk Linux, ditulis dengan bahasa pemrograman Rust (egui/eframe).
 
