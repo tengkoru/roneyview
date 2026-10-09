@@ -56,7 +56,30 @@ if ((${#missing[@]})); then
 fi
 [[ "${1:-}" == "--dry-run" ]] && exit 0
 
-cargo build --release --locked --no-default-features --features "$FEATS"
+# Progres persen selama kompilasi (cargo tidak menampilkannya bawaan):
+# total crate dari Cargo.lock, persen dari baris "Compiling" yang sudah lewat.
+TOTAL=$(grep -c '^\[\[package\]\]' Cargo.lock 2>/dev/null || true)
+if [ -z "$TOTAL" ] || [ "$TOTAL" -eq 0 ]; then TOTAL=1; fi
+LOG="$(mktemp /tmp/roneyview-build-XXXXXX.log)"
+printf 'Membangun roneyview (bin)...   0%%'
+cargo build --release --locked --no-default-features --features "$FEATS" >"$LOG" 2>&1 &
+CARGO_PID=$!
+while kill -0 "$CARGO_PID" 2>/dev/null; do
+    n=$(grep -c 'Compiling ' "$LOG" 2>/dev/null || true)
+    pct=$((n * 100 / TOTAL))
+    if [ "$pct" -gt 99 ]; then pct=99; fi
+    printf '\rMembangun roneyview (bin)... %3d%%' "$pct"
+    sleep 2
+done
+if wait "$CARGO_PID"; then
+    printf '\rMembangun roneyview (bin)... 100%%\n'
+    rm -f "$LOG"
+else
+    printf '\nKompilasi gagal. 20 baris terakhir log:\n'
+    tail -n 20 "$LOG"
+    echo "Log lengkap: $LOG"
+    exit 1
+fi
 install -Dm755 target/release/roneyview "$BIN"
 install -Dm644 packaging/roneyview.desktop "$DESKTOP"
 install -Dm644 packaging/roneyview.svg "$ICON"

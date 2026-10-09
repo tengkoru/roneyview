@@ -77,7 +77,19 @@ fn pair_widths(dims: &[(f32, f32)]) -> (Vec<f32>, f32) {
     (w, h)
 }
 const MIN_SCALE: f32 = 0.02;
-const MAX_SCALE: f32 = 32.0;
+// Jumlah langkah zoom-in (1.25x) maksimal dari ukuran fit.
+const MAX_ZOOM_STEPS: i32 = 8;
+
+/// Tier resolusi decode mengikuti level zoom (skala absolut, 1.0 = ukuran asli):
+/// tampilan fit/pas-pasan cukup ~2MP (ringan di CPU/GPU lemah), zoom >= 7x naik
+/// ke ~4MP supaya tetap tajam. Pemanggil me-min-kannya dengan max_pixels().
+fn tier_pixels(scale: f32) -> usize {
+    if scale >= 7.0 {
+        4_000_000
+    } else {
+        2_000_000
+    }
+}
 const ZOOM_STEP: f32 = 1.25;
 const PAN_STEP: f32 = 90.0;
 /// Roda mouse: satu "notch" dihitung sebesar ini (poin).
@@ -96,6 +108,11 @@ struct Anim {
 struct Page {
     tex: TextureHandle,
     orig: [u32; 2],
+    /// Dimensi hasil decode (resolusi tekstur). Bisa lebih kecil dari `orig`
+    /// karena tier resolusi mengikuti zoom (fit ~2MP, zoom >= 7x ~4MP).
+    decoded: [u32; 2],
+    /// Benar bila ini pratinjau blur progresif; versi tajam menyusul.
+    preview: bool,
     file_size: u64,
     bytes: usize,
     anim: Option<Anim>,
@@ -206,7 +223,10 @@ pub struct RoneyApp {
     shown: Option<Arc<Shown>>,
     placed_for: Option<(u64, usize, usize)>,
 
-    cmd_tx: Sender<Command>,
+    /// Perintah ke worker utama (permintaan utama).
+    cmd_tx_main: Sender<Command>,
+    /// Perintah ke worker prefetch.
+    cmd_tx_pref: Sender<Command>,
     out_rx: Receiver<Loaded>,
 
     #[cfg(feature = "dialogs")]
@@ -284,7 +304,7 @@ impl RoneyApp {
             v.major >= 3 || (v.is_embedded && v.major >= 2)
         });
 
-        let (cmd_tx, out_rx) = loader::spawn(ctx.clone())?;
+        let (cmd_tx_main, cmd_tx_pref, out_rx) = loader::spawn(ctx.clone())?;
         let (note_tx, note_rx) = mpsc::channel::<String>();
         #[cfg(feature = "dialogs")]
         let (dialog_tx, dialog_rx) = mpsc::channel();
@@ -326,7 +346,8 @@ impl RoneyApp {
             errors: HashMap::new(),
             shown: None,
             placed_for: None,
-            cmd_tx,
+            cmd_tx_main,
+            cmd_tx_pref,
             out_rx,
             #[cfg(feature = "dialogs")]
             dialog_tx,
@@ -385,11 +406,12 @@ impl RoneyApp {
         let index = index.min(listing.len().saturating_sub(1));
         self.session += 1;
         let listing = Arc::new(listing);
-        let cmd = Command::Open {
+        // Open harus sampai ke KEDUA worker pemuat.
+        let open = || Command::Open {
             session: self.session,
             listing: listing.clone(),
         };
-        if self.cmd_tx.send(cmd).is_err() {
+        if self.cmd_tx_main.send(open()).is_err() || self.cmd_tx_pref.send(open()).is_err() {
             self.notify("Thread pemuat gambar berhenti; mulai ulang Roneyview.");
             return;
         }
@@ -525,6 +547,9 @@ impl RoneyApp {
         };
         let n = l.len() as isize;
         let max_side = Self::max_side(ctx);
+        // Resolusi decode mengikuti zoom saat ini: fit cukup 2MP (jauh lebih
+        // ringan), zoom >= 7x naik ke 4MP via refine otomatis.
+        let max_pixels = tier_pixels(self.display_scale).min(loader::max_pixels());
         let cur = self.index as isize;
         let (a, b) = if self.dir >= 0 { (1, -1) } else { (-1, 1) };
         let mut wanted: Vec<(usize, bool)> = vec![(self.index, true)];
@@ -571,14 +596,33 @@ impl RoneyApp {
                 }
             }
             self.pending.insert(i, primary);
+            // Worker memakai anggaran untuk melewatkan prefetch yang hasilnya
+            // pasti dibuang (decode-nya bisa makan 8 detik CPU dengan sia-sia).
+            let held: usize = self.cache.values().map(|p| p.bytes).sum();
             let cmd = Command::Load {
                 session: self.session,
                 index: i,
                 primary,
                 max_side,
+                max_pixels,
                 focus: self.index,
+                budget: self.budget,
+                held,
             };
-            if self.cmd_tx.send(cmd).is_err() {
+            // Permintaan utama ke worker utama; prefetch ke worker prefetch.
+            // Bila suatu indeks naik jadi permintaan utama, batalkan salinan
+            // prefetch-nya yang mungkin masih antre di worker prefetch supaya
+            // tidak didekode dua kali.
+            let ok = if primary {
+                let _ = self.cmd_tx_pref.send(Command::Forget {
+                    session: self.session,
+                    index: i,
+                });
+                self.cmd_tx_main.send(cmd).is_ok()
+            } else {
+                self.cmd_tx_pref.send(cmd).is_ok()
+            };
+            if !ok {
                 self.pending.remove(&i);
             }
         }
@@ -602,9 +646,41 @@ impl RoneyApp {
             }
             self.pending.remove(&msg.index);
             match msg.outcome {
+                Outcome::Preview(d) => {
+                    // Pratinjau blur: tampilkan langsung supaya ada gambarnya,
+                    // versi tajam (Ready) menyusul dari pemrosesan yang sama.
+                    let (lo, hi) = keep_window(self.index, self.low_memory_mode, self.two_page_mode);
+                    if !(lo..=hi).contains(&msg.index) {
+                        continue; // sudah terlalu jauh, buang
+                    }
+                    let px = d.pixels;
+                    self.dims.insert(msg.index, px.orig);
+                    let decoded = [px.image.size[0] as u32, px.image.size[1] as u32];
+                    let bytes = decoded[0] as usize * decoded[1] as usize * 4;
+                    let tex = ctx.load_texture(
+                        format!("pg{}-{}-prev", msg.session, msg.index),
+                        px.image,
+                        self.texture_options(false),
+                    );
+                    let page = Arc::new(Page {
+                        tex,
+                        orig: px.orig,
+                        decoded,
+                        preview: true,
+                        file_size: d.file_size,
+                        bytes,
+                        anim: None,
+                        format: px.format.clone(),
+                    });
+                    self.cache.insert(msg.index, page);
+                    ctx.request_repaint();
+                }
                 Outcome::Ready(d) => {
                     let (lo, hi) = keep_window(self.index, self.low_memory_mode, self.two_page_mode);
                     if !(lo..=hi).contains(&msg.index) {
+                        // Buang juga pratinjaunya kalau sempat masuk: kalau tidak,
+                        // gambar blur basi bisa tampil selamanya tanpa versi tajam.
+                        self.cache.remove(&msg.index);
                         continue; // sudah terlalu jauh, buang
                     }
                     let px = d.pixels;
@@ -632,6 +708,7 @@ impl RoneyApp {
                             continue; // prefetch tidak muat: jangan alokasikan tekstur GPU
                         }
                     }
+                    let decoded = [px.image.size[0] as u32, px.image.size[1] as u32];
                     let tex = ctx.load_texture(
                         format!("pg{}-{}", msg.session, msg.index),
                         px.image,
@@ -640,6 +717,8 @@ impl RoneyApp {
                     let page = Arc::new(Page {
                         tex,
                         orig: px.orig,
+                        decoded,
+                        preview: false,
                         file_size: d.file_size,
                         bytes,
                         anim,
@@ -818,13 +897,20 @@ impl RoneyApp {
             Zoom::Custom(z) => z,
             Zoom::Fit(m) => fit_scale(m, dims, view.size()),
         }
-        .clamp(MIN_SCALE, MAX_SCALE);
+        .clamp(MIN_SCALE, self.max_zoom_scale(dims, view));
         let size = dims * scale;
         Geo {
             scale,
             size,
             offset: clamp_offset(self.offset, size, view.size()),
         }
+    }
+
+    /// Batas zoom: maksimal 8 langkah (1.25x) dari ukuran fit.
+    /// Di atas itu layar bisa hitam di GPU lama.
+    fn max_zoom_scale(&self, dims: Vec2, view: Rect) -> f32 {
+        let fit = fit_scale(self.fit, dims, view.size());
+        (fit * ZOOM_STEP.powi(MAX_ZOOM_STEPS)).max(MIN_SCALE)
     }
 
     fn zoom_by(&mut self, ctx: &Context, factor: f32, anchor: Option<Pos2>) {
@@ -837,7 +923,8 @@ impl RoneyApp {
         let view = self.view_rect;
         let dims = self.shown_dims(ctx, &sh);
         let geo = self.geometry(ctx, dims, view);
-        let new_scale = (geo.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+        let max = self.max_zoom_scale(dims, view);
+        let new_scale = (geo.scale * factor).clamp(MIN_SCALE, max);
         if (new_scale - geo.scale).abs() < 1e-6 {
             return;
         }
@@ -846,6 +933,53 @@ impl RoneyApp {
         let new_center = anchor - (anchor - center) * (new_scale / geo.scale);
         self.offset = new_center - view.center();
         self.zoom = Zoom::Custom(new_scale);
+        // Naik tier resolusi -> decode ulang lebih tajam di background;
+        // tampilan lama tetap dipakai sampai yang baru siap.
+        if tier_pixels(new_scale) > tier_pixels(geo.scale) {
+            self.refine_current(ctx, tier_pixels(new_scale));
+        }
+    }
+
+    /// Decode ulang halaman aktif pada tier resolusi yang lebih tinggi
+    /// (mis. pengguna zoom >= 7x). Berjalan di background; hasilnya menggantikan
+    /// cache saat siap. Hanya naik tier, tidak pernah turun (bolak-balik zoom
+    /// tidak memicu decode berulang).
+    fn refine_current(&mut self, ctx: &Context, tier_px: usize) {
+        let s = self.index;
+        if self.pending.contains_key(&s) {
+            return; // sudah ada permintaan berjalan untuk halaman ini
+        }
+        let Some(page) = self.cache.get(&s) else {
+            return;
+        };
+        if page.preview {
+            return; // versi tajam sedang di jalan (Ready menyusul Preview)
+        }
+        let decoded_px = page.decoded[0] as usize * page.decoded[1] as usize;
+        if decoded_px * 10 >= tier_px * 9 {
+            return; // sudah cukup tajam
+        }
+        let orig_px = page.orig[0] as usize * page.orig[1] as usize;
+        if orig_px <= tier_px {
+            return; // gambar aslinya memang sekecil ini
+        }
+        let max_side = Self::max_side(ctx);
+        let max_pixels = tier_px.min(loader::max_pixels());
+        let held: usize = self.cache.values().map(|p| p.bytes).sum();
+        self.pending.insert(s, true);
+        let cmd = Command::Load {
+            session: self.session,
+            index: s,
+            primary: true,
+            max_side,
+            max_pixels,
+            focus: s,
+            budget: self.budget,
+            held,
+        };
+        if self.cmd_tx_main.send(cmd).is_err() {
+            self.pending.remove(&s);
+        }
     }
 
     /// Tentukan isi yang tampil untuk halaman aktif. Bila pasangan masih dimuat, isi
@@ -1226,6 +1360,7 @@ impl RoneyApp {
 
         let Some(sh) = self.current_content() else {
             self.draw_placeholder(&painter, rect);
+            self.draw_loading_badge(&painter, rect);
             return;
         };
         let shown_index = sh.start;
@@ -1316,6 +1451,10 @@ impl RoneyApp {
             self.ctx_target = nearest.unwrap_or(shown_index);
         }
 
+        // Badge status loading di atas gambar: "Memuat..." kalau gambarnya
+        // belum ada, "Mempertajam..." kalau yang tampil masih pratinjau blur.
+        self.draw_loading_badge(&painter, rect);
+
         // Menu klik kanan.
         let mut chosen: Option<CtxChoice> = None;
         resp.context_menu(|ui| {
@@ -1353,8 +1492,31 @@ impl RoneyApp {
         }
     }
 
-    fn draw_placeholder(&self, painter: &egui::Painter, rect: Rect) {
-        let (text, color, size) = match (&self.listing, self.errors.get(&self.index)) {
+    /// Pil status loading di tengah atas area gambar.
+    fn draw_loading_badge(&self, painter: &egui::Painter, rect: Rect) {
+        let badge = if self.errors.contains_key(&self.index) {
+            None
+        } else if !self.cache.contains_key(&self.index) {
+            Some("Memuat…")
+        } else if self.cache.get(&self.index).is_some_and(|p| p.preview) {
+            Some("Mempertajam…")
+        } else {
+            None
+        };
+        let Some(text) = badge else { return };
+        let galley = painter.layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(14.0),
+            Color32::WHITE,
+        );
+        let pad = vec2(14.0, 7.0);
+        let size = galley.size() + pad * 2.0;
+        let br = Rect::from_center_size(rect.center_top() + vec2(0.0, 12.0), size);
+        painter.rect_filled(br, 10.0, Color32::from_black_alpha(170));
+        painter.galley(br.min + pad, galley, Color32::WHITE);
+    }
+
+    fn draw_placeholder(&self, painter: &egui::Painter, rect: Rect) {        let (text, color, size) = match (&self.listing, self.errors.get(&self.index)) {
             (None, _) => (
                 "Roneyview\n\nSeret gambar, folder, atau ZIP/CBZ ke sini\natau tekan Ctrl+O. F1 untuk pintasan.".to_string(),
                 Color32::from_gray(150),
@@ -2185,6 +2347,16 @@ impl RoneyApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_resolusi_mengikuti_zoom_dan_cap_8_langkah() {
+        assert_eq!(tier_pixels(0.25), 2_000_000); // fit
+        assert_eq!(tier_pixels(1.0), 2_000_000); // 100%
+        assert_eq!(tier_pixels(6.9), 2_000_000);
+        assert_eq!(tier_pixels(7.0), 4_000_000); // zoom >= 7x -> refine
+        assert_eq!(tier_pixels(8.0), 4_000_000);
+        assert_eq!(MAX_ZOOM_STEPS, 8); // maksimal 8x tekan zoom dari fit
+    }
 
     #[test]
     fn mode_muat_menghitung_skala_dengan_benar() {

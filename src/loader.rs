@@ -124,11 +124,23 @@ pub enum Command {
         index: usize,
         primary: bool,
         max_side: usize,
+        /// Batas piksel untuk decode permintaan ini (tier resolusi mengikuti zoom:
+        /// tampilan fit cukup ~2MP, zoom >= 7x naik ke ~4MP). Selalu <= max_pixels().
+        max_pixels: usize,
         /// Halaman yang sedang dilihat. Dikirim di SETIAP permintaan: halaman yang sudah
         /// ada di cache tidak diminta ulang, jadi fokus tidak boleh bergantung pada
         /// permintaan utama saja (kalau tidak, prefetch/pasangan dianggap "terlalu jauh").
         focus: usize,
+        /// Anggaran cache (byte) dan perkiraan isi cache saat permintaan dikirim.
+        /// Worker memakai ini untuk MELEWATKAN prefetch yang hasilnya pasti dibuang
+        /// karena tidak muat anggaran — decode satu gambar 16MP bisa makan 8 detik CPU.
+        budget: usize,
+        held: usize,
     },
+    /// Batalkan prefetch yang masih antre untuk indeks ini (mis. karena indeksnya
+    /// baru saja diminta sebagai gambar utama ke worker satunya). Tidak bisa
+    /// membatalkan decode yang sudah berjalan; itu tidak apa-apa (hasilnya tetap benar).
+    Forget { session: u64, index: usize },
 }
 
 pub struct AnimFrame {
@@ -157,6 +169,9 @@ pub struct Decoded {
 
 pub enum Outcome {
     Ready(Decoded),
+    /// Pratinjau blur cepat untuk gambar besar; selalu disusul `Ready`
+    /// untuk indeks yang sama (dari pemrosesan yang sama, tanpa jeda antre).
+    Preview(Decoded),
     Failed(String),
     Skipped,
 }
@@ -171,6 +186,9 @@ struct Job {
     index: usize,
     primary: bool,
     max_side: usize,
+    max_pixels: usize,
+    budget: usize,
+    held: usize,
     seq: u64,
 }
 
@@ -183,29 +201,51 @@ struct Worker {
     queue: Vec<Job>,
     seq: u64,
     focus: usize,
+    /// true = worker utama (hanya memproses permintaan utama),
+    /// false = worker prefetch (hanya memproses prefetch).
+    handles_primary: bool,
 }
 
-pub fn spawn(ctx: Context) -> std::io::Result<(Sender<Command>, Receiver<Loaded>)> {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+/// Mulai thread pemuat. Mengembalikan `(utama, prefetch, hasil)`:
+/// - `utama`: untuk permintaan utama (gambar yang sedang dilihat),
+/// - `prefetch`: untuk prefetch (gambar di sekitarnya),
+/// - `hasil`: hasil decode dari kedua worker.
+///
+/// Dua worker dipakai supaya satu gambar raksasa (decode bisa 8 detik) tidak
+/// memblokir prefetch gambar-gambar lain di belakangnya. `Open` harus dikirim
+/// ke KEDUA worker; `Load` dirutekan sesuai jenisnya.
+pub fn spawn(
+    ctx: Context,
+) -> std::io::Result<(Sender<Command>, Sender<Command>, Receiver<Loaded>)> {
+    let (main_tx, main_rx) = mpsc::channel::<Command>();
+    let (pref_tx, pref_rx) = mpsc::channel::<Command>();
     let (out_tx, out_rx) = mpsc::channel::<Loaded>();
     // Worker dibangun di dalam thread-nya sendiri: pembaca arsip (mis. RAR) memegang
     // handle C yang tidak perlu/boleh berpindah thread.
-    thread::Builder::new()
-        .name("roneyview-loader".into())
-        .spawn(move || {
-            Worker {
-                ctx,
-                tx: out_tx,
-                session: 0,
-                listing: None,
-                reader: None,
-                queue: Vec::new(),
-                seq: 0,
-                focus: 0,
-            }
-            .run(cmd_rx)
-        })?;
-    Ok((cmd_tx, out_rx))
+    for (name, rx, handles_primary) in [
+        ("roneyview-loader", main_rx, true),
+        ("roneyview-loader-prefetch", pref_rx, false),
+    ] {
+        let ctx = ctx.clone();
+        let tx = out_tx.clone();
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                Worker {
+                    ctx,
+                    tx,
+                    session: 0,
+                    listing: None,
+                    reader: None,
+                    queue: Vec::new(),
+                    seq: 0,
+                    focus: 0,
+                    handles_primary,
+                }
+                .run(rx)
+            })?;
+    }
+    Ok((main_tx, pref_tx, out_rx))
 }
 
 impl Worker {
@@ -252,8 +292,15 @@ impl Worker {
                 index,
                 primary,
                 max_side,
+                max_pixels,
                 focus,
+                budget,
+                held,
             } => {
+                // Tiap worker hanya menangani jenisnya sendiri (utama vs prefetch).
+                if primary != self.handles_primary {
+                    return;
+                }
                 if session != self.session {
                     return;
                 }
@@ -266,6 +313,9 @@ impl Worker {
                 }
                 if let Some(j) = self.queue.iter_mut().find(|j| j.index == index) {
                     j.max_side = max_side;
+                    j.max_pixels = max_pixels;
+                    j.budget = budget;
+                    j.held = held;
                     if primary {
                         j.primary = true;
                         j.seq = self.seq;
@@ -275,9 +325,20 @@ impl Worker {
                         index,
                         primary,
                         max_side,
+                        max_pixels,
+                        budget,
+                        held,
                         seq: self.seq,
                     });
                 }
+            }
+            Command::Forget { session, index } => {
+                if session != self.session {
+                    return;
+                }
+                // Hapus dari antrean bila belum mulai didekode. Tidak ada pesan
+                // balasan: peminta sudah mencatatnya sebagai permintaan utama.
+                self.queue.retain(|j| j.index != index);
             }
         }
     }
@@ -320,8 +381,37 @@ impl Worker {
             Err(e) => return Outcome::Failed(e),
         };
         let file_size = bytes.len() as u64;
-        match catch_unwind(AssertUnwindSafe(|| decode(&bytes, job.max_side))) {
-            Ok(Ok(pixels)) => Outcome::Ready(Decoded { pixels, file_size }),
+        // Prefetch yang hasilnya pasti dibuang karena tidak muat anggaran tidak
+        // perlu didekode: satu gambar 16MP bisa makan 8 detik CPU. Perkiraan
+        // dihitung dari header saja (tanpa decode penuh); orientasi EXIF tidak
+        // mengubah luas area sehingga tidak memengaruhi perkiraan.
+        // (Permintaan utama selalu didekode: yang dilihat pengguna tidak boleh gagal.)
+        if !job.primary {
+            if let Some(est) = estimate_bytes(&bytes, job.max_side, job.max_pixels) {
+                if est > job.budget || job.held.saturating_add(est) > job.budget {
+                    return Outcome::Skipped;
+                }
+            }
+        }
+        match catch_unwind(AssertUnwindSafe(|| {
+            decode_progressive(&bytes, job.max_side, job.max_pixels)
+        })) {
+            Ok(Ok((preview, sharp))) => {
+                // Pratinjau dikirim langsung agar segera tampil; versi tajam
+                // menyusul lewat hasil akhir pemrosesan ini.
+                if let Some(p) = preview {
+                    let _ = self.tx.send(Loaded {
+                        session: self.session,
+                        index: job.index,
+                        outcome: Outcome::Preview(Decoded { pixels: p, file_size }),
+                    });
+                    self.ctx.request_repaint();
+                }
+                Outcome::Ready(Decoded {
+                    pixels: sharp,
+                    file_size,
+                })
+            }
             Ok(Err(e)) => Outcome::Failed(e),
             Err(_) => Outcome::Failed(
                 "Dekoder gagal memproses berkas ini (data kemungkinan rusak)".into(),
@@ -330,17 +420,95 @@ impl Worker {
     }
 }
 
-/// Dekode byte gambar -> piksel siap-unggah. Gambar yang lebih besar dari
-/// `max_side` diperkecil agar tidak melebihi batas tekstur GPU (kalau tidak,
-/// egui akan panik).
-pub fn decode(bytes: &[u8], max_side: usize) -> Result<Pixels, String> {
-    let mut p = decode_inner(bytes, max_side)?;
+/// Gambar dengan sisi panjang di atas ini mendapat pratinjau progresif
+/// (blur cepat dulu, tajam menyusul). Gambar kecil decode-nya sudah cepat,
+/// tidak perlu.
+const PREVIEW_LONG_SIDE: u32 = 2500;
+/// Ukuran pratinjau ~0.25MP: cukup untuk bayangan yang dikenali.
+const PREVIEW_PIXELS: usize = 250_000;
+
+/// Dekode progresif: satu kali decode penuh, lalu —
+/// - gambar besar (>2500px): pratinjau blur cepat + versi tajam, atau
+/// - gambar kecil: langsung versi tajam (tanpa pratinjau).
+/// Mengembalikan `(pratinjau, tajam)`.
+pub fn decode_progressive(
+    bytes: &[u8],
+    max_side: usize,
+    max_pixels: usize,
+) -> Result<(Option<Pixels>, Pixels), String> {
+    let (preview, mut sharp) = decode_progressive_inner(bytes, max_side, max_pixels)?;
     let name = format_name(bytes);
-    p.format = match &p.frames {
+    let format = match &sharp.frames {
         Some(f) => format!("{name} (animasi, {} frame)", f.len()),
         None => name,
     };
-    Ok(p)
+    sharp.format = format.clone();
+    let preview = preview.map(|mut p| {
+        p.format = format;
+        p
+    });
+    Ok((preview, sharp))
+}
+
+fn decode_progressive_inner(
+    bytes: &[u8],
+    max_side: usize,
+    max_pixels: usize,
+) -> Result<(Option<Pixels>, Pixels), String> {
+    let max_side_c = max_side.clamp(1024, 16384) as u32;
+
+    #[cfg(feature = "heif")]
+    if is_heif(bytes) {
+        return decode_heif(bytes, max_side_c, max_pixels).map(|p| (None, p));
+    }
+    #[cfg(not(feature = "heif"))]
+    if looks_like_heif(bytes) {
+        return Err("HEIC/AVIF tidak ikut dikompilasi (bangun dengan fitur \"heif\")".into());
+    }
+
+    if let Some(p) = decode_animated(bytes, max_side_c, max_pixels)? {
+        return Ok((None, p));
+    }
+    // Jalur statis (JPEG/PNG/...): satu decode penuh, dua output.
+    let raw = load_raw(bytes)?;
+    let big = raw.img.width().max(raw.img.height()) > PREVIEW_LONG_SIDE;
+    // Pratinjau bersifat best-effort: gagal bukan alasan menggagalkan decode.
+    let preview = if big { preview_pixels(&raw).ok() } else { None };
+    let sharp = finish_raw(raw, max_side_c, max_pixels)?;
+    Ok((preview, sharp))
+}
+
+/// Pratinjau blur untuk gambar besar: Nearest langsung ke ~0.25MP.
+/// (Triangle ke ukuran sekecil ini hampir semahal ke ukuran penuh —
+/// biayanya mengikuti rasio, bukan ukuran output — jadi tidak hemat.)
+fn preview_pixels(raw: &RawImage) -> Result<Pixels, String> {
+    let (w, h) = (raw.img.width(), raw.img.height());
+    if w == 0 || h == 0 {
+        return Err("Gambar berukuran nol".into());
+    }
+    let (ow, oh) = oriented_dims(w, h, raw.orientation);
+    let s = (PREVIEW_PIXELS as f64 / (f64::from(ow) * f64::from(oh))).sqrt().min(1.0);
+    let (tw, th) = (
+        (f64::from(ow) * s).round() as u32,
+        (f64::from(oh) * s).round() as u32,
+    );
+    let (tw, th) = (tw.max(1), th.max(1));
+    // Target dihitung di ruang terorientasi, dipetakan kembali seperti finish_raw.
+    let (uw, uh) = if swaps_axes(raw.orientation) {
+        (th, tw)
+    } else {
+        (tw, th)
+    };
+    let mut img = raw.img.resize_exact(uw, uh, FilterType::Nearest);
+    img.apply_orientation(raw.orientation);
+    let image = Arc::new(to_color_image(img));
+    Ok(Pixels {
+        image,
+        orig: [ow, oh],
+        frames: None,
+        truncated: false,
+        format: String::new(),
+    })
 }
 
 /// Nama format dari isi berkas (bukan ekstensi).
@@ -367,24 +535,6 @@ pub fn format_name(bytes: &[u8]) -> String {
     .to_string()
 }
 
-fn decode_inner(bytes: &[u8], max_side: usize) -> Result<Pixels, String> {
-    let max_side = max_side.clamp(1024, 16384) as u32;
-
-    #[cfg(feature = "heif")]
-    if is_heif(bytes) {
-        return decode_heif(bytes, max_side);
-    }
-    #[cfg(not(feature = "heif"))]
-    if looks_like_heif(bytes) {
-        return Err("HEIC/AVIF tidak ikut dikompilasi (bangun dengan fitur \"heif\")".into());
-    }
-
-    if let Some(p) = decode_animated(bytes, max_side)? {
-        return Ok(p);
-    }
-    decode_static(bytes, max_side)
-}
-
 fn limits() -> Limits {
     let mut limits = Limits::default();
     limits.max_alloc = Some(alloc_limit());
@@ -407,8 +557,23 @@ fn fit_target(w: u32, h: u32, max_side: u32, max_pixels: usize) -> (u32, u32) {
     )
 }
 
-fn decode_static(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
-    finish_raw(load_raw(bytes)?, max_side)
+/// Perkiraan ukuran halaman hasil decode (byte, termasuk mipmap x4/3) hanya dari
+/// header gambar — tanpa decode penuh. `None` bila format tak dikenali dari
+/// header (mis. HEIF yang ditangani jalur khusus); pemanggil melanjutkan decode
+/// normal dalam kasus itu.
+fn estimate_bytes(bytes: &[u8], max_side: usize, max_pixels: usize) -> Option<usize> {
+    let max_side = max_side.clamp(1024, 16384) as u32;
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits());
+    let decoder = reader.into_decoder().ok()?;
+    let (w, h) = decoder.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (tw, th) = fit_target(w, h, max_side, max_pixels);
+    Some(tw as usize * th as usize * 4 * 4 / 3)
 }
 
 /// Gambar hasil dekode mentah: piksel BELUM diorientasi menurut EXIF.
@@ -457,7 +622,7 @@ fn load_raw(bytes: &[u8]) -> Result<RawImage, String> {
     Ok(RawImage { img, orientation })
 }
 
-fn finish_raw(raw: RawImage, max_side: u32) -> Result<Pixels, String> {
+fn finish_raw(raw: RawImage, max_side: u32, max_pixels: usize) -> Result<Pixels, String> {
     let (w, h) = (raw.img.width(), raw.img.height());
     if w == 0 || h == 0 {
         return Err("Gambar berukuran nol".into());
@@ -466,7 +631,7 @@ fn finish_raw(raw: RawImage, max_side: u32) -> Result<Pixels, String> {
     // Target dihitung dalam ruang terorientasi, lalu dipetakan kembali ke ruang
     // sebelum orientasi supaya resize dikerjakan pada gambar yang belum diputar:
     // foto portrait 6000x4000 tidak lagi disalin 24 MP dua kali.
-    let (tw, th) = fit_target(ow, oh, max_side, max_pixels());
+    let (tw, th) = fit_target(ow, oh, max_side, max_pixels);
     let (uw, uh) = if swaps_axes(raw.orientation) {
         (th, tw)
     } else {
@@ -495,7 +660,61 @@ fn shrink_to(img: DynamicImage, w: u32, h: u32) -> DynamicImage {
     if (w, h) == (iw, ih) {
         return img;
     }
-    fast_shrink(img, w, h).unwrap_or_else(|img| img.resize_exact(w, h, FilterType::Triangle))
+    match resize_backend() {
+        ResizeBackend::FastImageResize => {
+            fast_shrink(img, w, h).unwrap_or_else(|img| img.resize_exact(w, h, FilterType::Triangle))
+        }
+        // Di mesin yang SIMD-nya kena penalti (mis. VM tertentu), `image`
+        // justru berkali-kali lebih cepat daripada `fast_image_resize`.
+        ResizeBackend::ImageCrate => img.resize_exact(w, h, FilterType::Triangle),
+    }
+}
+
+/// Backend resize terpilih lewat kalibrasi sekali jalan.
+///
+/// `fast_image_resize` biasanya jauh lebih cepat berkat SIMD, tetapi di
+/// sebagian mesin virtual instruksi AVX2-nya sangat lambat (terukur 3x lebih
+/// lambat daripada kode skalar) sehingga ia malah jadi 4-8x lebih lambat
+/// daripada `image`. Kalibrasi ini memilih yang tercepat di mesin ini.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResizeBackend {
+    FastImageResize,
+    ImageCrate,
+}
+
+static RESIZE_BACKEND: OnceLock<ResizeBackend> = OnceLock::new();
+
+fn resize_backend() -> ResizeBackend {
+    *RESIZE_BACKEND.get_or_init(calibrate_resize_backend)
+}
+
+fn calibrate_resize_backend() -> ResizeBackend {
+    use std::time::Instant;
+    // Gambar sintetis 1280x960 RGBA; cukup besar untuk mengukur, cukup kecil
+    // supaya kalibrasi sekali jalan tidak terasa (ratusan ms sekali saja).
+    let (w, h) = (1280u32, 960u32);
+    let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
+    for (i, b) in px.iter_mut().enumerate() {
+        *b = ((i.wrapping_mul(2654435761)) >> 16) as u8;
+    }
+    let img = match image::RgbaImage::from_raw(w, h, px) {
+        Some(buf) => DynamicImage::ImageRgba8(buf),
+        None => return ResizeBackend::ImageCrate,
+    };
+    let (tw, th) = (w / 2, h / 2);
+    let t0 = Instant::now();
+    let fir_ok = fast_shrink(img.clone(), tw, th).is_ok();
+    let t_fir = t0.elapsed();
+    let t0 = Instant::now();
+    let _ = img.resize_exact(tw, th, FilterType::Triangle);
+    let t_img = t0.elapsed();
+    // Pilih `fast_image_resize` hanya bila ia JELAS lebih cepat (margin 25%):
+    // ragu-ragu = pakai `image` yang perilakunya konsisten di semua mesin.
+    if fir_ok && t_fir.as_secs_f64() * 1.25 < t_img.as_secs_f64() {
+        ResizeBackend::FastImageResize
+    } else {
+        ResizeBackend::ImageCrate
+    }
 }
 
 /// Resize via `fast_image_resize`. `Err` mengembalikan gambar utuh untuk fallback.
@@ -538,9 +757,9 @@ fn blank_like(img: &DynamicImage, w: u32, h: u32) -> Option<DynamicImage> {
 
 /// Diperkecil dalam format aslinya (mis. RGB8), bukan RGBA: menghindari salinan
 /// RGBA berukuran penuh yang bisa mencapai ratusan MB.
-fn shrink(img: DynamicImage, max_side: u32) -> DynamicImage {
+fn shrink(img: DynamicImage, max_side: u32, max_pixels: usize) -> DynamicImage {
     let (w, h) = (img.width(), img.height());
-    let (nw, nh) = fit_target(w, h, max_side, max_pixels());
+    let (nw, nh) = fit_target(w, h, max_side, max_pixels);
     shrink_to(img, nw, nh)
 }
 
@@ -552,7 +771,7 @@ fn to_color_image(img: DynamicImage) -> ColorImage {
 
 /// Animasi GIF / WebP / APNG. `Ok(None)` = bukan animasi (atau hanya 1 frame),
 /// biarkan jalur gambar statis yang menangani.
-fn decode_animated(bytes: &[u8], max_side: u32) -> Result<Option<Pixels>, String> {
+fn decode_animated(bytes: &[u8], max_side: u32, max_pixels: usize) -> Result<Option<Pixels>, String> {
     let frames = match image::guess_format(bytes).ok() {
         Some(ImageFormat::Gif) => {
             let mut d = GifDecoder::new(Cursor::new(bytes))
@@ -613,7 +832,7 @@ fn decode_animated(bytes: &[u8], max_side: u32) -> Result<Option<Pixels>, String
         if out.is_empty() {
             canvas = [buf.width(), buf.height()];
         }
-        let img = shrink(DynamicImage::ImageRgba8(buf), max_side);
+        let img = shrink(DynamicImage::ImageRgba8(buf), max_side, max_pixels);
         let cost = img.width() as usize * img.height() as usize * 4;
         if !out.is_empty() && (total + cost > ANIM_BUDGET || out.len() >= MAX_ANIM_FRAMES) {
             truncated = true;
@@ -668,7 +887,7 @@ fn is_heif(bytes: &[u8]) -> bool {
 }
 
 #[cfg(feature = "heif")]
-fn decode_heif(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
+fn decode_heif(bytes: &[u8], max_side: u32, max_pixels: usize) -> Result<Pixels, String> {
     finish_raw(
         RawImage {
             img: DynamicImage::ImageRgba8(load_heif_rgba(bytes)?),
@@ -676,6 +895,7 @@ fn decode_heif(bytes: &[u8], max_side: u32) -> Result<Pixels, String> {
             orientation: Orientation::NoTransforms,
         },
         max_side,
+        max_pixels,
     )
 }
 
@@ -764,6 +984,11 @@ pub fn decode_rgba(bytes: &[u8], max_side: u32, max_pixels: usize) -> Result<Rgb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper tes: ambil versi tajam dari decode_progressive.
+    fn decode_sharp(bytes: &[u8], max_side: usize, max_pixels: usize) -> Result<Pixels, String> {
+        decode_progressive(bytes, max_side, max_pixels).map(|(_, sharp)| sharp)
+    }
     use image::{ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {
@@ -837,7 +1062,7 @@ mod tests {
         // Berkas ±100 byte yang mengaku 1,6 gigapiksel (6,4 GB RGBA).
         let data: &[u8] = include_bytes!("../tests/fixtures/enorme.png");
         assert!(data.len() < 200);
-        let err = match decode(data, 4096) {
+        let err = match decode_sharp(data, 4096, max_pixels()) {
             Ok(_) => panic!("seharusnya ditolak"),
             Err(e) => e,
         };
@@ -851,12 +1076,12 @@ mod tests {
         g.extend_from_slice(&65535u16.to_le_bytes());
         g.extend_from_slice(&65535u16.to_le_bytes());
         g.extend_from_slice(&[0, 0, 0, b';']);
-        assert!(decode(&g, 4096).is_err());
+        assert!(decode_sharp(&g, 4096, max_pixels()).is_err());
     }
 
     #[test]
     fn dekode_png_biasa() {
-        let p = decode(&png_bytes(40, 30), 4096).unwrap();
+        let p = decode_sharp(&png_bytes(40, 30), 4096, max_pixels()).unwrap();
         assert_eq!(p.orig, [40, 30]);
         assert_eq!(p.image.size, [40, 30]);
         assert!(p.frames.is_none());
@@ -864,15 +1089,95 @@ mod tests {
 
     #[test]
     fn gambar_besar_diperkecil_tetapi_dimensi_asli_dicatat() {
-        let p = decode(&png_bytes(3000, 1500), 1024).unwrap();
+        let p = decode_sharp(&png_bytes(3000, 1500), 1024, max_pixels()).unwrap();
         assert_eq!(p.orig, [3000, 1500]);
         assert_eq!(p.image.size, [1024, 512]);
     }
 
     #[test]
+    fn batas_piksel_permintaan_mengikuti_tier_zoom() {
+        // Tier fit (~2MP): gambar 4.5MP dipotong ke <= 2MP.
+        let p = decode_sharp(&png_bytes(3000, 1500), 16384, 2_000_000).unwrap();
+        let px = p.image.size[0] * p.image.size[1];
+        assert!(px <= 2_000_000, "dapat {px}");
+        assert_eq!(p.orig, [3000, 1500]);
+        // Tier zoom >= 7x (~4MP): gambar yang sama boleh sampai 4MP.
+        let p = decode_sharp(&png_bytes(3000, 1500), 16384, 4_000_000).unwrap();
+        let px = p.image.size[0] * p.image.size[1];
+        assert!(px <= 4_000_000 && px > 2_000_000, "dapat {px}");
+        // Gambar kecil tidak diperbesar oleh tier.
+        let p = decode_sharp(&png_bytes(40, 30), 16384, 2_000_000).unwrap();
+        assert_eq!(p.image.size, [40, 30]);
+    }
+
+    #[test]
+    fn progresif_gambar_besar_dapat_pratinjau_dan_tajam() {
+        // >2500px: pratinjau kecil + tajam 2MP dari satu decode.
+        let (preview, sharp) = decode_progressive(&png_bytes(3000, 1500), 16384, 2_000_000).unwrap();
+        let p = preview.expect("gambar besar harus punya pratinjau");
+        let ppx = p.image.size[0] * p.image.size[1];
+        assert!(ppx <= 260_000, "pratinjau {ppx}"); // toleransi pembulatan
+        assert_eq!(p.orig, [3000, 1500]);
+        let spx = sharp.image.size[0] * sharp.image.size[1];
+        assert!(spx <= 2_000_000 && spx > ppx, "tajam {spx}");
+        assert_eq!(sharp.orig, [3000, 1500]);
+    }
+
+    #[test]
+    fn progresif_gambar_kecil_tanpa_pratinjau() {
+        // <=2500px: langsung tajam, tanpa pratinjau.
+        let (preview, sharp) = decode_progressive(&png_bytes(40, 30), 16384, 2_000_000).unwrap();
+        assert!(preview.is_none());
+        assert_eq!(sharp.image.size, [40, 30]);
+    }
+
+    #[test]
+    fn pekerja_mengirim_pratinjau_lalu_tajam_untuk_gambar_besar() {
+        use crate::source::Listing;
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join("rv-prog-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b.png"), png_bytes(3000, 1600)).unwrap();
+        let (listing, _) = Listing::open(&dir).unwrap();
+        let ctx = eframe::egui::Context::default();
+        let (main_tx, pref_tx, out_rx) = spawn(ctx).unwrap();
+        let listing = std::sync::Arc::new(listing);
+        main_tx
+            .send(Command::Open { session: 1, listing: listing.clone() })
+            .unwrap();
+        pref_tx.send(Command::Open { session: 1, listing }).unwrap();
+        main_tx
+            .send(Command::Load {
+                session: 1,
+                index: 0,
+                primary: true,
+                max_side: 16384,
+                max_pixels: 2_000_000,
+                focus: 0,
+                budget: 256 << 20,
+                held: 0,
+            })
+            .unwrap();
+        // Pratinjau harus tiba dulu, disusul versi tajam.
+        let m1 = out_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(matches!(m1.outcome, Outcome::Preview(_)), "pertama harus Preview");
+        if let Outcome::Preview(d) = m1.outcome {
+            let s = d.pixels.image.size;
+            assert!(s[0] * s[1] <= 260_000, "pratinjau {}", s[0] * s[1]);
+        }
+        let m2 = out_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(matches!(m2.outcome, Outcome::Ready(_)), "kedua harus Ready");
+        if let Outcome::Ready(d) = m2.outcome {
+            let s = d.pixels.image.size;
+            assert!(s[0] * s[1] <= 2_000_000, "tajam {}", s[0] * s[1]);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn jpeg_besar_didekode_dengan_dimensi_dan_warna_benar() {
         let data = jpeg_bytes(3000, 2000);
-        let p = decode(&data, 4096).unwrap();
+        let p = decode_sharp(&data, 4096, max_pixels()).unwrap();
         assert_eq!(p.orig, [3000, 2000]);
         assert_eq!(p.image.size, [3000, 2000]);
         assert!(p.frames.is_none());
@@ -891,7 +1196,7 @@ mod tests {
             img,
             orientation: Orientation::Rotate90,
         };
-        let p = finish_raw(raw, 1024).unwrap();
+        let p = finish_raw(raw, 1024, max_pixels()).unwrap();
         assert_eq!(p.orig, [3000, 2000]);
         assert_eq!(p.image.size, [1024, 683]);
     }
@@ -946,7 +1251,7 @@ mod tests {
             24,
             16,
         );
-        let p = decode(&data, 4096).unwrap();
+        let p = decode_sharp(&data, 4096, max_pixels()).unwrap();
         let frames = p.frames.expect("harus dikenali sebagai animasi");
         assert_eq!(frames.len(), 3);
         assert_eq!(p.orig, [24, 16]);
@@ -964,7 +1269,7 @@ mod tests {
     #[test]
     fn gif_satu_frame_diperlakukan_sebagai_gambar_statis() {
         let data = gif_bytes(&[([10, 20, 30, 255], 100)], 8, 8);
-        let p = decode(&data, 4096).unwrap();
+        let p = decode_sharp(&data, 4096, max_pixels()).unwrap();
         assert!(p.frames.is_none());
         assert_eq!(p.image.size, [8, 8]);
     }
@@ -972,7 +1277,7 @@ mod tests {
     #[test]
     fn gif_animasi_besar_diperkecil_semua_frame() {
         let data = gif_bytes(&[([1, 2, 3, 255], 40), ([4, 5, 6, 255], 40)], 3000, 1500);
-        let p = decode(&data, 1024).unwrap();
+        let p = decode_sharp(&data, 1024, max_pixels()).unwrap();
         let frames = p.frames.unwrap();
         assert_eq!(p.orig, [3000, 1500]);
         assert!(frames.iter().all(|f| f.image.size == [1024, 512]));
@@ -987,7 +1292,7 @@ mod tests {
         );
         let cut = &data[..data.len() - 40];
         // Boleh berupa animasi parsial atau galat, tetapi tidak boleh panik.
-        match decode(cut, 4096) {
+        match decode_sharp(cut, 4096, max_pixels()) {
             Ok(p) => assert!(p.image.size == [64, 64]),
             Err(e) => assert!(!e.is_empty()),
         }
@@ -999,7 +1304,7 @@ mod tests {
         let heic: &[u8] = include_bytes!("../tests/fixtures/merah.heic");
         let avif: &[u8] = include_bytes!("../tests/fixtures/merah.avif");
         for (nama, data) in [("heic", heic), ("avif", avif)] {
-            let p = decode(data, 4096).unwrap_or_else(|e| panic!("{nama}: {e}"));
+            let p = decode_sharp(data, 4096, max_pixels()).unwrap_or_else(|e| panic!("{nama}: {e}"));
             assert_eq!(p.orig, [48, 32], "{nama}");
             assert!(p.frames.is_none(), "{nama}");
             let c = p.image.pixels[0]; // pojok kiri-atas: merah solid
@@ -1014,21 +1319,21 @@ mod tests {
     #[test]
     fn heic_rusak_memberi_galat_bukan_panik() {
         let heic: &[u8] = include_bytes!("../tests/fixtures/merah.heic");
-        assert!(decode(&heic[..heic.len() / 2], 4096).is_err());
+        assert!(decode_sharp(&heic[..heic.len() / 2], 4096, max_pixels()).is_err());
         let mut sampah = heic.to_vec();
         for b in sampah.iter_mut().skip(12) {
             *b = 0xA5;
         }
-        assert!(decode(&sampah, 4096).is_err());
+        assert!(decode_sharp(&sampah, 4096, max_pixels()).is_err());
     }
 
     #[test]
     fn data_sampah_memberi_galat_bukan_panik() {
-        assert!(decode(b"ini bukan gambar", 4096).is_err());
-        assert!(decode(&[], 4096).is_err());
+        assert!(decode_sharp(b"ini bukan gambar", 4096, max_pixels()).is_err());
+        assert!(decode_sharp(&[], 4096, max_pixels()).is_err());
         let mut rusak = png_bytes(64, 64);
         rusak.truncate(rusak.len() / 2);
-        assert!(decode(&rusak, 4096).is_err());
+        assert!(decode_sharp(&rusak, 4096, max_pixels()).is_err());
     }
 
     #[test]
@@ -1036,10 +1341,10 @@ mod tests {
         assert_eq!(format_name(&png_bytes(4, 4)), "PNG");
         assert_eq!(format_name(b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"), "GIF");
         assert_eq!(format_name(b"bukan gambar"), "Tidak diketahui");
-        let p = decode(&png_bytes(4, 4), 4096).unwrap();
+        let p = decode_sharp(&png_bytes(4, 4), 4096, max_pixels()).unwrap();
         assert_eq!(p.format, "PNG");
         let g = gif_bytes(&[([1, 2, 3, 255], 50), ([4, 5, 6, 255], 50)], 8, 8);
-        assert_eq!(decode(&g, 4096).unwrap().format, "GIF (animasi, 2 frame)");
+        assert_eq!(decode_sharp(&g, 4096, max_pixels()).unwrap().format, "GIF (animasi, 2 frame)");
         #[cfg(feature = "heif")]
         {
             let heic: &[u8] = include_bytes!("../tests/fixtures/merah.heic");
@@ -1060,3 +1365,7 @@ mod tests {
         assert_eq!(decode_rgba(&g, 8192, 1_000_000).unwrap().dimensions(), (8, 8));
     }
 }
+
+
+
+

@@ -1,6 +1,6 @@
 [package]
 name = "roneyview"
-version = "0.5.1"
+version = "0.5.4"
 edition = "2021"
 rust-version = "1.88"
 description = "Image viewer; not only for picture, you can see a folder with pictures, archive with pictures, and comic files like CBZ"
