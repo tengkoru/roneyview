@@ -3,9 +3,12 @@
 
 An alternative to Honeyview; an image viewer for Linux; written in the Rust programming language (using egui/eframe).
 
+
+![Screenshot1](tests/1.jpg)
 ![Screenshot1](tests/2.png)
 ![Screenshot2](tests/3.png)
 
+[Thanks for pictures](tests/thanks-for-pictures.md)
 
 ## What can Roneyview do?
 - **Open images**, **folders**, and **archives**
