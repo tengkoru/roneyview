@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::i18n::{Lang, tr, tr_fmt};
 use crate::source::Listing;
 
 /// Konversi detik-sejak-epoch (UTC) ke (tahun, bulan, hari, jam, menit, detik).
@@ -102,31 +103,31 @@ fn file_name(p: &Path) -> String {
 }
 
 /// Baris (label, nilai) untuk jendela Properties.
-pub fn properties_rows(listing: &Listing, index: usize, facts: &PageFacts) -> Vec<(String, String)> {
+pub fn properties_rows(listing: &Listing, index: usize, facts: &PageFacts, lang: Lang) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = Vec::new();
     let Some(loc) = locate(listing, index) else {
         return rows;
     };
     match &loc {
         Where::File(p) => {
-            rows.push(("Nama berkas".into(), file_name(p)));
+            rows.push((tr(lang, "prop_filename").to_string(), file_name(p)));
             rows.push((
-                "Lokasi".into(),
+                tr(lang, "prop_location").to_string(),
                 p.parent().map(|d| d.display().to_string()).unwrap_or_default(),
             ));
         }
         Where::Archive { archive, inner } => {
-            rows.push(("Nama berkas".into(), inner.rsplit('/').next().unwrap_or(inner).to_string()));
-            rows.push(("Arsip".into(), archive.display().to_string()));
-            rows.push(("Jalur di dalam arsip".into(), inner.clone()));
+            rows.push((tr(lang, "prop_filename").to_string(), inner.rsplit('/').next().unwrap_or(inner).to_string()));
+            rows.push((tr(lang, "prop_archive").to_string(), archive.display().to_string()));
+            rows.push((tr(lang, "prop_inner_path").to_string(), inner.clone()));
         }
     }
-    rows.push(("Ukuran gambar".into(), format!("{} x {} piksel", facts.width, facts.height)));
+    rows.push((tr(lang, "prop_imgsize").to_string(), tr_fmt(lang, "prop_dimensions", &[&facts.width, &facts.height])));
     rows.push((
-        "Ukuran berkas".into(),
+        tr(lang, "prop_filesize").to_string(),
         format!("{} ({} byte)", human_size(facts.file_size), facts.file_size),
     ));
-    rows.push(("Format".into(), facts.format.clone()));
+    rows.push((tr(lang, "prop_format").to_string(), facts.format.clone()));
     let modified = match &loc {
         Where::File(p) => std::fs::metadata(p)
             .and_then(|m| m.modified())
@@ -135,8 +136,8 @@ pub fn properties_rows(listing: &Listing, index: usize, facts: &PageFacts) -> Ve
         Where::Archive { .. } => listing.modified.get(index).cloned().flatten(),
     };
     rows.push((
-        "Tanggal ubah".into(),
-        modified.unwrap_or_else(|| "tidak diketahui".into()),
+        tr(lang, "prop_modified").to_string(),
+        modified.unwrap_or_else(|| tr(lang, "prop_unknown").to_string()),
     ));
     rows
 }

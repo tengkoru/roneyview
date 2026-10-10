@@ -56,23 +56,37 @@ if ((${#missing[@]})); then
 fi
 [[ "${1:-}" == "--dry-run" ]] && exit 0
 
-# Progres persen selama kompilasi (cargo tidak menampilkannya bawaan):
-# total crate dari Cargo.lock, persen dari baris "Compiling" yang sudah lewat.
+# Progres selama kompilasi (cargo tidak menampilkannya bawaan):
+# persen dari baris "Compiling" yang sudah lewat + nama crate yang sedang dikompilasi.
 TOTAL=$(grep -c '^\[\[package\]\]' Cargo.lock 2>/dev/null || true)
 if [ -z "$TOTAL" ] || [ "$TOTAL" -eq 0 ]; then TOTAL=1; fi
 LOG="$(mktemp /tmp/roneyview-build-XXXXXX.log)"
-printf 'Membangun roneyview (bin)...   0%%'
-cargo build --release --locked --no-default-features --features "$FEATS" >"$LOG" 2>&1 &
+echo 'Membangun...'
+if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL cargo build --release --locked --no-default-features --features "$FEATS" >"$LOG" 2>&1 &
+else
+    cargo build --release --offline --no-default-features --features "$FEATS" >"$LOG" 2>&1 &
+fi
+# NOTE: stdbuf -oL biar output cargo tidak ke-buffer saat di-redirect ke file.
+# Kalau ke-buffer, log kelihatan kosong dan progres macet di "menyiapkan...".
 CARGO_PID=$!
+last_crate=""
 while kill -0 "$CARGO_PID" 2>/dev/null; do
     n=$(grep -c 'Compiling ' "$LOG" 2>/dev/null || true)
     pct=$((n * 100 / TOTAL))
     if [ "$pct" -gt 99 ]; then pct=99; fi
-    printf '\rMembangun roneyview (bin)... %3d%%' "$pct"
-    sleep 2
+    # Tampilkan aktivitas terakhir cargo (Compiling, Checking, Fresh, dsb.)
+    # kalau belum ada, tampilkan "menyiapkan..."
+    crate=$(grep -E '^\s+(Compiling|Checking|Fresh|Downloading|Updating)' "$LOG" 2>/dev/null | tail -1 | sed 's/^ *//;s/ *$//' | cut -c1-50 || true)
+    if [ -z "$crate" ]; then crate="menyiapkan..."; fi
+    if [ "$crate" != "$last_crate" ]; then
+        printf 'Membangun %-50s %3d%%\n' "$crate" "$pct"
+        last_crate="$crate"
+    fi
+    sleep 1
 done
 if wait "$CARGO_PID"; then
-    printf '\rMembangun roneyview (bin)... 100%%\n'
+    printf 'Membangun %-50s 100%%\n' "roneyview (selesai)"
     rm -f "$LOG"
 else
     printf '\nKompilasi gagal. 20 baris terakhir log:\n'

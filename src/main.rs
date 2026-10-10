@@ -3,6 +3,7 @@
 mod app;
 mod dialogs;
 mod fileinfo;
+mod i18n;
 mod loader;
 mod natsort;
 mod settings;

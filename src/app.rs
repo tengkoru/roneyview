@@ -16,6 +16,7 @@ use eframe::glow::HasContext;
 
 use crate::dialogs::{self, Modal, ModalResult, PropsDialog, WallpaperDialog};
 use crate::fileinfo::{self, PageFacts};
+use crate::i18n::{Lang, tr, tr_fmt, unescape};
 use crate::loader::{self, AnimFrame, Command, Loaded, Outcome};
 use crate::settings::{FitMode, Store};
 use crate::source::Listing;
@@ -163,6 +164,7 @@ enum Action {
     ToggleRtl,
     ToggleCover,
     Help,
+    Settings,
     Quit,
 }
 
@@ -243,6 +245,8 @@ pub struct RoneyApp {
     land_bottom: bool,
     view_rect: Rect,
     display_scale: f32,
+    lang: Lang,
+    show_settings: bool,
     flip_accum: f32,
     flip_block_until: Instant,
 
@@ -311,6 +315,7 @@ impl RoneyApp {
 
         let store = Store::load();
         let fit = store.state.fit;
+        let lang = Lang::from_code(&store.state.lang);
         let bar_locked = store.state.bar_locked;
         let two_page_mode = store.state.two_page;
         let rtl = store.state.rtl;
@@ -362,6 +367,8 @@ impl RoneyApp {
             land_bottom: false,
             view_rect: Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
             display_scale: 1.0,
+            lang,
+            show_settings: false,
             flip_accum: 0.0,
             flip_block_until: Instant::now(),
             anim_key: None,
@@ -391,7 +398,8 @@ impl RoneyApp {
     }
 
     fn open_path(&mut self, ctx: &Context, path: &Path) {
-        let (listing, start) = match Listing::open(path) {
+        let scan = self.store.state.scan_subfolders;
+        let (listing, start) = match Listing::open(path, scan) {
             Ok(v) => v,
             Err(e) => {
                 self.notify(e);
@@ -403,6 +411,7 @@ impl RoneyApp {
 
     /// Pasang daftar gambar baru dan tampilkan gambar ke-`index`.
     fn install_listing(&mut self, ctx: &Context, listing: Listing, index: usize) {
+        let lang = self.lang;
         let index = index.min(listing.len().saturating_sub(1));
         self.session += 1;
         let listing = Arc::new(listing);
@@ -412,7 +421,7 @@ impl RoneyApp {
             listing: listing.clone(),
         };
         if self.cmd_tx_main.send(open()).is_err() || self.cmd_tx_pref.send(open()).is_err() {
-            self.notify("Thread pemuat gambar berhenti; mulai ulang Roneyview.");
+            self.notify(tr(lang, "err_loader_dead"));
             return;
         }
         self.listing = Some(listing);
@@ -432,6 +441,7 @@ impl RoneyApp {
 
     #[cfg(feature = "dialogs")]
     fn start_dialog(&mut self, ctx: &Context, kind: DialogKind) {
+        let lang = self.lang;
         if self.dialog_busy {
             return;
         }
@@ -468,10 +478,10 @@ impl RoneyApp {
                                 exts.push(e.to_uppercase());
                             }
                             d.set_title("Buka gambar atau arsip")
-                                .add_filter("Gambar dan arsip ZIP/CBZ", &exts)
+                                .add_filter(tr(lang, "dlg_open_file_filter"), &exts)
                                 .pick_file()
                         }
-                        DialogKind::Folder => d.set_title("Buka folder gambar").pick_folder(),
+                        DialogKind::Folder => d.set_title(tr(lang, "dlg_open_folder_title")).pick_folder(),
                     }
                 })
                 .unwrap_or(None);
@@ -480,13 +490,14 @@ impl RoneyApp {
             });
         if spawned.is_err() {
             self.dialog_busy = false;
-            self.notify("Tidak dapat membuka dialog berkas.");
+            self.notify(tr(lang, "err_open_dialog"));
         }
     }
 
     #[cfg(not(feature = "dialogs"))]
     fn start_dialog(&mut self, _ctx: &Context, _kind: DialogKind) {
-        self.notify("Dialog berkas tidak tersedia di build ini. Seret berkas ke jendela.");
+        let lang = self.lang;
+        self.notify(tr(lang, "err_no_file_dialog"));
     }
 
     fn poll_dialog(&mut self, ctx: &Context) {
@@ -542,6 +553,7 @@ impl RoneyApp {
     }
 
     fn request_pages(&mut self, ctx: &Context) {
+        let lang = self.lang;
         let Some(l) = self.listing.clone() else {
             return;
         };
@@ -566,7 +578,7 @@ impl RoneyApp {
             self.cache.retain(|i, _| *i == self.index || *i == partner);
             if !self.low_mem_notified {
                 self.low_mem_notified = true;
-                self.notify("Memori sistem hampir habis: prefetch dimatikan");
+                self.notify(tr(lang, "notify_lowmem"));
             }
         } else if self.low_memory_mode {
             self.low_mem_notified = false; // mode hemat: hanya halaman aktif, tanpa prefetch
@@ -768,28 +780,44 @@ impl RoneyApp {
     }
 
     fn go_next(&mut self, ctx: &Context) {
+        let lang = self.lang;
         let n = self.count();
         if n == 0 {
             return;
         }
         let target = self.index + self.next_span();
         if target >= n {
-            self.notify("Ini gambar terakhir");
+            self.notify(tr(lang, "notify_last"));
         } else {
             self.go_to(ctx, target, false);
         }
     }
 
     fn go_prev(&mut self, ctx: &Context, land_bottom: bool) {
+        let lang = self.lang;
         let wide = |i: usize| self.is_wide(i);
         match prev_start_for(self.index, self.two_page_mode, self.cover_alone, &wide) {
-            None => self.notify("Ini gambar pertama"),
+            None => self.notify(tr(lang, "notify_first")),
             Some(t) => self.go_to(ctx, t, land_bottom),
         }
     }
 
+    /// Apakah gambar saat ini masih dalam proses loading.
+    /// Preview (blurry) sudah dihitung "tampil", jadi navigasi dibuka lagi
+    /// begitu preview muncul — tidak perlu nunggu gambar tajam selesai.
+    fn is_loading(&self) -> bool {
+        self.listing.is_some()
+            && !self.cache.contains_key(&self.index)
+            && !self.errors.contains_key(&self.index)
+    }
+
     fn go_to(&mut self, ctx: &Context, target: usize, land_bottom: bool) {
         if target >= self.count() || target == self.index {
+            return;
+        }
+        // Kunci navigasi selama gambar saat ini masih loading, supaya tidak
+        // loncat ke 3.jpg/4.jpg padahal 2.jpg belum tampil.
+        if self.is_loading() {
             return;
         }
         self.dir = if target > self.index { 1 } else { -1 };
@@ -913,6 +941,15 @@ impl RoneyApp {
         (fit * ZOOM_STEP.powi(MAX_ZOOM_STEPS)).max(MIN_SCALE)
     }
 
+    /// Ganti bahasa UI dan simpan ke pengaturan.
+    fn set_lang(&mut self, lang: Lang) {
+        if self.lang != lang {
+            self.lang = lang;
+            self.store.state.lang = lang.code().to_string();
+            self.store_dirty = true;
+        }
+    }
+
     fn zoom_by(&mut self, ctx: &Context, factor: f32, anchor: Option<Pos2>) {
         let Some(sh) = self.shown.clone() else {
             return;
@@ -1021,6 +1058,7 @@ impl RoneyApp {
     // ------------------------------------------------------------- aksi
 
     fn perform(&mut self, ctx: &Context, action: Action) {
+        let lang = self.lang;
         match action {
             Action::Next => self.go_next(ctx),
             Action::Prev => self.go_prev(ctx, false),
@@ -1069,14 +1107,16 @@ impl RoneyApp {
             Action::ToggleCover => self.set_cover(ctx, !self.cover_alone),
             Action::ToggleLowMemory => self.set_low_memory(ctx, !self.low_memory_mode),
             Action::Help => self.show_help = !self.show_help,
+            Action::Settings => self.show_settings = true,
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
         ctx.request_repaint();
     }
 
     fn rotate_checked(&mut self, quarter_turns: u8) {
+        let lang = self.lang;
         if self.shown.as_ref().is_some_and(|s| s.slots.len() == 2) {
-            self.notify("Rotasi tidak tersedia pada mode dua halaman");
+            self.notify(tr(lang, "notify_no_rotate"));
         } else {
             self.rotate(quarter_turns);
         }
@@ -1111,6 +1151,7 @@ impl RoneyApp {
                 take(ctrl | shift, Key::O, Action::OpenFolder, i);
                 take(ctrl, Key::O, Action::OpenFile, i);
                 take(ctrl, Key::Q, Action::Quit, i);
+                take(ctrl, Key::Comma, Action::Settings, i);
                 take(shift, Key::R, Action::RotateCcw, i);
                 take(none, Key::R, Action::RotateCw, i);
                 take(shift, Key::Space, Action::Prev, i);
@@ -1200,6 +1241,7 @@ impl RoneyApp {
     // ------------------------------------------------------------ gambar
 
     fn menu_bar(&self, ui: &mut egui::Ui, acts: &mut Vec<Action>) {
+        let lang = self.lang;
         egui::MenuBar::new().ui(ui, |ui| {
             let item = |ui: &mut egui::Ui, text: &str, short: &str, acts: &mut Vec<Action>, a: Action| {
                 let mut b = egui::Button::new(text);
@@ -1210,23 +1252,25 @@ impl RoneyApp {
                     acts.push(a);
                 }
             };
-            ui.menu_button("Berkas", |ui| {
-                item(ui, "Buka berkas atau arsip...", "Ctrl+O", acts, Action::OpenFile);
-                item(ui, "Buka folder...", "Ctrl+Shift+O", acts, Action::OpenFolder);
+            ui.menu_button(tr(lang, "menu_file"), |ui| {
+                item(ui, tr(lang, "menu_open_file"), "Ctrl+O", acts, Action::OpenFile);
+                item(ui, tr(lang, "menu_open_folder"), "Ctrl+Shift+O", acts, Action::OpenFolder);
                 ui.separator();
-                item(ui, "Keluar", "Ctrl+Q", acts, Action::Quit);
+                item(ui, tr(lang, "menu_settings"), "Ctrl+,", acts, Action::Settings);
+                ui.separator();
+                item(ui, tr(lang, "menu_quit"), "Ctrl+Q", acts, Action::Quit);
             });
-            ui.menu_button("Tampilan", |ui| {
+            ui.menu_button(tr(lang, "menu_view"), |ui| {
                 let current = match self.zoom {
                     Zoom::Fit(m) => Some(m),
                     Zoom::Custom(_) => None,
                 };
                 for (m, label, short) in [
-                    (FitMode::Fit, "Muat ke jendela (kecilkan saja)", "F"),
-                    (FitMode::FitUpscale, "Muat ke jendela (perbesar juga)", "Shift+F"),
-                    (FitMode::Width, "Sesuaikan lebar", "W"),
-                    (FitMode::Height, "Sesuaikan tinggi", "H"),
-                    (FitMode::Original, "Ukuran asli (100%)", "0"),
+                    (FitMode::Fit, tr(lang, "view_fit"), "F"),
+                    (FitMode::FitUpscale, tr(lang, "view_fit_upscale"), "Shift+F"),
+                    (FitMode::Width, tr(lang, "view_fit_w"), "W"),
+                    (FitMode::Height, tr(lang, "view_fit_h"), "H"),
+                    (FitMode::Original, tr(lang, "view_orig"), "0"),
                 ] {
                     let b = egui::Button::new(label)
                         .selected(current == Some(m))
@@ -1236,65 +1280,66 @@ impl RoneyApp {
                     }
                 }
                 ui.separator();
-                item(ui, "Perbesar", "+", acts, Action::ZoomIn);
-                item(ui, "Perkecil", "-", acts, Action::ZoomOut);
+                item(ui, tr(lang, "view_zoomin"), "+", acts, Action::ZoomIn);
+                item(ui, tr(lang, "view_zoomout"), "-", acts, Action::ZoomOut);
                 ui.separator();
-                item(ui, "Putar searah jarum jam", "R", acts, Action::RotateCw);
-                item(ui, "Putar berlawanan jarum jam", "Shift+R", acts, Action::RotateCcw);
+                item(ui, tr(lang, "view_rotate_cw"), "R", acts, Action::RotateCw);
+                item(ui, tr(lang, "view_rotate_ccw"), "Shift+R", acts, Action::RotateCcw);
                 ui.separator();
-                item(ui, "Jeda / putar animasi", "P", acts, Action::TogglePlay);
-                let lock = egui::Button::new("Kunci bar bawah")
+                item(ui, tr(lang, "view_anim"), "P", acts, Action::TogglePlay);
+                let lock = egui::Button::new(tr(lang, "view_lockbar"))
                     .selected(self.bar_locked)
                     .shortcut_text("L");
                 if ui.add(lock).clicked() {
                     acts.push(Action::ToggleBarLock);
                 }
-                let saver = egui::Button::new("Mode hemat memori")
+                let saver = egui::Button::new(tr(lang, "view_lowmem"))
                     .selected(self.low_memory_mode)
                     .shortcut_text("M");
-                let two = egui::Button::new("Mode dua halaman")
+                let two = egui::Button::new(tr(lang, "view_twopage"))
                     .selected(self.two_page_mode)
                     .shortcut_text("D");
                 if ui.add(two).clicked() {
                     acts.push(Action::ToggleTwoPage);
                 }
-                let rtl = egui::Button::new("Arah baca kanan-ke-kiri (manga)")
+                let rtl = egui::Button::new(tr(lang, "view_rtl"))
                     .selected(self.rtl)
                     .shortcut_text("K");
                 if ui.add(rtl).clicked() {
                     acts.push(Action::ToggleRtl);
                 }
-                let cover = egui::Button::new("Halaman pertama tunggal (sampul)").selected(self.cover_alone);
+                let cover = egui::Button::new(tr(lang, "view_cover")).selected(self.cover_alone);
                 if ui.add(cover).clicked() {
                     acts.push(Action::ToggleCover);
                 }
                 if ui
                     .add(saver)
-                    .on_hover_text("Hanya gambar yang sedang dilihat disimpan di RAM; tanpa prefetch")
+                    .on_hover_text(tr(lang, "view_lowmem_tip"))
                     .clicked()
                 {
                     acts.push(Action::ToggleLowMemory);
                 }
                 ui.separator();
-                item(ui, "Layar penuh", "Enter", acts, Action::ToggleFullscreen);
+                item(ui, tr(lang, "view_fullscreen"), "Enter", acts, Action::ToggleFullscreen);
             });
-            ui.menu_button("Navigasi", |ui| {
+            ui.menu_button(tr(lang, "menu_navigate"), |ui| {
                 let (kp, kn) = if self.rtl { ("Kanan", "Kiri") } else { ("Kiri", "Kanan") };
-                item(ui, "Sebelumnya", kp, acts, Action::Prev);
-                item(ui, "Berikutnya", kn, acts, Action::Next);
-                item(ui, "Pertama", "Home", acts, Action::First);
-                item(ui, "Terakhir", "End", acts, Action::Last);
+                item(ui, tr(lang, "nav_prev"), kp, acts, Action::Prev);
+                item(ui, tr(lang, "nav_next"), kn, acts, Action::Next);
+                item(ui, tr(lang, "nav_first"), "Home", acts, Action::First);
+                item(ui, tr(lang, "nav_last"), "End", acts, Action::Last);
             });
-            ui.menu_button("Bantuan", |ui| {
-                item(ui, "Pintasan keyboard", "F1", acts, Action::Help);
+            ui.menu_button(tr(lang, "menu_help"), |ui| {
+                item(ui, tr(lang, "help_title"), "F1", acts, Action::Help);
             });
         });
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         ui.horizontal(|ui| {
             let Some(l) = &self.listing else {
-                ui.label("Siap. Seret gambar, folder, atau ZIP ke jendela ini.");
+                ui.label(tr(lang, "status_ready"));
                 return;
             };
             let name = l.names.get(self.index).map_or("", String::as_str);
@@ -1338,10 +1383,10 @@ impl RoneyApp {
                 }
             }
             if self.errors.contains_key(&self.index) {
-                ui.colored_label(Color32::from_rgb(235, 110, 110), "gagal dimuat");
+                ui.colored_label(Color32::from_rgb(235, 110, 110), tr(lang, "status_failed"));
                 ui.separator();
             } else if !self.cache.contains_key(&self.index) {
-                ui.label("memuat...");
+                ui.label(tr(lang, "status_loading"));
                 ui.separator();
             }
             ui.add(egui::Label::new(name).truncate());
@@ -1351,6 +1396,7 @@ impl RoneyApp {
 
 impl RoneyApp {
     fn draw_view(&mut self, ctx: &Context, ui: &mut egui::Ui, inp: &FrameInput) {
+        let lang = self.lang;
         let rect = ui.available_rect_before_wrap();
         self.view_rect = rect;
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
@@ -1451,27 +1497,27 @@ impl RoneyApp {
             self.ctx_target = nearest.unwrap_or(shown_index);
         }
 
-        // Badge status loading di atas gambar: "Memuat..." kalau gambarnya
-        // belum ada, "Mempertajam..." kalau yang tampil masih pratinjau blur.
+        // Badge status loading di atas gambar: tr(lang, "Memuat...") kalau gambarnya
+        // belum ada, tr(lang, "badge_sharpen_dots") kalau yang tampil masih pratinjau blur.
         self.draw_loading_badge(&painter, rect);
 
         // Menu klik kanan.
         let mut chosen: Option<CtxChoice> = None;
         resp.context_menu(|ui| {
-            if ui.button("Set as wallpaper...").clicked() {
+            if ui.button(tr(lang, "ctx_wallpaper_title")).clicked() {
                 chosen = Some(CtxChoice::Wallpaper);
                 ui.close();
             }
-            if ui.button("Properties").clicked() {
+            if ui.button(tr(lang, "ctx_properties")).clicked() {
                 chosen = Some(CtxChoice::Properties);
                 ui.close();
             }
-            ui.menu_button("Tindakan", |ui| {
-                if ui.button("Buka di dalam folder").clicked() {
+            ui.menu_button(tr(lang, "ctx_actions"), |ui| {
+                if ui.button(tr(lang, "ctx_open_folder")).clicked() {
                     chosen = Some(CtxChoice::OpenFolder);
                     ui.close();
                 }
-                if ui.button("Pindahkan ke sampah").clicked() {
+                if ui.button(tr(lang, "modal_trash_title")).clicked() {
                     chosen = Some(CtxChoice::Trash);
                     ui.close();
                 }
@@ -1494,12 +1540,17 @@ impl RoneyApp {
 
     /// Pil status loading di tengah atas area gambar.
     fn draw_loading_badge(&self, painter: &egui::Painter, rect: Rect) {
+        // Jangan tampilkan badge kalau belum ada berkas/folder/arsip yang dibuka.
+        if self.listing.is_none() {
+            return;
+        }
+        let lang = self.lang;
         let badge = if self.errors.contains_key(&self.index) {
             None
         } else if !self.cache.contains_key(&self.index) {
-            Some("Memuat…")
+            Some(tr(lang, "badge_loading"))
         } else if self.cache.get(&self.index).is_some_and(|p| p.preview) {
-            Some("Mempertajam…")
+            Some(tr(lang, "badge_sharpen"))
         } else {
             None
         };
@@ -1516,9 +1567,11 @@ impl RoneyApp {
         painter.galley(br.min + pad, galley, Color32::WHITE);
     }
 
-    fn draw_placeholder(&self, painter: &egui::Painter, rect: Rect) {        let (text, color, size) = match (&self.listing, self.errors.get(&self.index)) {
+    fn draw_placeholder(&self, painter: &egui::Painter, rect: Rect) {
+        let lang = self.lang;
+        let (text, color, size) = match (&self.listing, self.errors.get(&self.index)) {
             (None, _) => (
-                "Roneyview\n\nSeret gambar, folder, atau ZIP/CBZ ke sini\natau tekan Ctrl+O. F1 untuk pintasan.".to_string(),
+                unescape(tr(lang, "empty_hint")),
                 Color32::from_gray(150),
                 18.0,
             ),
@@ -1530,7 +1583,7 @@ impl RoneyApp {
                     16.0,
                 )
             }
-            (Some(_), None) => ("Memuat...".to_string(), Color32::from_gray(130), 16.0),
+            (Some(_), None) => (tr(lang, "Memuat...").to_string(), Color32::from_gray(130), 16.0),
         };
         let galley = painter.layout(
             text,
@@ -1543,13 +1596,14 @@ impl RoneyApp {
     }
 
     fn draw_overlays(&mut self, ctx: &Context, hovering_files: bool) {
+        let lang = self.lang;
         if hovering_files {
             egui::Area::new(egui::Id::new("drop_hint"))
                 .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                 .interactable(false)
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.heading("Lepaskan untuk membuka");
+                        ui.heading(tr(lang, "drop_hint"));
                     });
                 });
         }
@@ -1571,8 +1625,9 @@ impl RoneyApp {
             }
         }
         if self.show_help {
+            let lang = self.lang;
             let mut open = true;
-            egui::Window::new("Pintasan keyboard")
+            egui::Window::new(tr(lang, "help_title"))
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
@@ -1580,29 +1635,29 @@ impl RoneyApp {
                 .show(ctx, |ui| {
                     egui::Grid::new("help_grid").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
                         for (k, d) in [
-                            ("Kanan / PgDn / Spasi", "Gambar berikutnya"),
-                            ("Kiri / PgUp / Backspace", "Gambar sebelumnya"),
-                            ("Home / End", "Pertama / terakhir"),
-                            ("Roda mouse", "Geser; pindah gambar bila sudah mentok"),
-                            ("Atas / Bawah", "Geser vertikal"),
-                            ("Seret kiri", "Geser gambar"),
-                            ("Ctrl + roda / + / -", "Perbesar / perkecil"),
-                            ("F / Shift+F", "Muat ke jendela (kecilkan / perbesar juga)"),
-                            ("W / H", "Sesuaikan lebar / tinggi"),
-                            ("0 atau 1", "Ukuran asli 100%"),
-                            ("R / Shift+R", "Putar kanan / kiri"),
-                            ("P", "Jeda / putar animasi (GIF, WebP, APNG)"),
-                            ("L", "Kunci / lepas bar bawah"),
-                            ("M", "Mode hemat memori (buang gambar dari RAM setelah dilihat)"),
-                            ("D", "Mode dua halaman"),
-                            ("K", "Arah baca kanan-ke-kiri (panah kiri = berikutnya)"),
-                            ("Klik kanan", "Set as wallpaper, Properties, Tindakan"),
-                            ("Mouse ke tepi kiri/kanan", "Tombol sebelumnya / berikutnya"),
-                            ("Mouse ke bawah", "Bar: tombol, slider lompat, Kunci"),
-                            ("Enter / F11 / klik ganda", "Layar penuh (Esc keluar)"),
-                            ("Ctrl+O", "Buka berkas atau arsip"),
-                            ("Ctrl+Shift+O", "Buka folder"),
-                            ("Ctrl+Q", "Keluar"),
+                            (tr(lang, "help_next_keys"), tr(lang, "help_next_img")),
+                            (tr(lang, "help_prev_keys"), tr(lang, "help_prev_img")),
+                            (tr(lang, "help_home_end"), tr(lang, "help_first_last")),
+                            (tr(lang, "help_wheel_title"), tr(lang, "help_wheel")),
+                            (tr(lang, "help_up_down"), tr(lang, "help_pan_y")),
+                            (tr(lang, "help_drag"), tr(lang, "help_pan")),
+                            ("Ctrl + roda / + / -", tr(lang, "help_zoom")),
+                            (tr(lang, "help_fit"), tr(lang, "help_fit_desc")),
+                            ("W / H", tr(lang, "help_fit_wh")),
+                            (tr(lang, "shortcut_orig_size"), tr(lang, "help_orig")),
+                            (tr(lang, "help_rotate_keys"), tr(lang, "help_rotate")),
+                            ("P", tr(lang, "help_anim")),
+                            ("L", tr(lang, "help_lock")),
+                            ("M", tr(lang, "help_lowmem")),
+                            ("D", tr(lang, "view_twopage")),
+                            ("K", tr(lang, "help_rtl")),
+                            (tr(lang, "help_rightclick"), tr(lang, "help_ctx")),
+                            (tr(lang, "help_mouse_edge"), tr(lang, "help_nav_btns")),
+                            (tr(lang, "help_mouse_bottom"), tr(lang, "help_bar")),
+                            (tr(lang, "help_fullscreen"), tr(lang, "help_fullscreen_desc")),
+                            ("Ctrl+O", tr(lang, "help_open_file")),
+                            ("Ctrl+Shift+O", tr(lang, "help_open_folder")),
+                            ("Ctrl+Q", tr(lang, "menu_quit")),
                         ] {
                             ui.monospace(k);
                             ui.label(d);
@@ -1611,6 +1666,35 @@ impl RoneyApp {
                     });
                 });
             self.show_help = open;
+        }
+        if self.show_settings {
+            let lang = self.lang;
+            let mut open = true;
+            egui::Window::new(tr(lang, "settings_title"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.heading(tr(lang, "settings_language"));
+                    for l in [Lang::Id, Lang::En] {
+                        if ui.radio(self.lang == l, l.display_name()).clicked() {
+                            self.set_lang(l);
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.heading(tr(lang, "settings_folders"));
+                    let mut scan = self.store.state.scan_subfolders;
+                    if ui
+                        .checkbox(&mut scan, tr(lang, "settings_scan_subfolders"))
+                        .changed()
+                    {
+                        self.store.state.scan_subfolders = scan;
+                        self.store_dirty = true;
+                    }
+                    // Kategori pengaturan lain bisa ditambah di sini.
+                });
+            self.show_settings = open;
         }
     }
 
@@ -1874,6 +1958,7 @@ struct BarInput {
     can_right: bool,
     /// Halaman terakhir pada spread dua halaman yang sedang tampil.
     pair_end: Option<usize>,
+    lang: Lang,
 }
 
 #[derive(Default)]
@@ -1889,6 +1974,7 @@ struct BarOutput {
 }
 
 fn draw_bar(ui: &mut egui::Ui, inp: &BarInput) -> BarOutput {
+    let lang = inp.lang;
     let mut out = BarOutput {
         locked: inp.locked,
         ..Default::default()
@@ -1969,8 +2055,8 @@ fn draw_bar(ui: &mut egui::Ui, inp: &BarInput) -> BarOutput {
 
         let mut locked = inp.locked;
         let cb = ui
-            .add_sized([lock_w, btn.y], egui::Checkbox::new(&mut locked, "Kunci"))
-            .on_hover_text("Kunci: bar ini tetap tampil walau pointer menjauh (L)");
+            .add_sized([lock_w, btn.y], egui::Checkbox::new(&mut locked, tr(lang, "bar_lock")))
+            .on_hover_text(tr(lang, "bar_lock_tip"));
         if cb.changed() {
             out.locked = locked;
         }
@@ -1991,6 +2077,7 @@ impl RoneyApp {
     }
 
     fn handle_ctx(&mut self, ctx: &Context, choice: CtxChoice, index: usize) {
+        let lang = self.lang;
         let Some(listing) = self.listing.clone() else {
             return;
         };
@@ -2006,7 +2093,7 @@ impl RoneyApp {
                     format: page.format.clone(),
                 };
                 self.props = Some(PropsDialog {
-                    rows: fileinfo::properties_rows(&listing, index, &facts),
+                    rows: fileinfo::properties_rows(&listing, index, &facts, self.lang),
                 });
             }
             CtxChoice::Wallpaper => {
@@ -2036,7 +2123,7 @@ impl RoneyApp {
                 let path = listing.origin.join(&name);
                 if matches!(choice, CtxChoice::OpenFolder) {
                     dialogs::open_in_folder(&path, self.note_tx.clone(), ctx.clone());
-                    self.notify("Membuka folder...");
+                    self.notify(tr(lang, "notify_open_folder"));
                 } else {
                     self.modal = Some(Modal::ConfirmTrash { index, path, name });
                 }
@@ -2063,7 +2150,8 @@ impl RoneyApp {
         let Some(listing) = self.listing.clone() else {
             return;
         };
-        match Listing::open(&listing.origin) {
+        let scan = self.store.state.scan_subfolders;
+        match Listing::open(&listing.origin, scan) {
             Ok((l, _)) => self.install_listing(ctx, l, index),
             Err(_) => self.clear_listing(ctx),
         }
@@ -2071,11 +2159,12 @@ impl RoneyApp {
     }
 
     fn draw_dialogs(&mut self, ctx: &Context) {
+        let lang = self.lang;
         while let Ok(msg) = self.note_rx.try_recv() {
             self.modal = Some(Modal::Error(msg));
         }
         if let Some(modal) = self.modal.take() {
-            match dialogs::draw_modal(ctx, &modal) {
+            match dialogs::draw_modal(ctx, &modal, self.lang) {
                 ModalResult::Keep => self.modal = Some(modal),
                 ModalResult::Close => {}
                 ModalResult::ConfirmTrash => {
@@ -2091,8 +2180,8 @@ impl RoneyApp {
         if let Some(dlg) = self.props.take() {
             let mut open = true;
             let mut inner_close = false;
-            dialogs::show_dialog(ctx, "roneyview-properties", "Properties", [520.0, 340.0], &mut open, |_, ui| {
-                if dialogs::draw_properties(ui, &dlg) {
+            dialogs::show_dialog(ctx, "roneyview-properties", tr(lang, "ctx_properties"), [520.0, 340.0], &mut open, |_, ui| {
+                if dialogs::draw_properties(ui, &dlg, lang) {
                     inner_close = true;
                 }
             });
@@ -2103,8 +2192,8 @@ impl RoneyApp {
         if let Some(mut dlg) = self.wallpaper.take() {
             let mut open = true;
             let mut inner_close = false;
-            dialogs::show_dialog(ctx, "roneyview-wallpaper", "Set as wallpaper", [460.0, 560.0], &mut open, |c, ui| {
-                if dialogs::draw_wallpaper(c, ui, &mut dlg) {
+            dialogs::show_dialog(ctx, "roneyview-wallpaper", tr(lang, "ctx_wallpaper"), [460.0, 560.0], &mut open, |c, ui| {
+                if dialogs::draw_wallpaper(c, ui, &mut dlg, lang) {
                     inner_close = true;
                 }
             });
@@ -2119,6 +2208,7 @@ impl RoneyApp {
     }
 
     fn set_low_memory(&mut self, ctx: &Context, on: bool) {
+        let lang = self.lang;
         self.low_memory_mode = on;
         self.store.state.low_memory = on;
         self.store_dirty = true;
@@ -2129,42 +2219,45 @@ impl RoneyApp {
             self.request_pages(ctx); // nyalakan lagi prefetch
         }
         self.notify(if on {
-            "Mode hemat memori aktif: hanya gambar yang dilihat disimpan di RAM"
+            tr(lang, "notify_lowmem_on")
         } else {
-            "Mode hemat memori mati: gambar sekitar dimuat lebih dulu agar cepat"
+            tr(lang, "notify_lowmem_off")
         });
     }
 
     fn set_two_page(&mut self, ctx: &Context, on: bool) {
+        let lang = self.lang;
         self.two_page_mode = on;
         self.store.state.two_page = on;
         self.store_dirty = true;
         self.relayout(ctx);
-        self.notify(if on { "Mode dua halaman aktif" } else { "Mode dua halaman mati" });
+        self.notify(if on { tr(lang, "notify_twopage_on") } else { tr(lang, "notify_twopage_off") });
     }
 
     fn set_rtl(&mut self, ctx: &Context, on: bool) {
+        let lang = self.lang;
         self.rtl = on;
         self.store.state.rtl = on;
         self.store_dirty = true;
         self.placed_for = None;
         ctx.request_repaint();
         self.notify(if on {
-            "Arah baca kanan-ke-kiri (manga): panah kiri = berikutnya"
+            tr(lang, "help_rtl_desc")
         } else {
             "Arah baca kiri-ke-kanan"
         });
     }
 
     fn set_cover(&mut self, ctx: &Context, on: bool) {
+        let lang = self.lang;
         self.cover_alone = on;
         self.store.state.cover_alone = on;
         self.store_dirty = true;
         self.relayout(ctx);
         self.notify(if on {
-            "Halaman pertama tampil sendiri (sampul)"
+            tr(lang, "notify_cover_on")
         } else {
-            "Halaman pertama dipasangkan dengan kedua"
+            tr(lang, "notify_cover_off")
         });
     }
 
@@ -2273,6 +2366,7 @@ impl RoneyApp {
                 can_left,
                 can_right,
                 pair_end,
+                lang: self.lang,
             };
             let out = egui::Area::new(egui::Id::new("nav_bar_area"))
                 .order(egui::Order::Foreground)

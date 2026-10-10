@@ -112,11 +112,12 @@ impl Listing {
 
     /// Buka path apa pun: folder, arsip, atau satu berkas gambar.
     /// Untuk berkas gambar, mengembalikan juga indeks berkas itu di dalam foldernya.
-    pub fn open(path: &Path) -> Result<(Listing, Option<usize>), String> {
+    /// `scan_subfolders`: kalau true, sub-folder ikut dipindai secara rekursif.
+    pub fn open(path: &Path, scan_subfolders: bool) -> Result<(Listing, Option<usize>), String> {
         let meta = fs::metadata(path)
             .map_err(|e| format!("Tidak dapat mengakses {}: {e}", path.display()))?;
         if meta.is_dir() {
-            return Ok((list_folder(path, None)?, None));
+            return Ok((list_folder(path, None, scan_subfolders)?, None));
         }
         if is_archive_path(path) {
             return Ok((list_archive(path)?, None));
@@ -135,7 +136,7 @@ impl Listing {
             .strip_prefix(dir)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| name.clone());
-        let listing = list_folder(dir, Some(rel.as_str()))?;
+        let listing = list_folder(dir, Some(rel.as_str()), scan_subfolders)?;
         let idx = listing.names.iter().position(|n| *n == rel).unwrap_or(0);
         Ok((listing, Some(idx)))
     }
@@ -256,12 +257,16 @@ fn rar_error(context: &str, e: &unrar::error::UnrarError) -> String {
     }
 }
 
-/// Pindai folder SECARA REKURSIF: gambar di sub-folder ikut dimuat.
+/// Pindai folder: kalau `recursive` true, gambar di sub-folder ikut dimuat.
 /// `names` berisi jalur relatif terhadap `dir` ("sub/foto.png") supaya berkas
 /// bernama sama di folder berbeda tetap bisa dibedakan.
-fn list_folder(dir: &Path, keep_hidden: Option<&str>) -> Result<Listing, String> {
+fn list_folder(
+    dir: &Path,
+    keep_hidden: Option<&str>,
+    recursive: bool,
+) -> Result<Listing, String> {
     let mut items: Vec<(String, PathBuf)> = Vec::new();
-    collect_images(dir, dir, keep_hidden, &mut items)?;
+    collect_images(dir, dir, keep_hidden, recursive, &mut items)?;
     if items.is_empty() {
         return Err(format!(
             "Tidak ada gambar yang didukung di {}",
@@ -282,6 +287,7 @@ fn collect_images(
     root: &Path,
     dir: &Path,
     keep_hidden: Option<&str>,
+    recursive: bool,
     items: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), String> {
     let rd = fs::read_dir(dir)
@@ -296,13 +302,17 @@ fn collect_images(
         // (mencegah loop), symlink ke berkas tetap dibuka lewat `is_file`.
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
+            // Kalau recursive mati, lewati sub-folder sepenuhnya.
+            if !recursive {
+                continue;
+            }
             let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
             // Lewati folder tersembunyi (.git, .thumbnails, ...) supaya tidak
             // memindai ribuan berkas yang tidak diinginkan.
             if base.starts_with('.') {
                 continue;
             }
-            collect_images(root, &path, keep_hidden, items)?;
+            collect_images(root, &path, keep_hidden, recursive, items)?;
             continue;
         }
         if !path.is_file() {
@@ -483,11 +493,11 @@ mod tests {
         for n in ["p10.png", "p2.png", "p1.png", ".tersembunyi.png", "baca.txt"] {
             fs::write(d.join(n), b"x").unwrap();
         }
-        let (l, start) = Listing::open(&d.join("p2.png")).unwrap();
+        let (l, start) = Listing::open(&d.join("p2.png"), true).unwrap();
         assert_eq!(l.names, vec!["p1.png", "p2.png", "p10.png"]);
         assert_eq!(start, Some(1));
         assert!(!l.is_archive());
-        let (l2, s2) = Listing::open(&d).unwrap();
+        let (l2, s2) = Listing::open(&d, true).unwrap();
         assert_eq!(l2.len(), 3);
         assert_eq!(s2, None);
         let mut r = l.open_reader().unwrap();
@@ -512,14 +522,14 @@ mod tests {
         ] {
             fs::write(d.join(n), b"x").unwrap();
         }
-        let (l, _) = Listing::open(&d).unwrap();
+        let (l, _) = Listing::open(&d, true).unwrap();
         assert_eq!(
             l.names,
             vec!["a.png", "sub/b2.png", "sub/b10.png", "sub/deep/c.png"]
         );
         // Membuka satu berkas: listing berakar di folder induk berkas itu
         // (rekursif ke bawah), dan indeksnya menunjuk berkas yang benar.
-        let (l2, start) = Listing::open(&d.join("sub/b10.png")).unwrap();
+        let (l2, start) = Listing::open(&d.join("sub/b10.png"), true).unwrap();
         assert_eq!(l2.names, vec!["b2.png", "b10.png", "deep/c.png"]);
         assert_eq!(start, Some(1));
         let _ = fs::remove_dir_all(&d);
@@ -532,7 +542,7 @@ mod tests {
         fs::create_dir_all(d.join("s2")).unwrap();
         fs::write(d.join("s1/foto.png"), b"satu").unwrap();
         fs::write(d.join("s2/foto.png"), b"dua").unwrap();
-        let (l, _) = Listing::open(&d).unwrap();
+        let (l, _) = Listing::open(&d, true).unwrap();
         assert_eq!(l.names, vec!["s1/foto.png", "s2/foto.png"]);
         let mut r = l.open_reader().unwrap();
         assert_eq!(r.read(0).unwrap(), b"satu");
@@ -543,10 +553,10 @@ mod tests {
     #[test]
     fn folder_kosong_dan_format_salah_memberi_galat_bukan_panik() {
         let d = tmpdir("kosong");
-        assert!(Listing::open(&d).is_err());
+        assert!(Listing::open(&d, true).is_err());
         fs::write(d.join("a.txt"), b"x").unwrap();
-        assert!(Listing::open(&d.join("a.txt")).is_err());
-        assert!(Listing::open(&d.join("tidak-ada.png")).is_err());
+        assert!(Listing::open(&d.join("a.txt"), true).is_err());
+        assert!(Listing::open(&d.join("tidak-ada.png"), true).is_err());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -570,7 +580,7 @@ mod tests {
             }
             w.finish().unwrap();
         }
-        let (l, _) = Listing::open(&zpath).unwrap();
+        let (l, _) = Listing::open(&zpath, true).unwrap();
         assert!(l.is_archive());
         assert_eq!(l.names, vec!["bab1/2.png", "bab1/10.png"]);
         let mut r = l.open_reader().unwrap();
@@ -584,7 +594,7 @@ mod tests {
         let d = tmpdir("ziprusak");
         let p = d.join("rusak.zip");
         fs::write(&p, b"bukan zip sungguhan").unwrap();
-        assert!(Listing::open(&p).is_err());
+        assert!(Listing::open(&p, true).is_err());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -596,7 +606,7 @@ mod tests {
     #[cfg(feature = "rar")]
     #[test]
     fn rar_terurut_alami_dan_bisa_dibaca_acak() {
-        let (l, _) = Listing::open(&fixture("mini.rar")).unwrap();
+        let (l, _) = Listing::open(&fixture("mini.rar", true)).unwrap();
         assert!(l.is_archive());
         assert_eq!(l.names, vec!["a1.png", "a2.png", "a10.png"]);
         let mut r = l.open_reader().unwrap();
@@ -610,8 +620,8 @@ mod tests {
     #[cfg(feature = "rar")]
     #[test]
     fn rar_solid_berurutan_maju_mundur_dan_isi_sama_dengan_non_solid() {
-        let (a, _) = Listing::open(&fixture("mini.rar")).unwrap();
-        let (b, _) = Listing::open(&fixture("solid.rar")).unwrap();
+        let (a, _) = Listing::open(&fixture("mini.rar", true)).unwrap();
+        let (b, _) = Listing::open(&fixture("solid.rar", true)).unwrap();
         assert_eq!(a.names, b.names);
         let mut ra = a.open_reader().unwrap();
         let mut rb = b.open_reader().unwrap();
@@ -628,7 +638,7 @@ mod tests {
         // RAR bernama .cbz
         let salah = d.join("sebenarnya-rar.cbz");
         fs::copy(fixture("mini.rar"), &salah).unwrap();
-        let (l, _) = Listing::open(&salah).unwrap();
+        let (l, _) = Listing::open(&salah, true).unwrap();
         assert_eq!(l.len(), 3);
         // ZIP bernama .cbr
         let zip_path = d.join("sebenarnya-zip.cbr");
@@ -639,7 +649,7 @@ mod tests {
             w.write_all(b"data").unwrap();
             w.finish().unwrap();
         }
-        let (l2, _) = Listing::open(&zip_path).unwrap();
+        let (l2, _) = Listing::open(&zip_path, true).unwrap();
         assert_eq!(l2.names, vec!["x.png"]);
         let _ = fs::remove_dir_all(&d);
     }
@@ -652,7 +662,7 @@ mod tests {
         let p1 = d.join("terpotong.rar");
         fs::write(&p1, &bytes[..bytes.len() / 3]).unwrap();
         // boleh gagal membuka atau membuka sebagian, tetapi tidak boleh panik
-        if let Ok((l, _)) = Listing::open(&p1) {
+        if let Ok((l, _)) = Listing::open(&p1, true) {
             if let Ok(mut r) = l.open_reader() {
                 for i in 0..l.len() {
                     let _ = r.read(i);
@@ -661,7 +671,7 @@ mod tests {
         }
         let p2 = d.join("sampah.rar");
         fs::write(&p2, b"Rar!\x1a\x07\x01\x00 ini bukan rar sungguhan").unwrap();
-        assert!(Listing::open(&p2).is_err());
+        assert!(Listing::open(&p2, true).is_err());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -689,7 +699,7 @@ mod tests {
             w.write_all(b"d").unwrap();
             w.finish().unwrap();
         }
-        let (l, _) = Listing::open(&zpath).unwrap();
+        let (l, _) = Listing::open(&zpath, true).unwrap();
         assert_eq!(l.modified, vec![Some("2024-03-07 09:05:30".to_string())]);
         let _ = fs::remove_dir_all(&d);
     }

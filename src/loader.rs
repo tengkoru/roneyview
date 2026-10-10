@@ -1138,7 +1138,7 @@ mod tests {
         let dir = std::env::temp_dir().join("rv-prog-test");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("b.png"), png_bytes(3000, 1600)).unwrap();
-        let (listing, _) = Listing::open(&dir).unwrap();
+        let (listing, _) = Listing::open(&dir, true).unwrap();
         let ctx = eframe::egui::Context::default();
         let (main_tx, pref_tx, out_rx) = spawn(ctx).unwrap();
         let listing = std::sync::Arc::new(listing);

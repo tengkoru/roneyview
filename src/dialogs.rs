@@ -7,11 +7,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use eframe::egui::{self, pos2, vec2, Align2, Color32, Context, Rect, Sense, TextureId, Ui};
+use eframe::egui::{
+self, pos2, vec2, Align2, Color32, Context, Rect, Sense, TextureId, Ui};
 
 use crate::loader;
 use crate::source::Listing;
 use crate::wallpaper::{self, Backend, ColorMode, WpPrefs, WpStyle};
+use crate::i18n::{Lang, tr, tr_fmt};
 
 // ------------------------------------------------------------------ kotak modal
 
@@ -28,13 +30,13 @@ pub enum ModalResult {
     ConfirmTrash,
 }
 
-pub fn draw_modal(ctx: &Context, modal: &Modal) -> ModalResult {
+pub fn draw_modal(ctx: &Context, modal: &Modal, lang: Lang) -> ModalResult {
     let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
     let mut result = ModalResult::Keep;
     let (title, width) = match modal {
-        Modal::ArchiveWarning { .. } => ("Peringatan", 420.0),
-        Modal::ConfirmTrash { .. } => ("Pindahkan ke sampah", 420.0),
-        Modal::Error(_) => ("Terjadi kesalahan", 420.0),
+        Modal::ArchiveWarning { .. } => (tr(lang, "modal_warning"), 420.0),
+        Modal::ConfirmTrash { .. } => (tr(lang, "modal_trash_title"), 420.0),
+        Modal::Error(_) => (tr(lang, "modal_error"), 420.0),
     };
     egui::Window::new(title)
         .collapsible(false)
@@ -45,27 +47,27 @@ pub fn draw_modal(ctx: &Context, modal: &Modal) -> ModalResult {
             ui.set_max_width(width);
             match modal {
                 Modal::ArchiveWarning { archive } => {
-                    ui.label("Gambar ini berada di dalam arsip:");
+                    ui.label(tr(lang, "modal_archive_msg"));
                     ui.add(egui::Label::new(egui::RichText::new(archive).monospace()).wrap());
                     ui.add_space(6.0);
-                    ui.label("Roneyview tidak melakukan tindakan lain.");
+                    ui.label(tr(lang, "modal_archive_note"));
                     ui.add_space(8.0);
                     if ui.button("OK").clicked() || esc {
                         result = ModalResult::Close;
                     }
                 }
                 Modal::ConfirmTrash { name, path, .. } => {
-                    ui.label(format!("Pindahkan \"{name}\" ke Tempat Sampah?"));
+                    ui.label(tr(lang, "Pindahkan \"{name}\" ke Tempat Sampah?").replace("{name}", name));
                     ui.add(
                         egui::Label::new(egui::RichText::new(path.display().to_string()).monospace().weak())
                             .wrap(),
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Pindahkan ke sampah").clicked() {
+                        if ui.button(tr(lang, "modal_trash_title")).clicked() {
                             result = ModalResult::ConfirmTrash;
                         }
-                        if ui.button("Batal").clicked() || esc {
+                        if ui.button(tr(lang, "btn_cancel")).clicked() || esc {
                             result = ModalResult::Close;
                         }
                     });
@@ -126,7 +128,7 @@ pub struct PropsDialog {
     pub rows: Vec<(String, String)>,
 }
 
-pub fn draw_properties(ui: &mut Ui, dlg: &PropsDialog) -> bool {
+pub fn draw_properties(ui: &mut Ui, dlg: &PropsDialog, lang: Lang) -> bool {
     let mut close = false;
     egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
         egui::Grid::new("props_grid")
@@ -142,7 +144,7 @@ pub fn draw_properties(ui: &mut Ui, dlg: &PropsDialog) -> bool {
             });
     });
     ui.add_space(8.0);
-    if ui.button("Tutup").clicked() {
+    if ui.button(tr(lang, "btn_close")).clicked() {
         close = true;
     }
     close
@@ -301,7 +303,7 @@ fn draw_preview(ui: &mut Ui, dlg: &WallpaperDialog) {
 }
 
 /// Isi jendela "Set as wallpaper". Mengembalikan true bila harus ditutup.
-pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog) -> bool {
+pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog, lang: Lang) -> bool {
     if let Some(rx) = &dlg.rx {
         if let Ok(res) = rx.try_recv() {
             dlg.status = match res {
@@ -361,11 +363,11 @@ pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog) -> 
     });
 
     ui.add_space(6.0);
-    ui.add(egui::Label::new(egui::RichText::new(format!("Metode: {}", dlg.backend.label())).weak()).wrap());
+    ui.add(egui::Label::new(egui::RichText::new(tr_fmt(lang, "wp_method", &[&dlg.backend.label()])).weak()).wrap());
     if dlg.prefs.mode == ColorMode::Transparent && dlg.backend.supported() && !dlg.backend.has_transparent() {
         ui.add(
             egui::Label::new(
-                egui::RichText::new("Transparent hanya tersedia di Xfce; di desktop ini dipakai warna hitam.")
+                egui::RichText::new(tr(lang, "wp_transparent_note"))
                     .color(Color32::from_rgb(230, 190, 90)),
             )
             .wrap(),
@@ -376,7 +378,7 @@ pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog) -> 
         WpStatus::Working => {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Menerapkan...");
+                ui.label(tr(lang, "wp_applying"));
             });
         }
         WpStatus::Done(m) => {
@@ -392,7 +394,7 @@ pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog) -> 
         if ui.add_enabled(can, egui::Button::new("Apply")).clicked() {
             dlg.start_apply(ctx);
         }
-        if ui.button("Tutup").clicked() {
+        if ui.button(tr(lang, "btn_close")).clicked() {
             close = true;
         }
     });

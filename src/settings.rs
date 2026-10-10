@@ -38,6 +38,11 @@ pub struct State {
     pub cover_alone: bool,
     /// Pilihan terakhir di jendela "Set as wallpaper".
     pub wallpaper: WpPrefs,
+    /// Kode bahasa UI: "id" atau "en".
+    pub lang: String,
+    /// Pindai sub-folder secara rekursif saat membuka folder.
+    /// Kalau mati, hanya berkas di folder utama yang dimuat.
+    pub scan_subfolders: bool,
 }
 
 impl Default for State {
@@ -50,6 +55,8 @@ impl Default for State {
             rtl: false,
             cover_alone: true,
             wallpaper: WpPrefs::default(),
+            lang: "id".to_string(),
+            scan_subfolders: true,
         }
     }
 }
