@@ -32,6 +32,8 @@ pub enum ModalResult {
 
 pub fn draw_modal(ctx: &Context, modal: &Modal, lang: Lang) -> ModalResult {
     let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    // Enter = setuju dengan tindakan yang ditawarkan dialog.
+    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
     let mut result = ModalResult::Keep;
     let (title, width) = match modal {
         Modal::ArchiveWarning { .. } => (tr(lang, "modal_warning"), 420.0),
@@ -52,19 +54,19 @@ pub fn draw_modal(ctx: &Context, modal: &Modal, lang: Lang) -> ModalResult {
                     ui.add_space(6.0);
                     ui.label(tr(lang, "modal_archive_note"));
                     ui.add_space(8.0);
-                    if ui.button("OK").clicked() || esc {
+                    if ui.button("OK").clicked() || esc || enter {
                         result = ModalResult::Close;
                     }
                 }
                 Modal::ConfirmTrash { name, path, .. } => {
-                    ui.label(tr(lang, "Pindahkan \"{name}\" ke Tempat Sampah?").replace("{name}", name));
+                    ui.label(tr(lang, "modal_trash_msg").replace("{name}", name));
                     ui.add(
                         egui::Label::new(egui::RichText::new(path.display().to_string()).monospace().weak())
                             .wrap(),
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button(tr(lang, "modal_trash_title")).clicked() {
+                        if ui.button(tr(lang, "modal_trash_title")).clicked() || enter {
                             result = ModalResult::ConfirmTrash;
                         }
                         if ui.button(tr(lang, "btn_cancel")).clicked() || esc {
@@ -75,7 +77,7 @@ pub fn draw_modal(ctx: &Context, modal: &Modal, lang: Lang) -> ModalResult {
                 Modal::Error(msg) => {
                     ui.add(egui::Label::new(msg.as_str()).wrap());
                     ui.add_space(8.0);
-                    if ui.button("OK").clicked() || esc {
+                    if ui.button("OK").clicked() || esc || enter {
                         result = ModalResult::Close;
                     }
                 }

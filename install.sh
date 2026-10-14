@@ -49,19 +49,20 @@ else
 fi
 
 FEATS=$(IFS=,; echo "${features[*]:-}")
-echo "Fitur yang dipakai : ${FEATS:-(tidak ada, hanya inti)}"
+echo "Important dependency installed: ${FEATS:-(tidak ada, hanya inti)}"
 if ((${#missing[@]})); then
-  echo "Dilewati karena paket belum terpasang:"
+  echo "Skipping, because dependency not installed:"
   printf '  - %s\n' "${missing[@]}"
 fi
 [[ "${1:-}" == "--dry-run" ]] && exit 0
 
 # Progres selama kompilasi (cargo tidak menampilkannya bawaan):
-# persen dari baris "Compiling" yang sudah lewat + nama crate yang sedang dikompilasi.
-TOTAL=$(grep -c '^\[\[package\]\]' Cargo.lock 2>/dev/null || true)
-if [ -z "$TOTAL" ] || [ "$TOTAL" -eq 0 ]; then TOTAL=1; fi
+# tiap baris "Membangun Compiling <crate> vX.Y.Z" punya bar-nya sendiri.
+# Cargo tidak melaporkan progres per crate, jadi bar-nya indikator aktivitas
+# yang beranimasi selama crate itu dikompilasi; tiap ganti crate, bar baru
+# mulai lagi dari awal. Tidak ada persen (global maupun per crate).
 LOG="$(mktemp /tmp/roneyview-build-XXXXXX.log)"
-echo 'Membangun...'
+echo 'Prepare...'
 if command -v stdbuf >/dev/null 2>&1; then
     stdbuf -oL -eL cargo build --release --locked --no-default-features --features "$FEATS" >"$LOG" 2>&1 &
 else
@@ -70,28 +71,61 @@ fi
 # NOTE: stdbuf -oL biar output cargo tidak ke-buffer saat di-redirect ke file.
 # Kalau ke-buffer, log kelihatan kosong dan progres macet di "menyiapkan...".
 CARGO_PID=$!
+BAR_W=12
+bar_penuh() { printf '%*s' "$BAR_W" '' | tr ' ' '#'; }
+bar_frame() {
+    # Blok 4 sel yang meluncur bolak-balik di dalam bar selebar BAR_W.
+    local f=$1 span period p pos i bar=""
+    span=$((BAR_W - 4))
+    period=$((span * 2))
+    p=$((f % period))
+    pos=$p
+    if [ "$p" -gt "$span" ]; then pos=$((period - p)); fi
+    for ((i = 0; i < BAR_W; i++)); do
+        if [ "$i" -ge "$pos" ] && [ "$i" -lt "$((pos + 4))" ]; then bar+='#'; else bar+='-'; fi
+    done
+    printf '[%s]' "$bar"
+}
+is_tty=0
+if [ -t 1 ]; then is_tty=1; fi
 last_crate=""
+frame=0
 while kill -0 "$CARGO_PID" 2>/dev/null; do
-    n=$(grep -c 'Compiling ' "$LOG" 2>/dev/null || true)
-    pct=$((n * 100 / TOTAL))
-    if [ "$pct" -gt 99 ]; then pct=99; fi
     # Tampilkan aktivitas terakhir cargo (Compiling, Checking, Fresh, dsb.)
     # kalau belum ada, tampilkan "menyiapkan..."
-    crate=$(grep -E '^\s+(Compiling|Checking|Fresh|Downloading|Updating)' "$LOG" 2>/dev/null | tail -1 | sed 's/^ *//;s/ *$//' | cut -c1-50 || true)
-    if [ -z "$crate" ]; then crate="menyiapkan..."; fi
+    crate=$(grep -E '^\s+(Compiling|Checking|Fresh|Downloading|Downloaded|Updating|Blocking)' "$LOG" 2>/dev/null | tail -1 | sed 's/^ *//;s/ *$//' | cut -c1-50 || true)
+    if [ -z "$crate" ]; then crate=" start..."; fi
     if [ "$crate" != "$last_crate" ]; then
-        printf 'Membangun %-50s %3d%%\n' "$crate" "$pct"
+        # Crate sebelumnya selesai: tutup barisnya dengan bar penuh.
+        if [ "$is_tty" -eq 1 ] && [ -n "$last_crate" ]; then
+            printf '\rBuild %-50s [%s]\n' "$last_crate" "$(bar_penuh)"
+        fi
         last_crate="$crate"
+        frame=0
+        # Di luar terminal (log/pipe), bar tidak bisa beranimasi:
+        # cetak satu baris per crate, tanpa bar.
+        if [ "$is_tty" -eq 0 ]; then
+            printf 'Build %s\n' "$crate"
+        fi
     fi
-    sleep 1
+    if [ "$is_tty" -eq 1 ]; then
+        printf '\rBuild %-50s %s' "$crate" "$(bar_frame "$frame")"
+        frame=$((frame + 1))
+    fi
+    sleep 0.2
 done
 if wait "$CARGO_PID"; then
-    printf 'Membangun %-50s 100%%\n' "roneyview (selesai)"
+    if [ "$is_tty" -eq 1 ]; then
+        printf '\rBuild %-50s [%s]\n' "roneyview (completed)" "$(bar_penuh)"
+    else
+        printf 'Build %s\n' "roneyview (completed)"
+    fi
     rm -f "$LOG"
 else
-    printf '\nKompilasi gagal. 20 baris terakhir log:\n'
+    if [ "$is_tty" -eq 1 ]; then printf '\n'; fi
+    printf 'Compiled fail. 20 baris terakhir log:\n'
     tail -n 20 "$LOG"
-    echo "Log lengkap: $LOG"
+    echo "full log: $LOG"
     exit 1
 fi
 install -Dm755 target/release/roneyview "$BIN"
@@ -99,4 +133,4 @@ install -Dm644 packaging/roneyview.desktop "$DESKTOP"
 install -Dm644 packaging/roneyview.svg "$ICON"
 refresh_caches
 
-echo "Selesai. Jalankan: roneyview   (pastikan ~/.local/bin ada di PATH)"
+echo "Finish. Run roneyview with command: roneyview   (make sure ~/.local/bin in the PATH)"

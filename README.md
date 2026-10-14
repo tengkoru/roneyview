@@ -1,30 +1,44 @@
-# Roneyview (version 0.6.8)
+# Roneyview (version 0.7.5)
 ###### README.md berbahasa Indonesia ada [disini](README_ID.md)
 
 An alternative to Honeyview; an image viewer for Linux; written in the Rust programming language (using egui/eframe).
 
+## Where I can download Deb or Flatpak files?
+You can download at Releases place (location below "about" on repository github roneyview) or you just [klik this](https://github.com/tengkoru/roneyview/releases) to go to download page, scroll and klik dropdown menu named "Assets".
 
-![Screenshot1](tests/1.jpg)
-![Screenshot1](tests/2.png)
+
+![Screenshot1](tests/1.png) 
+![Screenshot1](tests/2.png) 
 ![Screenshot2](tests/3.png)
+More Screenshot [klik here](tests/)
 
 [Thanks for pictures](tests/thanks-for-pictures.md)
 
 ## What can Roneyview do?
 - **Open images**, **folders**, and **archives**
-- **Supports image formats**: JPEG/JPG, PNG, GIF, WebP, BMP, TIFF, QOI, TGA, ICO, AVIF, HEIC/HEIF
-- **Supports animated image formats**: GIF, WebP, and APNG
-- **Press the 'P' key to pause/play animated image files**
+- **Supports image formats**: JPEG/JPG, PNG, GIF, WebP, BMP, TIFF, QOI, TGA, ICO, AVIF, HEIC/HEIF, HDR (.hdr)
+- **Supports animated image formats**: GIF, WebP, APNG, and multi-page TIFF (one frame per page)
+- **Press the 'P' key to pause/play animated image files**; `,` / `.` step one frame backward/forward (auto-pauses)
 - **Supports archive formats**: ZIP/CBZ/RAR/CBR; displays only the image files contained within the archive
-- **Does not save viewing history**: no list of images or positions from previous sessions; if you launch Roneyview from the command line without specifying a file or folder path, it will simply open an empty window
+- **Remembers where you stopped**: when you open a folder or archive directly, Roneyview reopens it at the
+page you last read (stored in `~/.config/roneyview/positions.json`, up to 200 entries). **Recent folders**
+are only remembered if you enable them in Settings (off by default). If you launch Roneyview from the
+command line without specifying a file or folder path, it will simply open an empty window
+- **Go to page** (`Ctrl+G`) jumps to any page; the **Navigate** menu also lists recent folders (when enabled)
 - **Right-clicking on an image displays the following menu**:
     - **Set as wallpaper...**
     - **Properties**
     - **Actions**:
         - Open containing folder
         - Move to trash
+        - Save page as image... (saves the original bytes of the page)
+        - For animations: Save this frame as image... and Export all frames... (as PNG)
+- **Toolbar** (hidden by default, View menu): icon-only buttons for **Crop**, **Resize**,
+**Frame navigation**, **Color picker**, **HDR tone mapper**, **Print / save as PDF**, and **Projector** —
+see [Toolbar and simple editing](##toolbar-and-simple-editing) below
+- **About** (Help menu): a window titled with the version, developer credit, and the libraries used
 - **Two-page mode** and **right-to-left reading direction** for manga/comics
-- Window-fit, width-fit, height-fit, and 100% view modes; zoom to cursor, pan, rotate, and full-screen
+- **View mode setting** : Window-fit, width-fit, height-fit, and 100% view modes; zoom to cursor, pan, rotate, and full-screen
 - **Previous/Next buttons on the left/right edges**; appears only when the pointer approaches the edge
 - **Bottom bar**:
     - **prev/next buttons**
@@ -33,21 +47,22 @@ An alternative to Honeyview; an image viewer for Linux; written in the Rust prog
     
 ## Debian/Ubuntu/MX Linux/other Debian derivatives
 
+#### 1. Build tools + libraries for file dialogs (GTK3) and AVIF/HEIC (libheif)
 ```bash
-# 1. Build tools + libraries for file dialogs (GTK3) and AVIF/HEIC (libheif)
 sudo apt update
 sudo apt install build-essential pkg-config libgtk-3-dev libheif-dev curl
-
-# 2. Latest Rust (the rustc package in Debian is too old; requires Rust >= 1.88)
+```
+#### 2. Latest Rust (the rustc package in Debian is too old; requires Rust >= 1.88)
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
-
-# 3. Compile and install to ~/.local (without sudo)
+```
+#### 3. Compile and install to ~/.local (without sudo)
+```bash
 ./install.sh
 ```
 All dependencies required for the smooth operation of roneyview will be downloaded automatically when you run ./install.sh.
-However, if you wish to see which dependencies Roneyview requires, you can view them [here](dependencies-roneyview.txt)
-
+However, if you wish to see which dependencies Roneyview requires, you can view them at Cargo.lock.
 
 `install.sh` checks for available packages and enables only the features that can be built,
 then displays which features were skipped along with the `apt` commands to install them.
@@ -75,7 +90,7 @@ a "decoder" error, install the codec plugins: `sudo apt install libheif-plugin-l
 
 RAR files can only be read sequentially (no random access). Roneyview remembers the read position within the archive while it is open,
 so opening the next page is fast, but jumping backward reopens the archive from the beginning. With large *solid*
-archives, large jumps may feel slow. Password-protected archives are not supported.
+archives, large jumps may feel slow. **Password-protected archives are not supported.**
 
 ## Shortcuts
 
@@ -92,6 +107,10 @@ archives, large jumps may feel slow. Password-protected archives are not support
 | `0` or `1` | Original size (100%) |
 | `R` / `Shift+R` | Rotate right / left |
 | `P` | Pause / play animation |
+| `,` / `.` | Previous / next animation frame (auto-pauses) |
+| `Ctrl+G` | Go to page... |
+| `Ctrl+,` | Settings |
+| `T` | Toolbar hide/unhide [default: **unhide**]|
 | `L` | Lock / unlock bottom bar |
 | `M` | Memory-saving mode |
 | Enter, F11, double-click | Full screen (Esc to exit) |
@@ -100,46 +119,31 @@ archives, large jumps may feel slow. Password-protected archives are not support
 | Ctrl+Q | Quit |
 
 ## Command-line usage
-
+Are you prefer using command-line instead double-klik file on file manager? don't worry, we give that option here:
 ```bash
 roneyview photo.jpg        # open photo; the entire folder is also loaded
 roneyview ~/Comic_title/Chapter1    # open folder
 roneyview title_comic.cbz       # open archive (also .zip, .rar, .cbr)
 roneyview                 # empty window; Ctrl+O to open an image
+roneyview --version		#  See roneyview version you use now
 ```
 
-Only **display options** are saved in `~/.config/roneyview/state.json` (zoom mode, bar lock, memory-saving
-mode, mo...two-page layout, reading direction, and the final option in the wallpaper window). Old files (version <= 0.4)
-containing position history will be rewritten without that history when Roneyview is launched.
-
+### Set wallpaper using roneyview command-line
 ```bash
 roneyview --set-wallpaper photo.jpg --style zoomed --color '#202020'   # without opening a window
 roneyview --restore-wallpaper                                          # restore root window wallpaper
 ```
 
-## Memory limits
+All setting are saved in `~/.config/roneyview/state.json` (zoom mode, bar lock, memory-saving
+mode, two-page layout, reading direction, language, toolbar visibility, and the final option in the wallpaper
+window; recent folders only if enabled in Settings). The **last-read position** of each folder/archive is saved
+separately in `~/.config/roneyview/positions.json` (up to 200 entries) and restored when you open that
+folder/archive directly.
 
-Roneyview limits its own memory usage to prevent the system from running out of RAM:
+## Memory-saving mode (`M` key or via menu view)
 
-- Texture size per page is limited by **longest side** (GPU limit) and **pixel count** (max. 4 to 16 MP,
-adjusted based on available RAM at startup). 50 MP photos are displayed using a downscaled version.
-- The page cache has a total budget of 96 to 256 MB (including mipmaps); the most distant pages are discarded first.
-- Small files that **claim** to have a massive size (decompression bombs) are rejected before decoding, with a clear error message.
-- If available system memory drops below 256 MB, prefetching is disabled and the cache is cleared.
-
-### Memory-saving mode (`M` key or View menu)
-
-Only the image **currently being viewed** is stored in RAM; previous images are discarded as soon as you move away,
-and there is no prefetching. This setting persists across sessions. The trade-off: page navigation feels slower for
-large photos because each image must be decoded upon opening (including when returning to a previous image).
-In a test using twenty-four 24 MP photos, stable RAM usage dropped from approximately 395 MB to 232 MB.
-
-### What Roneyview does not do
-
-- Roneyview does not use `tumblerd` or any system thumbnailer, nor does it generate thumbnails; Images are decoded on the fly
-- No image caching on disk and no history of opened images. The only files written are
-`~/.config/roneyview/state.json` (display preferences) and, if you use *Set as wallpaper*, a copy of the
-wallpaper image in `~/.local/share/roneyview/`. When Roneyview closes, all its memory is released by the system.
+**Only the image currently being viewed** is stored in RAM; previous images are discarded as soon as you move away,
+and there is no prefetching.
 
 ## Right-click menu
 
@@ -151,13 +155,15 @@ Right-click on an image (in two-page mode: on the clicked page):
 unrecognized by the desktop (HEIC, AVIF, WebP, ...) are automatically exported to a temporary PNG.
 - **Properties** displays the filename, location, image dimensions, file size, format, and modification date. For
 images inside archives: the archive path and the path within the archive.
-- **Actions**: *Open in folder* (opens the file manager and selects the file) and *Move to trash*
+- **Actions**: 
+	- **Open in folder** (opens the file manager and selects the file)
+	- **Move to trash**
 (with confirmation; follows the freedesktop.org Trash specification). If the image is inside an archive, both
 options simply display a warning, and Roneyview performs no further action.
 
 ### Set as wallpaper across different desktops
 
-There is no single method that works on all desktops, as desktop environments manage their backgrounds
+There is no single method that works on all desktop environment, as desktop environments manage their backgrounds
 independently. Roneyview detects the running desktop and uses its official mechanism:
 
 | Desktop | Method | Test status |
@@ -183,15 +189,41 @@ Note: *Transparent* is only meaningful in Xfce; black is used on other desktops.
 and sliders are mirrored accordingly. `Space`/`PgDn` still means "next."
 - Rotation (`R`) is not available in two-page mode.
 
+## Simple editing tool on Toolbar (T)
+
+The toolbar sits below the main menu and is hidden by default; show it from the View menu
+(or hide it again with the X button at its right end). Its buttons are icon-only:
+
+- **Crop image**: draw a selection right on the photo, choose an aspect ratio (Free, 1:1, 4:3, 3:2,
+16:9, 2:3, 3:4, 9:16), fine-tune its position and size, then crop, copy, or save the result.
+- **Resize image**: resize by pixels or percentage, keep the proportions locked, pick a resampling
+method (Nearest, Triangle, CatmullRom, Lanczos3, Gaussian), and see the new size before you apply it.
+- **Frame navigation**: previous frame, pause/play, next frame (also `,` / `.` and `P`).
+- **Color picker**: zoom in and sample any pixel to read its value in RGBA, HEX, HSL, HSV, CMYK,
+or CIELAB, right on top of the image.
+- **HDR tone mapper**: tone-map HDR images for a standard display, with live control over exposure,
+reference white, highlight compression, and saturation.
+- **Print, save as PDF**: print to any printer or save as PDF, with layouts from a full page to
+contact sheets (2×2, 3×3, 4×4) and a live preview of every page.
+- **Projector**: present on another display while you browse from the main window.
+
+Editing opens the image at full resolution in an edit view (Esc or Cancel discards changes;
+Save writes a PNG). The crop, resize, color picker, and tone mapper tools work only on images
+that are **not** inside an archive; **to edit an image from an archive**, save it first
+(Save page as image...), then open the saved file. Print / save as PDF and the projector also work on
+archive file.
+
 ## Animation limitations
 
 All animation frames are stored in memory. (max. approx. 128 MB per animation, 1500 frames).
-Larger animations are truncated, and the status bar displays "truncated".
+Larger animations are truncated, and the status bar displays "truncated". Multi-page TIFF files
+are treated as animations (one frame per page).
 
 ## Development
 
 ```bash
-cargo test            # unit tests: natural order, ZIP/RAR, animated GIF, HEIC/AVIF, memory budget, slider, zoom,
-# wallpaper layout, desktop detection, gsettings/KDE/pcmanfm/sway commands, dual-page view
+cargo test            # unit tests: natural order, ZIP/RAR, animated GIF, multi-page TIFF, HEIC/AVIF, memory budget, slider, zoom,
+# wallpaper layout, desktop detection, gsettings/KDE/pcmanfm/sway commands, dual-page view, last-read positions,
+# color conversions, crop/resize math, HDR tone mapping, minimal PDF generation
 cargo run -- /path/to/image
 ```

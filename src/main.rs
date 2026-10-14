@@ -2,10 +2,12 @@
 
 mod app;
 mod dialogs;
+mod edit;
 mod fileinfo;
 mod i18n;
 mod loader;
 mod natsort;
+mod positions;
 mod settings;
 mod source;
 mod wallpaper;

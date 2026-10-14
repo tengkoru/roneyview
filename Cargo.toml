@@ -1,6 +1,6 @@
 [package]
 name = "roneyview"
-version = "0.6.8"
+version = "0.7.5"
 edition = "2021"
 rust-version = "1.88"
 description = "Image viewer; not only for picture, you can see a folder with pictures, archive with pictures, and comic files like CBZ"
@@ -18,7 +18,12 @@ rar = ["dep:unrar"]
 
 [dependencies]
 eframe = { version = "=0.33.3", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "qoi", "tga", "ico"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "qoi", "tga", "ico", "hdr"] }
+# Clipboard gambar (Salin hasil crop) via X11.
+arboard = "3"
+# Dipakai langsung hanya untuk iterasi halaman TIFF multi-page
+# (image::TiffDecoder tidak mengekspos next_image/more_images).
+tiff = "0.11"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 # Resize SIMD ~20x lebih cepat daripada `image::imageops::resize` untuk
 # foto besar (murni Rust, tanpa dependensi sistem). Fitur `image` memberi

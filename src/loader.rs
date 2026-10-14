@@ -113,6 +113,9 @@ fn describe(e: &image::ImageError, fallback: &str) -> String {
 /// Anggaran memori untuk semua frame satu animasi (RGBA). Lebih dari ini dipotong.
 const ANIM_BUDGET: usize = 128 * 1024 * 1024;
 const MAX_ANIM_FRAMES: usize = 1500;
+/// TIFF tidak menyimpan jeda antar-halaman; pakai nilai tetap yang nyaman
+/// untuk dilihat (tetap bisa di-step manual per frame).
+const TIFF_FRAME_DELAY_MS: u64 = 500;
 
 pub enum Command {
     Open {
@@ -769,9 +772,126 @@ fn to_color_image(img: DynamicImage) -> ColorImage {
     ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
 }
 
-/// Animasi GIF / WebP / APNG. `Ok(None)` = bukan animasi (atau hanya 1 frame),
-/// biarkan jalur gambar statis yang menangani.
+/// Dekode satu halaman TIFF menjadi RGBA. Hanya tipe warna umum yang
+/// didukung (abu/RGB/RGBA 8 & 16 bit); sisanya dianggap halaman rusak.
+fn tiff_page_to_rgba(
+    dec: &mut tiff::decoder::Decoder<Cursor<&[u8]>>,
+) -> Result<RgbaImage, String> {
+    use tiff::decoder::DecodingResult;
+    let (w, h) = dec
+        .dimensions()
+        .map_err(|_| "TIFF rusak atau tidak lengkap".to_string())?;
+    check_canvas(w, h)?;
+    let colortype = dec
+        .colortype()
+        .map_err(|_| "TIFF rusak atau tidak lengkap".to_string())?;
+    let data = dec
+        .read_image()
+        .map_err(|_| "TIFF rusak atau tidak lengkap".to_string())?;
+    let px = w as usize * h as usize;
+    let raw: Vec<u8> = match (data, colortype) {
+        (DecodingResult::U8(b), tiff::ColorType::Gray(8)) if b.len() == px => {
+            b.iter().flat_map(|&g| [g, g, g, 255]).collect()
+        }
+        (DecodingResult::U8(b), tiff::ColorType::RGB(8)) if b.len() == px * 3 => b
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        (DecodingResult::U8(b), tiff::ColorType::RGBA(8)) if b.len() == px * 4 => b,
+        (DecodingResult::U16(b), tiff::ColorType::Gray(16)) if b.len() == px => b
+            .iter()
+            .flat_map(|&g| {
+                let v = (g >> 8) as u8;
+                [v, v, v, 255]
+            })
+            .collect(),
+        (DecodingResult::U16(b), tiff::ColorType::RGB(16)) if b.len() == px * 3 => b
+            .chunks_exact(3)
+            .flat_map(|p| [(p[0] >> 8) as u8, (p[1] >> 8) as u8, (p[2] >> 8) as u8, 255])
+            .collect(),
+        (DecodingResult::U16(b), tiff::ColorType::RGBA(16)) if b.len() == px * 4 => b
+            .chunks_exact(4)
+            .flat_map(|p| {
+                [(p[0] >> 8) as u8, (p[1] >> 8) as u8, (p[2] >> 8) as u8, (p[3] >> 8) as u8]
+            })
+            .collect(),
+        _ => return Err("Tipe warna TIFF tidak didukung".to_string()),
+    };
+    RgbaImage::from_raw(w, h, raw).ok_or_else(|| "Dimensi TIFF tidak cocok".to_string())
+}
+
+/// Halaman-halaman TIFF multi-page sebagai "animasi" (satu halaman = satu
+/// frame). `Ok(None)` = bukan TIFF / 1 halaman / gagal -> biarkan jalur
+/// gambar statis yang menangani.
+fn decode_tiff_animated(
+    bytes: &[u8],
+    max_side: u32,
+    max_pixels: usize,
+) -> Result<Option<Pixels>, String> {
+    if image::guess_format(bytes).ok() != Some(ImageFormat::Tiff) {
+        return Ok(None);
+    }
+    let mut dec = tiff::decoder::Decoder::new(Cursor::new(bytes))
+        .map_err(|_| "TIFF rusak atau tidak lengkap".to_string())?;
+
+    let mut out: Vec<AnimFrame> = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    let mut canvas = [0u32, 0u32];
+    loop {
+        let buf = match tiff_page_to_rgba(&mut dec) {
+            Ok(b) => b,
+            Err(_) => {
+                if out.is_empty() {
+                    return Ok(None); // coba jalur statis
+                }
+                truncated = true; // pakai halaman yang sudah terbaca
+                break;
+            }
+        };
+        if out.is_empty() {
+            canvas = [buf.width(), buf.height()];
+        }
+        let img = shrink(DynamicImage::ImageRgba8(buf), max_side, max_pixels);
+        let cost = img.width() as usize * img.height() as usize * 4;
+        if !out.is_empty() && (total + cost > ANIM_BUDGET || out.len() >= MAX_ANIM_FRAMES) {
+            truncated = true;
+            break;
+        }
+        total += cost;
+        out.push(AnimFrame {
+            image: Arc::new(to_color_image(img)),
+            delay: Duration::from_millis(TIFF_FRAME_DELAY_MS),
+        });
+        if !dec.more_images() {
+            break;
+        }
+        if dec.next_image().is_err() {
+            truncated = true;
+            break;
+        }
+    }
+
+    if out.len() < 2 || canvas[0] == 0 || canvas[1] == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Pixels {
+        image: out[0].image.clone(),
+        orig: canvas,
+        frames: Some(out),
+        truncated,
+        format: String::new(),
+    }))
+}
+
+/// Animasi GIF / WebP / APNG / TIFF multi-page. `Ok(None)` = bukan animasi
+/// (atau hanya 1 frame), biarkan jalur gambar statis yang menangani.
 fn decode_animated(bytes: &[u8], max_side: u32, max_pixels: usize) -> Result<Option<Pixels>, String> {
+    // TIFF multi-page ditangani terpisah: image::TiffDecoder tidak punya
+    // into_frames, jadi iterasi halamannya langsung lewat crate `tiff`.
+    if let Some(p) = decode_tiff_animated(bytes, max_side, max_pixels)? {
+        return Ok(Some(p));
+    }
     let frames = match image::guess_format(bytes).ok() {
         Some(ImageFormat::Gif) => {
             let mut d = GifDecoder::new(Cursor::new(bytes))
@@ -1005,6 +1125,51 @@ mod tests {
             .write_to(&mut out, ImageFormat::Jpeg)
             .unwrap();
         out.into_inner()
+    }
+
+    #[test]
+    fn tiff_multipage_jadi_animasi() {
+        use tiff::encoder::{colortype, TiffEncoder};
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut enc = TiffEncoder::new(&mut out).unwrap();
+            for &g in &[50u8, 150u8, 250u8] {
+                enc.write_image::<colortype::Gray8>(8, 8, &vec![g; 64]).unwrap();
+            }
+        }
+        let bytes = out.into_inner();
+        let p = decode_tiff_animated(&bytes, 16384, 16_000_000)
+            .unwrap()
+            .expect("3 halaman -> animasi");
+        let frames = p.frames.expect("ada frames");
+        assert_eq!(frames.len(), 3);
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.delay == Duration::from_millis(TIFF_FRAME_DELAY_MS)),
+            "semua frame pakai jeda TIFF tetap"
+        );
+        // Halaman kedua berwarna abu 150 -> RGBA (150,150,150,255).
+        let [r, g, b, a] = frames[1].image.pixels[0].to_array();
+        assert_eq!((r, g, b, a), (150, 150, 150, 255));
+    }
+
+    #[test]
+    fn tiff_satu_halaman_bukan_animasi() {
+        use tiff::encoder::{colortype, TiffEncoder};
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut enc = TiffEncoder::new(&mut out).unwrap();
+            enc.write_image::<colortype::Gray8>(8, 8, &vec![100u8; 64]).unwrap();
+        }
+        let bytes = out.into_inner();
+        assert!(decode_tiff_animated(&bytes, 16384, 16_000_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn bukan_tiff_dilewati_decode_tiff() {
+        let bytes = png_bytes(8, 8);
+        assert!(decode_tiff_animated(&bytes, 16384, 16_000_000).unwrap().is_none());
     }
 
     #[test]

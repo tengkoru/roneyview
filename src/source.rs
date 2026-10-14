@@ -13,11 +13,11 @@ use crate::natsort::natural_cmp;
 #[cfg(feature = "heif")]
 pub const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "png", "gif", "webp", "bmp", "tif", "tiff", "qoi", "tga", "ico", "avif",
-    "heic", "heif", "hif",
+    "heic", "heif", "hif", "hdr",
 ];
 #[cfg(not(feature = "heif"))]
 pub const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "jpe", "png", "gif", "webp", "bmp", "tif", "tiff", "qoi", "tga", "ico",
+    "jpg", "jpeg", "jpe", "png", "gif", "webp", "bmp", "tif", "tiff", "qoi", "tga", "ico", "hdr",
 ];
 #[cfg(feature = "rar")]
 pub const ARCHIVE_EXTS: &[&str] = &["zip", "cbz", "rar", "cbr"];
@@ -606,7 +606,7 @@ mod tests {
     #[cfg(feature = "rar")]
     #[test]
     fn rar_terurut_alami_dan_bisa_dibaca_acak() {
-        let (l, _) = Listing::open(&fixture("mini.rar", true)).unwrap();
+        let (l, _) = Listing::open(&fixture("mini.rar"), true).unwrap();
         assert!(l.is_archive());
         assert_eq!(l.names, vec!["a1.png", "a2.png", "a10.png"]);
         let mut r = l.open_reader().unwrap();
@@ -620,8 +620,8 @@ mod tests {
     #[cfg(feature = "rar")]
     #[test]
     fn rar_solid_berurutan_maju_mundur_dan_isi_sama_dengan_non_solid() {
-        let (a, _) = Listing::open(&fixture("mini.rar", true)).unwrap();
-        let (b, _) = Listing::open(&fixture("solid.rar", true)).unwrap();
+        let (a, _) = Listing::open(&fixture("mini.rar"), true).unwrap();
+        let (b, _) = Listing::open(&fixture("solid.rar"), true).unwrap();
         assert_eq!(a.names, b.names);
         let mut ra = a.open_reader().unwrap();
         let mut rb = b.open_reader().unwrap();

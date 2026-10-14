@@ -1,6 +1,7 @@
 //! Preferensi ringan (mode zoom, bar, mode hemat memori, dua halaman, wallpaper) di
-//! ~/.config/roneyview/state.json. Roneyview TIDAK menyimpan gambar/posisi dari sesi
-//! sebelumnya. Semua galat I/O diabaikan dengan aman.
+//! ~/.config/roneyview/state.json. Posisi baca terakhir tiap folder/arsip disimpan
+//! terpisah di ~/.config/roneyview/positions.json (lihat modul `positions`).
+//! Semua galat I/O diabaikan dengan aman.
 
 use std::fs;
 use std::io;
@@ -43,6 +44,15 @@ pub struct State {
     /// Pindai sub-folder secara rekursif saat membuka folder.
     /// Kalau mati, hanya berkas di folder utama yang dimuat.
     pub scan_subfolders: bool,
+    /// Ingat folder/arsip yang baru dibuka (menu "Folder terkini").
+    /// Mati secara bawaan; pengguna mengaktifkannya sendiri bila mau.
+    pub recent_folders: bool,
+    /// Tampilkan toolbar perkakas di bawah menu utama.
+    /// Mati secara bawaan; pengguna mengaktifkannya sendiri bila mau.
+    pub show_toolbar: bool,
+    /// Daftar folder/arsip yang baru dibuka, paling baru di depan (maks 20).
+    /// Hanya diisi bila `recent_folders` aktif.
+    pub recent: Vec<String>,
 }
 
 impl Default for State {
@@ -57,6 +67,9 @@ impl Default for State {
             wallpaper: WpPrefs::default(),
             lang: "id".to_string(),
             scan_subfolders: true,
+            recent_folders: false,
+            recent: Vec::new(),
+            show_toolbar: true,
         }
     }
 }
