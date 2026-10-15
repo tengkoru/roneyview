@@ -2172,14 +2172,19 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         let index = self.index;
         let session = self.session;
         let key = (session, index, self.anim_frame);
-        // Piksel: frame animasi saat ini, atau decode ulang sumber.
-        let pixels: Option<ColorImage> = self.page_for(index).and_then(|page| {
-            if let Some(anim) = &page.anim {
-                anim.frames.get(self.anim_frame).map(|f| (*f.image).clone())
-            } else {
-                self.decode_projector_pixels(index)
-            }
-        });
+        // Decode hanya bila gambar/frame berubah; sebelumnya decode full tiap frame.
+        let need_pixels = self.projector_key != Some(key);
+        let pixels: Option<ColorImage> = if need_pixels {
+            self.page_for(index).and_then(|page| {
+                if let Some(anim) = &page.anim {
+                    anim.frames.get(self.anim_frame).map(|f| (*f.image).clone())
+                } else {
+                    self.decode_projector_pixels(index)
+                }
+            })
+        } else {
+            None
+        };
         let mut closed = false;
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("roneyview-projector"),
