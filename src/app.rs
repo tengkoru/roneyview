@@ -172,8 +172,6 @@ struct Page {
     /// Dimensi hasil decode (resolusi tekstur). Bisa lebih kecil dari `orig`
     /// karena tier resolusi mengikuti zoom (fit ~2MP, zoom >= 7x ~4MP).
     decoded: [u32; 2],
-    /// Benar bila ini pratinjau blur progresif; versi tajam menyusul.
-    preview: bool,
     file_size: u64,
     bytes: usize,
     anim: Option<Anim>,
@@ -2196,6 +2194,31 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     closed = true;
                     return;
                 }
+                // Shortcut subtool projector: P/E/W/V/C (abaikan saat mengetik).
+                let (sc_pen, sc_eraser, sc_color, sc_width, sc_clear) =
+                    if pctx.wants_keyboard_input() {
+                        (false, false, false, false, false)
+                    } else {
+                        pctx.input_mut(|i| {
+                            let none = Modifiers::NONE;
+                            (
+                                i.consume_key(none, Key::P),
+                                i.consume_key(none, Key::E),
+                                i.consume_key(none, Key::W),
+                                i.consume_key(none, Key::V),
+                                i.consume_key(none, Key::C),
+                            )
+                        })
+                    };
+                if sc_pen {
+                    self.projector_eraser = false;
+                }
+                if sc_eraser {
+                    self.projector_eraser = true;
+                }
+                if sc_clear {
+                    self.projector_strokes.clear();
+                }
                 if self.projector_key != Some(key) {
                     self.projector_key = Some(key);
                     self.projector_tex = pixels.as_ref().map(|ci| {
@@ -2209,29 +2232,68 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     ui.horizontal(|ui| {
                         if ui
                             .selectable_label(!self.projector_eraser, tr(lang, "projector_pen"))
+                            .on_hover_text(tr(lang, "projector_pen_tip"))
                             .clicked()
+                            || sc_pen
                         {
                             self.projector_eraser = false;
                         }
                         if ui
                             .selectable_label(self.projector_eraser, tr(lang, "projector_eraser"))
+                            .on_hover_text(tr(lang, "projector_eraser_tip"))
                             .clicked()
+                            || sc_eraser
                         {
                             self.projector_eraser = true;
                         }
                         ui.separator();
-                        egui::color_picker::color_edit_button_srgba(
-                            ui,
-                            &mut self.projector_pen_color,
-                            egui::color_picker::Alpha::Opaque,
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.projector_pen_width, 1.0..=24.0)
-                                .text(tr(lang, "projector_width"))
-                                .max_decimals(0),
-                        );
+                        // Tombol warna custom (ID eksplisit) agar shortcut W bisa
+                        // membuka/menutup popup color picker.
+                        let color_id = ui.make_persistent_id("projector_pen_color");
+                        let (crect, cresp) =
+                            ui.allocate_exact_size(vec2(30.0, 22.0), Sense::click());
+                        {
+                            let p = ui.painter();
+                            p.rect_filled(crect, 4.0, self.projector_pen_color);
+                            p.rect_stroke(
+                                crect,
+                                4.0,
+                                egui::Stroke::new(1.0_f32, Color32::from_gray(120)),
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                        let cresp = cresp.on_hover_text(tr(lang, "projector_color_tip"));
+                        egui::Popup::from_response(&cresp)
+                            .id(color_id.with("popup"))
+                            .open_memory(
+                                (cresp.clicked() || sc_color)
+                                    .then_some(egui::SetOpenCommand::Toggle),
+                            )
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| {
+                                egui::color_picker::color_picker_color32(
+                                    ui,
+                                    &mut self.projector_pen_color,
+                                    egui::color_picker::Alpha::Opaque,
+                                );
+                            });
+                        let wresp = ui
+                            .add(
+                                egui::Slider::new(&mut self.projector_pen_width, 1.0..=24.0)
+                                    .text(tr(lang, "projector_width"))
+                                    .max_decimals(0),
+                            )
+                            .on_hover_text(tr(lang, "projector_width_tip"));
+                        if sc_width {
+                            wresp.request_focus();
+                        }
                         ui.separator();
-                        if ui.button(tr(lang, "projector_clear")).clicked() {
+                        if ui
+                            .button(tr(lang, "projector_clear"))
+                            .on_hover_text(tr(lang, "projector_clear_tip"))
+                            .clicked()
+                            || sc_clear
+                        {
                             self.projector_strokes.clear();
                         }
                     });
@@ -2486,35 +2548,6 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             }
             self.pending.remove(&msg.index);
             match msg.outcome {
-                Outcome::Preview(d) => {
-                    // Pratinjau blur: tampilkan langsung supaya ada gambarnya,
-                    // versi tajam (Ready) menyusul dari pemrosesan yang sama.
-                    let (lo, hi) = keep_window(self.index, self.low_memory_mode, self.two_page_mode);
-                    if !(lo..=hi).contains(&msg.index) {
-                        continue; // sudah terlalu jauh, buang
-                    }
-                    let px = d.pixels;
-                    self.dims.insert(msg.index, px.orig);
-                    let decoded = [px.image.size[0] as u32, px.image.size[1] as u32];
-                    let bytes = decoded[0] as usize * decoded[1] as usize * 4;
-                    let tex = ctx.load_texture(
-                        format!("pg{}-{}-prev", msg.session, msg.index),
-                        px.image,
-                        self.texture_options(false),
-                    );
-                    let page = Arc::new(Page {
-                        tex,
-                        orig: px.orig,
-                        decoded,
-                        preview: true,
-                        file_size: d.file_size,
-                        bytes,
-                        anim: None,
-                        format: px.format.clone(),
-                    });
-                    self.cache.insert(msg.index, page);
-                    ctx.request_repaint();
-                }
                 Outcome::Ready(d) => {
                     let (lo, hi) = keep_window(self.index, self.low_memory_mode, self.two_page_mode);
                     if !(lo..=hi).contains(&msg.index) {
@@ -2558,7 +2591,6 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                         tex,
                         orig: px.orig,
                         decoded,
-                        preview: false,
                         file_size: d.file_size,
                         bytes,
                         anim,
@@ -2631,8 +2663,6 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     }
 
     /// Apakah gambar saat ini masih dalam proses loading.
-    /// Preview (blurry) sudah dihitung "tampil", jadi navigasi dibuka lagi
-    /// begitu preview muncul — tidak perlu nunggu gambar tajam selesai.
     fn is_loading(&self) -> bool {
         self.listing.is_some()
             && !self.cache.contains_key(&self.index)
@@ -2851,9 +2881,6 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         let Some(page) = self.cache.get(&s) else {
             return;
         };
-        if page.preview {
-            return; // versi tajam sedang di jalan (Ready menyusul Preview)
-        }
         let decoded_px = page.decoded[0] as usize * page.decoded[1] as usize;
         if decoded_px * 10 >= tier_px * 9 {
             return; // sudah cukup tajam
@@ -3501,7 +3528,7 @@ impl RoneyApp {
         }
 
         // Badge status loading di atas gambar: tr(lang, "Memuat...") kalau gambarnya
-        // belum ada, tr(lang, "badge_sharpen_dots") kalau yang tampil masih pratinjau blur.
+        // belum ada.
         self.draw_loading_badge(&painter, rect);
 
         // Menu klik kanan.
@@ -3570,8 +3597,6 @@ impl RoneyApp {
             None
         } else if !self.cache.contains_key(&self.index) {
             Some(tr(lang, "badge_loading"))
-        } else if self.cache.get(&self.index).is_some_and(|p| p.preview) {
-            Some(tr(lang, "badge_sharpen"))
         } else {
             None
         };

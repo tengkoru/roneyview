@@ -300,19 +300,59 @@ impl Default for ToneParams {
     }
 }
 
+/// LUT sRGB byte -> linier float. Dibangun sekali per proses; mengubah 3x `powf`
+/// per piksel menjadi 3x lookup saat tone mapping.
+fn srgb_to_linear_lut() -> &'static [f32; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = srgb_to_linear(i as f32 / 255.0);
+        }
+        t
+    })
+}
+
+/// LUT linier terkuantisasi (0..1 dalam 4096 langkah) -> sRGB byte.
+/// Akurasi < 1 nilai sRGB dari versi `powf`; cukup untuk preview maupun hasil akhir.
+fn linear_to_srgb_lut() -> &'static [u8; 4097] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[u8; 4097]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u8; 4097];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = (linear_to_srgb(i as f32 / 4096.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        t
+    })
+}
+
+/// Parameter tone yang sudah diurai: gain dan faktor kompresi highlight.
+/// Dihitung sekali per pemanggilan, bukan per piksel.
+fn tone_factors(p: &ToneParams) -> (f32, f32) {
+    let gain = 2f32.powf(p.exposure) / p.reference_white.max(0.05);
+    let k = p.highlight * 4.0;
+    (gain, k)
+}
+
+/// Terapkan gain + kompresi highlight + clamp ke satu kanal linier.
+#[inline]
+fn tone_channel(v: f32, gain: f32, k: f32) -> f32 {
+    let mut v = v * gain;
+    if k > 0.0 {
+        v = v / (1.0 + k * v);
+    }
+    v.clamp(0.0, 1.0)
+}
+
 /// Tone-map satu piksel LINIER (0..tidak terbatas) -> sRGB 0..1.
 pub fn tone_map_linear_pixel(rgb: [f32; 3], p: &ToneParams) -> [f32; 3] {
-    let gain = 2f32.powf(p.exposure) / p.reference_white.max(0.05);
+    let (gain, k) = tone_factors(p);
     let mut out = [0.0f32; 3];
     let mut luma = 0.0;
     for (i, c) in rgb.iter().enumerate() {
-        let mut v = c * gain;
-        // Kompresi highlight (Reinhard lembut): 0 -> tanpa kompresi.
-        if p.highlight > 0.0 {
-            let k = p.highlight * 4.0;
-            v = v / (1.0 + k * v);
-        }
-        v = v.clamp(0.0, 1.0);
+        let v = tone_channel(*c, gain, k);
         out[i] = v;
         luma += [0.2126, 0.7152, 0.0722][i] * v;
     }
@@ -325,40 +365,44 @@ pub fn tone_map_linear_pixel(rgb: [f32; 3], p: &ToneParams) -> [f32; 3] {
 }
 
 /// Tone-map gambar sRGB 8-bit: sRGB -> linier -> tone -> sRGB.
+/// Versi cepat: konversi sRGB<->linier lewat LUT (bukan `powf` per piksel).
 pub fn tone_map_srgb(img: &RgbaImage, p: &ToneParams) -> RgbaImage {
+    let to_lin = srgb_to_linear_lut();
+    let to_srgb = linear_to_srgb_lut();
+    let (gain, k) = tone_factors(p);
+    let sat = p.saturation;
     let mut out = RgbaImage::new(img.width(), img.height());
-    for (x, y, px) in img.enumerate_pixels() {
-        let lin = [
-            srgb_to_linear(px[0] as f32 / 255.0),
-            srgb_to_linear(px[1] as f32 / 255.0),
-            srgb_to_linear(px[2] as f32 / 255.0),
-        ];
-        let mapped = tone_map_linear_pixel(lin, p);
-        out.put_pixel(
-            x,
-            y,
-            image::Rgba([
-                (mapped[0] * 255.0).round().clamp(0.0, 255.0) as u8,
-                (mapped[1] * 255.0).round().clamp(0.0, 255.0) as u8,
-                (mapped[2] * 255.0).round().clamp(0.0, 255.0) as u8,
-                px[3],
-            ]),
-        );
+    for (dst, src) in out.pixels_mut().zip(img.pixels()) {
+        let r = tone_channel(to_lin[src[0] as usize], gain, k);
+        let g = tone_channel(to_lin[src[1] as usize], gain, k);
+        let b = tone_channel(to_lin[src[2] as usize], gain, k);
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        // Saturasi di sekitar luma, lalu kuantisasi + LUT ke sRGB byte.
+        let q = |v: f32| {
+            let v = (luma + sat * (v - luma)).clamp(0.0, 1.0);
+            to_srgb[(v * 4096.0).round() as usize]
+        };
+        *dst = image::Rgba([q(r), q(g), q(b), src[3]]);
     }
     out
 }
 
 /// Tone-map buffer HDR linier (RGB float, 3 kanal per piksel) -> RGBA8.
 pub fn tone_map_linear_buffer(rgb: &[f32], w: u32, h: u32, p: &ToneParams) -> RgbaImage {
+    let to_srgb = linear_to_srgb_lut();
+    let (gain, k) = tone_factors(p);
+    let sat = p.saturation;
     let mut out = RgbaImage::new(w, h);
     for (i, px) in out.pixels_mut().enumerate() {
-        let mapped = tone_map_linear_pixel([rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]], p);
-        *px = image::Rgba([
-            (mapped[0] * 255.0).round().clamp(0.0, 255.0) as u8,
-            (mapped[1] * 255.0).round().clamp(0.0, 255.0) as u8,
-            (mapped[2] * 255.0).round().clamp(0.0, 255.0) as u8,
-            255,
-        ]);
+        let r = tone_channel(rgb[i * 3], gain, k);
+        let g = tone_channel(rgb[i * 3 + 1], gain, k);
+        let b = tone_channel(rgb[i * 3 + 2], gain, k);
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let q = |v: f32| {
+            let v = (luma + sat * (v - luma)).clamp(0.0, 1.0);
+            to_srgb[(v * 4096.0).round() as usize]
+        };
+        *px = image::Rgba([q(r), q(g), q(b), 255]);
     }
     out
 }
@@ -507,6 +551,7 @@ pub fn build_pdf(pages: &[PdfPage]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::Rgba;
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() <= eps
@@ -619,3 +664,4 @@ mod tests {
         assert!(text.contains("%%EOF"));
     }
 }
+

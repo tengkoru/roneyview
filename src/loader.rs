@@ -172,9 +172,6 @@ pub struct Decoded {
 
 pub enum Outcome {
     Ready(Decoded),
-    /// Pratinjau blur cepat untuk gambar besar; selalu disusul `Ready`
-    /// untuk indeks yang sama (dari pemrosesan yang sama, tanpa jeda antre).
-    Preview(Decoded),
     Failed(String),
     Skipped,
 }
@@ -399,22 +396,10 @@ impl Worker {
         match catch_unwind(AssertUnwindSafe(|| {
             decode_progressive(&bytes, job.max_side, job.max_pixels)
         })) {
-            Ok(Ok((preview, sharp))) => {
-                // Pratinjau dikirim langsung agar segera tampil; versi tajam
-                // menyusul lewat hasil akhir pemrosesan ini.
-                if let Some(p) = preview {
-                    let _ = self.tx.send(Loaded {
-                        session: self.session,
-                        index: job.index,
-                        outcome: Outcome::Preview(Decoded { pixels: p, file_size }),
-                    });
-                    self.ctx.request_repaint();
-                }
-                Outcome::Ready(Decoded {
-                    pixels: sharp,
-                    file_size,
-                })
-            }
+            Ok(Ok(sharp)) => Outcome::Ready(Decoded {
+                pixels: sharp,
+                file_size,
+            }),
             Ok(Err(e)) => Outcome::Failed(e),
             Err(_) => Outcome::Failed(
                 "Dekoder gagal memproses berkas ini (data kemungkinan rusak)".into(),
@@ -422,13 +407,6 @@ impl Worker {
         }
     }
 }
-
-/// Gambar dengan sisi panjang di atas ini mendapat pratinjau progresif
-/// (blur cepat dulu, tajam menyusul). Gambar kecil decode-nya sudah cepat,
-/// tidak perlu.
-const PREVIEW_LONG_SIDE: u32 = 2500;
-/// Ukuran pratinjau ~0.25MP: cukup untuk bayangan yang dikenali.
-const PREVIEW_PIXELS: usize = 250_000;
 
 /// Dekode progresif: satu kali decode penuh, lalu —
 /// - gambar besar (>2500px): pratinjau blur cepat + versi tajam, atau
@@ -438,31 +416,27 @@ pub fn decode_progressive(
     bytes: &[u8],
     max_side: usize,
     max_pixels: usize,
-) -> Result<(Option<Pixels>, Pixels), String> {
-    let (preview, mut sharp) = decode_progressive_inner(bytes, max_side, max_pixels)?;
+) -> Result<Pixels, String> {
+    let mut sharp = decode_progressive_inner(bytes, max_side, max_pixels)?;
     let name = format_name(bytes);
     let format = match &sharp.frames {
         Some(f) => format!("{name} (animasi, {} frame)", f.len()),
         None => name,
     };
-    sharp.format = format.clone();
-    let preview = preview.map(|mut p| {
-        p.format = format;
-        p
-    });
-    Ok((preview, sharp))
+    sharp.format = format;
+    Ok(sharp)
 }
 
 fn decode_progressive_inner(
     bytes: &[u8],
     max_side: usize,
     max_pixels: usize,
-) -> Result<(Option<Pixels>, Pixels), String> {
+) -> Result<Pixels, String> {
     let max_side_c = max_side.clamp(1024, 16384) as u32;
 
     #[cfg(feature = "heif")]
     if is_heif(bytes) {
-        return decode_heif(bytes, max_side_c, max_pixels).map(|p| (None, p));
+        return decode_heif(bytes, max_side_c, max_pixels);
     }
     #[cfg(not(feature = "heif"))]
     if looks_like_heif(bytes) {
@@ -470,48 +444,11 @@ fn decode_progressive_inner(
     }
 
     if let Some(p) = decode_animated(bytes, max_side_c, max_pixels)? {
-        return Ok((None, p));
+        return Ok(p);
     }
-    // Jalur statis (JPEG/PNG/...): satu decode penuh, dua output.
+    // Jalur statis (JPEG/PNG/...): satu decode penuh.
     let raw = load_raw(bytes)?;
-    let big = raw.img.width().max(raw.img.height()) > PREVIEW_LONG_SIDE;
-    // Pratinjau bersifat best-effort: gagal bukan alasan menggagalkan decode.
-    let preview = if big { preview_pixels(&raw).ok() } else { None };
-    let sharp = finish_raw(raw, max_side_c, max_pixels)?;
-    Ok((preview, sharp))
-}
-
-/// Pratinjau blur untuk gambar besar: Nearest langsung ke ~0.25MP.
-/// (Triangle ke ukuran sekecil ini hampir semahal ke ukuran penuh —
-/// biayanya mengikuti rasio, bukan ukuran output — jadi tidak hemat.)
-fn preview_pixels(raw: &RawImage) -> Result<Pixels, String> {
-    let (w, h) = (raw.img.width(), raw.img.height());
-    if w == 0 || h == 0 {
-        return Err("Gambar berukuran nol".into());
-    }
-    let (ow, oh) = oriented_dims(w, h, raw.orientation);
-    let s = (PREVIEW_PIXELS as f64 / (f64::from(ow) * f64::from(oh))).sqrt().min(1.0);
-    let (tw, th) = (
-        (f64::from(ow) * s).round() as u32,
-        (f64::from(oh) * s).round() as u32,
-    );
-    let (tw, th) = (tw.max(1), th.max(1));
-    // Target dihitung di ruang terorientasi, dipetakan kembali seperti finish_raw.
-    let (uw, uh) = if swaps_axes(raw.orientation) {
-        (th, tw)
-    } else {
-        (tw, th)
-    };
-    let mut img = raw.img.resize_exact(uw, uh, FilterType::Nearest);
-    img.apply_orientation(raw.orientation);
-    let image = Arc::new(to_color_image(img));
-    Ok(Pixels {
-        image,
-        orig: [ow, oh],
-        frames: None,
-        truncated: false,
-        format: String::new(),
-    })
+    finish_raw(raw, max_side_c, max_pixels)
 }
 
 /// Nama format dari isi berkas (bukan ekstensi).
@@ -1107,7 +1044,7 @@ mod tests {
 
     /// Helper tes: ambil versi tajam dari decode_progressive.
     fn decode_sharp(bytes: &[u8], max_side: usize, max_pixels: usize) -> Result<Pixels, String> {
-        decode_progressive(bytes, max_side, max_pixels).map(|(_, sharp)| sharp)
+        decode_progressive(bytes, max_side, max_pixels)
     }
     use image::{ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 
@@ -1276,23 +1213,18 @@ mod tests {
     }
 
     #[test]
-    fn progresif_gambar_besar_dapat_pratinjau_dan_tajam() {
-        // >2500px: pratinjau kecil + tajam 2MP dari satu decode.
-        let (preview, sharp) = decode_progressive(&png_bytes(3000, 1500), 16384, 2_000_000).unwrap();
-        let p = preview.expect("gambar besar harus punya pratinjau");
-        let ppx = p.image.size[0] * p.image.size[1];
-        assert!(ppx <= 260_000, "pratinjau {ppx}"); // toleransi pembulatan
-        assert_eq!(p.orig, [3000, 1500]);
+    fn progresif_gambar_besar_langsung_tajam() {
+        // >2500px: langsung tajam 2MP, tanpa pratinjau blur.
+        let sharp = decode_progressive(&png_bytes(3000, 1500), 16384, 2_000_000).unwrap();
         let spx = sharp.image.size[0] * sharp.image.size[1];
-        assert!(spx <= 2_000_000 && spx > ppx, "tajam {spx}");
+        assert!(spx <= 2_000_000, "tajam {spx}");
         assert_eq!(sharp.orig, [3000, 1500]);
     }
 
     #[test]
-    fn progresif_gambar_kecil_tanpa_pratinjau() {
-        // <=2500px: langsung tajam, tanpa pratinjau.
-        let (preview, sharp) = decode_progressive(&png_bytes(40, 30), 16384, 2_000_000).unwrap();
-        assert!(preview.is_none());
+    fn progresif_gambar_kecil_langsung_tajam() {
+        // <=2500px: langsung tajam.
+        let sharp = decode_progressive(&png_bytes(40, 30), 16384, 2_000_000).unwrap();
         assert_eq!(sharp.image.size, [40, 30]);
     }
 
@@ -1323,16 +1255,10 @@ mod tests {
                 held: 0,
             })
             .unwrap();
-        // Pratinjau harus tiba dulu, disusul versi tajam.
+        // Tanpa pratinjau blur: langsung versi tajam.
         let m1 = out_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-        assert!(matches!(m1.outcome, Outcome::Preview(_)), "pertama harus Preview");
-        if let Outcome::Preview(d) = m1.outcome {
-            let s = d.pixels.image.size;
-            assert!(s[0] * s[1] <= 260_000, "pratinjau {}", s[0] * s[1]);
-        }
-        let m2 = out_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-        assert!(matches!(m2.outcome, Outcome::Ready(_)), "kedua harus Ready");
-        if let Outcome::Ready(d) = m2.outcome {
+        assert!(matches!(m1.outcome, Outcome::Ready(_)), "harus Ready");
+        if let Outcome::Ready(d) = m1.outcome {
             let s = d.pixels.image.size;
             assert!(s[0] * s[1] <= 2_000_000, "tajam {}", s[0] * s[1]);
         }
