@@ -346,24 +346,6 @@ fn tone_channel(v: f32, gain: f32, k: f32) -> f32 {
     v.clamp(0.0, 1.0)
 }
 
-/// Tone-map satu piksel LINIER (0..tidak terbatas) -> sRGB 0..1.
-pub fn tone_map_linear_pixel(rgb: [f32; 3], p: &ToneParams) -> [f32; 3] {
-    let (gain, k) = tone_factors(p);
-    let mut out = [0.0f32; 3];
-    let mut luma = 0.0;
-    for (i, c) in rgb.iter().enumerate() {
-        let v = tone_channel(*c, gain, k);
-        out[i] = v;
-        luma += [0.2126, 0.7152, 0.0722][i] * v;
-    }
-    // Saturasi di sekitar luma.
-    for v in out.iter_mut() {
-        *v = (luma + p.saturation * (*v - luma)).clamp(0.0, 1.0);
-    }
-    // Linear -> sRGB untuk ditampilkan/disimpan.
-    out.map(linear_to_srgb)
-}
-
 /// Tone-map gambar sRGB 8-bit: sRGB -> linier -> tone -> sRGB.
 /// Versi cepat: konversi sRGB<->linier lewat LUT (bukan `powf` per piksel).
 pub fn tone_map_srgb(img: &RgbaImage, p: &ToneParams) -> RgbaImage {
@@ -405,6 +387,76 @@ pub fn tone_map_linear_buffer(rgb: &[f32], w: u32, h: u32, p: &ToneParams) -> Rg
         *px = image::Rgba([q(r), q(g), q(b), 255]);
     }
     out
+}
+
+// ----------------------------------------------------------------------- pratinjau cepat
+
+/// Sisi panjang maksimum untuk pratinjau tone mapping saat slider digeser.
+/// ~0.6MP: cukup tajam untuk tampilan, ~30x lebih ringan daripada full-res 20MP.
+pub const TONE_PREVIEW_MAX_SIDE: u32 = 960;
+
+/// Perkecil RgbaImage agar sisi panjangnya <= max_side (pakai fast_image_resize).
+/// Kalau sudah kecil, kembalikan kloningan.
+pub fn shrink_rgba(img: &RgbaImage, max_side: u32) -> RgbaImage {
+    let (w, h) = (img.width(), img.height());
+    if w.max(h) <= max_side || w == 0 || h == 0 {
+        return img.clone();
+    }
+    let s = max_side as f32 / w.max(h) as f32;
+    let (nw, nh) = ((w as f32 * s).round() as u32, (h as f32 * s).round() as u32);
+    let (nw, nh) = (nw.max(1), nh.max(1));
+    use fast_image_resize::{FilterType as FirFilter, ResizeAlg, ResizeOptions, Resizer};
+    use fast_image_resize::images::Image;
+    let src = Image::from_vec_u8(w, h, img.as_raw().to_vec(), fast_image_resize::PixelType::U8x4).ok();
+    let mut dst_img = Image::new(nw, nh, fast_image_resize::PixelType::U8x4);
+    if let Some(src) = src {
+        let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FirFilter::Bilinear));
+        if Resizer::new().resize(&src, &mut dst_img, &opts).is_ok() {
+            if let Some(buf) = RgbaImage::from_raw(nw, nh, dst_img.into_vec()) {
+                return buf;
+            }
+        }
+    }
+    // Fallback: resize biasa.
+    image::imageops::resize(img, nw, nh, FilterType::Triangle)
+}
+
+/// Perkecil buffer RGB float linier (3 kanal) agar sisi panjangnya <= max_side.
+pub fn shrink_rgb32f(rgb: &[f32], w: u32, h: u32, max_side: u32) -> (Vec<f32>, u32, u32) {
+    if w.max(h) <= max_side || w == 0 || h == 0 {
+        return (rgb.to_vec(), w, h);
+    }
+    let s = max_side as f32 / w.max(h) as f32;
+    let (nw, nh) = ((w as f32 * s).round() as u32, (h as f32 * s).round() as u32);
+    let (nw, nh) = (nw.max(1), nh.max(1));
+    use fast_image_resize::{FilterType as FirFilter, ResizeAlg, ResizeOptions, Resizer};
+    use fast_image_resize::images::Image;
+    // Konversi ke bytes untuk fast_image_resize (F32x3).
+    let src_bytes: Vec<u8> = rgb.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let src = Image::from_vec_u8(w, h, src_bytes, fast_image_resize::PixelType::F32x3).ok();
+    let mut dst_img = Image::new(nw, nh, fast_image_resize::PixelType::F32x3);
+    if let Some(src) = src {
+        let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FirFilter::Bilinear));
+        if Resizer::new().resize(&src, &mut dst_img, &opts).is_ok() {
+            let bytes = dst_img.into_vec();
+            let float: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
+            if float.len() == (nw * nh * 3) as usize {
+                return (float, nw, nh);
+            }
+        }
+    }
+    // Fallback: sampling nearest manual.
+    let mut out = vec![0.0f32; (nw * nh * 3) as usize];
+    for y in 0..nh {
+        for x in 0..nw {
+            let sx = ((x as f32 / s) as u32).min(w - 1);
+            let sy = ((y as f32 / s) as u32).min(h - 1);
+            let si = ((sy * w + sx) * 3) as usize;
+            let di = ((y * nw + x) * 3) as usize;
+            out[di..di + 3].copy_from_slice(&rgb[si..si + 3]);
+        }
+    }
+    (out, nw, nh)
 }
 
 // ----------------------------------------------------------------------- PDF
@@ -664,4 +716,6 @@ mod tests {
         assert!(text.contains("%%EOF"));
     }
 }
+
+
 

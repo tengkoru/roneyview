@@ -318,6 +318,10 @@ struct EditSession {
     tone: ToneParams,
     tone_float: Option<Vec<f32>>,
     tone_preview: Option<RgbaImage>,
+    /// Sumber kecil yang di-cache untuk pratinjau cepat saat slider digeser.
+    /// Dibangun sekali dari buffer; dibuang saat buffer berubah.
+    tone_draft_src: Option<RgbaImage>,
+    tone_draft_float: Option<(Vec<f32>, u32, u32)>,
     /// Ada perubahan yang belum disimpan.
     dirty: bool,
 }
@@ -344,6 +348,8 @@ impl EditSession {
             tone: ToneParams::default(),
             tone_float: float,
             tone_preview: None,
+            tone_draft_src: None,
+            tone_draft_float: None,
             dirty: false,
         }
     }
@@ -1213,15 +1219,13 @@ impl RoneyApp {
                 tone_changed |= ui
                     .add(egui::Slider::new(&mut e.tone.saturation, 0.0..=2.0).text(tr(lang, "edit_tone_saturation")).step_by(0.05).max_decimals(2))
                     .changed();
-                // Batas input: nilai paling besar 2, maksimal 2 digit di belakang koma.
-                for v in [
-                    &mut e.tone.exposure,
-                    &mut e.tone.reference_white,
-                    &mut e.tone.highlight,
-                    &mut e.tone.saturation,
-                ] {
-                    *v = ((*v * 100.0).round() / 100.0).min(2.0);
-                }
+                // Batas input ketikan: 2 digit di belakang koma, dijepit ke rentang
+                // masing-masing (terutama exposure: -3..=2).
+                let clamp2 = |v: f32, lo: f32, hi: f32| ((v * 100.0).round() / 100.0).clamp(lo, hi);
+                e.tone.exposure = clamp2(e.tone.exposure, -3.0, 2.0);
+                e.tone.reference_white = clamp2(e.tone.reference_white, 0.5, 2.0);
+                e.tone.highlight = clamp2(e.tone.highlight, 0.0, 1.0);
+                e.tone.saturation = clamp2(e.tone.saturation, 0.0, 2.0);
                 ui.horizontal(|ui| {
                     if ui.button(tr(lang, "edit_apply_tone")).clicked() {
                         action = Some(EditPanelAction::ApplyTone);
@@ -1280,6 +1284,8 @@ impl RoneyApp {
                     e.crop_rect = None;
                     e.tone = ToneParams::default();
                     e.tone_preview = None;
+                    e.tone_draft_src = None;
+                    e.tone_draft_float = None;
                     e.dirty = false;
                 }
                 self.edit_tex_dirty = true;
@@ -1693,6 +1699,8 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 image::imageops::rotate270(&e.buffer)
             };
             e.crop_rect = None;
+            e.tone_draft_src = None;
+            e.tone_draft_float = None;
             e.dirty = true;
         }
         self.edit_tex_dirty = true;
@@ -1733,6 +1741,8 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         e.buffer = edit::crop_image(&e.buffer, rect);
         e.crop_rect = None;
         e.tone_float = None; // buffer berubah -> sumber HDR linier tidak lagi cocok
+        e.tone_draft_src = None;
+        e.tone_draft_float = None;
         e.dirty = true;
         self.edit_tex_dirty = true;
     }
@@ -1748,23 +1758,31 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         };
         e.buffer = edit::resize_image(&e.buffer, w.max(1), h.max(1), resize_filter(filter_idx));
         e.tone_float = None;
+        e.tone_draft_src = None;
+        e.tone_draft_float = None;
         e.dirty = true;
         self.edit_tex_dirty = true;
     }
 
-    /// Terapkan tone mapping: buffer menjadi hasil pratinjau.
+    /// Terapkan tone mapping: buffer menjadi hasil tone full-res.
+    /// Pratinjau saat slider digeser memang versi kecil (cepat); di sini
+    /// dihitung ulang full-res supaya hasil akhir tajam.
     fn apply_tone(&mut self) {
         let Some(e) = &mut self.edit else {
             return;
         };
-        if let Some(preview) = e.tone_preview.take() {
-            e.buffer = preview;
+        let p = e.tone;
+        if let Some(float) = e.tone_float.take() {
+            let (w, h) = (e.buffer.width(), e.buffer.height());
+            e.buffer = edit::tone_map_linear_buffer(&float, w, h, &p);
         } else {
-            let p = e.tone;
-            e.buffer = edit::tone_map_srgb(&e.buffer, &p);
+            let src = e.buffer.clone();
+            e.buffer = edit::tone_map_srgb(&src, &p);
         }
+        e.tone_preview = None;
+        e.tone_draft_src = None;
+        e.tone_draft_float = None;
         e.tone = ToneParams::default();
-        e.tone_float = None;
         e.dirty = true;
         self.edit_tex_dirty = true;
     }
@@ -1790,18 +1808,28 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         }
     }
 
-    /// Perbarui pratinjau tone mapping dari buffer saat ini (atau sumber HDR).
+    /// Perbarui pratinjau tone mapping: versi KECIL (cepat) untuk tampilan
+    /// saat slider digeser. Sumber kecil di-cache (buffer tidak berubah saat
+    /// slider digeser), jadi tiap tick cuma tone mapping ~0.6MP.
+    /// Versi full-res dihitung saat Apply ditekan.
     fn refresh_tone_preview(&mut self) {
         let Some(e) = &mut self.edit else {
             return;
         };
         let p = e.tone;
         if let Some(float) = &e.tone_float {
-            let (w, h) = (e.buffer.width(), e.buffer.height());
-            e.tone_preview = Some(edit::tone_map_linear_buffer(float, w, h, &p));
+            if e.tone_draft_float.is_none() {
+                let (w, h) = (e.buffer.width(), e.buffer.height());
+                e.tone_draft_float = Some(edit::shrink_rgb32f(float, w, h, edit::TONE_PREVIEW_MAX_SIDE));
+            }
+            let (small, sw, sh) = e.tone_draft_float.as_ref().unwrap();
+            e.tone_preview = Some(edit::tone_map_linear_buffer(small, *sw, *sh, &p));
         } else {
-            let src = e.buffer.clone();
-            e.tone_preview = Some(edit::tone_map_srgb(&src, &p));
+            if e.tone_draft_src.is_none() {
+                e.tone_draft_src = Some(edit::shrink_rgba(&e.buffer, edit::TONE_PREVIEW_MAX_SIDE));
+            }
+            let src = e.tone_draft_src.as_ref().unwrap();
+            e.tone_preview = Some(edit::tone_map_srgb(src, &p));
         }
         self.edit_tex_dirty = true;
     }
