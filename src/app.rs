@@ -589,8 +589,8 @@ impl RoneyApp {
         arg: Option<PathBuf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let ctx = cc.egui_ctx.clone();
-        let mut store = Store::load();
-        // Tema tampilan dari pengaturan (bawaan: Dark Navy).
+        let store = Store::load();
+        // Tema tampilan dari pengaturan (bawaan: Neon).
         themes::apply_theme(&ctx, store.state.theme);
 
         // Mipmap membuat gambar besar yang dikecilkan tampak halus, tetapi
@@ -1057,7 +1057,7 @@ impl RoneyApp {
         let Some(e) = self.edit.as_mut() else {
             return (None, false);
         };
-        ui.heading(format!("{}: {}", tr(lang, "edit_title"), e.name));
+        themes::panel_heading(ui, self.store.state.theme, &format!("{}: {}", tr(lang, "edit_title"), e.name));
         let (bw, bh) = (e.buffer.width(), e.buffer.height());
         ui.label(format!("{bw} × {bh} px"));
         if e.dirty {
@@ -1211,6 +1211,8 @@ impl RoneyApp {
                 });
             }
             EditTool::Tone => {
+                // Panel sempit (280px): kecilkan slider agar label tidak kepotong.
+                ui.spacing_mut().slider_width = 110.0;
                 ui.label(tr(lang, "edit_tone_hint"));
                 if e.tone_float.is_some() {
                     ui.colored_label(Color32::from_rgb(140, 220, 160), tr(lang, "edit_tone_hdr_note"));
@@ -3253,7 +3255,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                             ui.painter().rect_stroke(
                                 rect.shrink(2.0),
                                 6.0,
-                                egui::Stroke::new(2.0, theme.accent()),
+                                egui::Stroke::new(2.0_f32, theme.accent()),
                                 egui::StrokeKind::Outside,
                             );
                         }
@@ -3267,7 +3269,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                         ui.allocate_exact_size(egui::vec2(190.0, 16.0), egui::Sense::hover());
                         if resp.clicked() {
                             acts.push(Action::SetTheme(theme));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     }
                 });
@@ -3835,7 +3837,7 @@ impl RoneyApp {
                             ui.set_min_size(vec2(380.0, 280.0));
                             match self.settings_tab {
                                 SettingsTab::Theme => {
-                                    ui.heading(tr(lang, "settings_theme"));
+                                    themes::panel_heading(ui, self.store.state.theme, &tr(lang, "settings_theme"));
                                     ui.add_space(6.0);
                                     // Grid 2x2: pratinjau + nama tema.
                                     egui::Grid::new("theme_grid")
@@ -3858,7 +3860,7 @@ impl RoneyApp {
                                                         ui.painter().rect_stroke(
                                                             rect,
                                                             6.0,
-                                                            egui::Stroke::new(2.5, theme.accent()),
+                                                            egui::Stroke::new(2.5_f32, theme.accent()),
                                                             egui::StrokeKind::Outside,
                                                         );
                                                     }
@@ -3874,7 +3876,7 @@ impl RoneyApp {
                                         });
                                 }
                                 SettingsTab::Language => {
-                                    ui.heading(tr(lang, "settings_language"));
+                                    themes::panel_heading(ui, self.store.state.theme, &tr(lang, "settings_language"));
                                     ui.add_space(6.0);
                                     for l in [Lang::Id, Lang::En] {
                                         if ui.radio(self.lang == l, l.display_name()).clicked() {
@@ -3883,7 +3885,7 @@ impl RoneyApp {
                                     }
                                 }
                                 SettingsTab::Folders => {
-                                    ui.heading(tr(lang, "settings_folders"));
+                                    themes::panel_heading(ui, self.store.state.theme, &tr(lang, "settings_folders"));
                                     ui.add_space(6.0);
                                     let mut scan = self.store.state.scan_subfolders;
                                     if ui
@@ -4482,7 +4484,7 @@ fn toolbar_labeled_button(
     painter.rect_stroke(
         rect,
         radius,
-        egui::Stroke::new(1.5, border_col),
+        egui::Stroke::new(1.5_f32, border_col),
         egui::StrokeKind::Inside,
     );
     // Ikon/teks: putih di atas aksen, mengikuti tema jika tidak aktif.

@@ -603,7 +603,6 @@ pub fn build_pdf(pages: &[PdfPage]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgba;
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() <= eps

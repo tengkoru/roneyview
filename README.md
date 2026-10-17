@@ -1,4 +1,4 @@
-# Roneyview (version 0.7.16)
+# Roneyview (version 0.8.1)
 ###### README.md berbahasa Indonesia ada [disini](README_ID.md)
 
 An alternative to Honeyview; an image viewer for Linux; written in the Rust programming language (using egui/eframe).

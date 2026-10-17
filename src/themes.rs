@@ -12,9 +12,9 @@ pub enum Theme {
     /// Biru navy gelap (biru terang sebagai aksen).
     DarkNavy,
     /// Hitam dengan aksen hijau neon.
+    #[default]
     Neon,
     /// Monokrom terang (hitam-putih).
-    #[default]
     Mono,
     /// Terang kebiruan gaya macOS dengan aksen biru.
     Aqua,
@@ -42,7 +42,7 @@ impl Theme {
             Theme::DarkNavy => Color32::from_rgb(10, 20, 40),
             Theme::Neon => Color32::from_rgb(6, 10, 8),
             Theme::Mono => Color32::from_rgb(250, 250, 250),
-            Theme::Aqua => Color32::from_rgb(223, 231, 245),
+            Theme::Aqua => Color32::from_rgb(206, 219, 240),
         }
     }
 
@@ -66,10 +66,10 @@ pub fn theme_visuals(theme: Theme) -> Visuals {
             v.window_fill = Color32::from_rgb(10, 20, 40);
             v.extreme_bg_color = Color32::from_rgb(6, 13, 29);
             v.selection.bg_fill = Color32::from_rgb(30, 77, 158);
-            v.selection.stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(77, 159, 255));
+            v.selection.stroke = eframe::egui::Stroke::new(1.0_f32, Color32::from_rgb(77, 159, 255));
             v.widgets.hovered.bg_fill = Color32::from_rgb(20, 41, 77);
             v.widgets.active.bg_fill = Color32::from_rgb(30, 77, 158);
-            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::WHITE);
+            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
             v.window_corner_radius = 8.0.into();
             for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
                 w.corner_radius = 9.0.into();
@@ -83,11 +83,11 @@ pub fn theme_visuals(theme: Theme) -> Visuals {
             v.extreme_bg_color = Color32::from_rgb(4, 7, 5);
             // Seleksi: hijau gelap + teks neon (bukan neon menyilaukan full).
             v.selection.bg_fill = Color32::from_rgb(16, 46, 30);
-            v.selection.stroke = eframe::egui::Stroke::new(1.5, Color32::from_rgb(0, 255, 157));
+            v.selection.stroke = eframe::egui::Stroke::new(1.5_f32, Color32::from_rgb(0, 255, 157));
             v.widgets.hovered.bg_fill = Color32::from_rgb(15, 31, 22);
-            v.widgets.hovered.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(0, 255, 157));
+            v.widgets.hovered.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::from_rgb(0, 255, 157));
             v.widgets.active.bg_fill = Color32::from_rgb(20, 55, 35);
-            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(0, 255, 157));
+            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::from_rgb(0, 255, 157));
             v.window_corner_radius = 8.0.into();
             for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
                 w.corner_radius = 8.0.into();
@@ -100,10 +100,10 @@ pub fn theme_visuals(theme: Theme) -> Visuals {
             v.window_fill = Color32::from_rgb(250, 250, 250);
             v.extreme_bg_color = Color32::from_rgb(240, 240, 240);
             v.selection.bg_fill = Color32::from_rgb(17, 17, 17);
-            v.selection.stroke = eframe::egui::Stroke::new(1.0, Color32::WHITE);
+            v.selection.stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
             v.widgets.hovered.bg_fill = Color32::from_rgb(235, 235, 235);
             v.widgets.active.bg_fill = Color32::from_rgb(17, 17, 17);
-            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::WHITE);
+            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
             v.window_corner_radius = 2.0.into();
             for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
                 w.corner_radius = 2.0.into();
@@ -112,14 +112,16 @@ pub fn theme_visuals(theme: Theme) -> Visuals {
         }
         Theme::Aqua => {
             let mut v = Visuals::light();
-            v.panel_fill = Color32::from_rgb(246, 246, 248);
+            // Kontras dinaikkan: panel putih bersih vs background biru yang
+            // lebih pekat, agar elemen tidak pudar menyatu.
+            v.panel_fill = Color32::WHITE;
             v.window_fill = Color32::from_rgb(240, 242, 246);
-            v.extreme_bg_color = Color32::from_rgb(223, 231, 245);
+            v.extreme_bg_color = Color32::from_rgb(206, 219, 240);
             v.selection.bg_fill = Color32::from_rgb(10, 132, 255);
-            v.selection.stroke = eframe::egui::Stroke::new(1.0, Color32::WHITE);
+            v.selection.stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
             v.widgets.hovered.bg_fill = Color32::from_rgb(230, 235, 242);
             v.widgets.active.bg_fill = Color32::from_rgb(10, 132, 255);
-            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::WHITE);
+            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
             v.window_corner_radius = 10.0.into();
             for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
                 w.corner_radius = 10.0.into();
@@ -143,16 +145,67 @@ pub fn apply_theme(ctx: &eframe::egui::Context, theme: Theme) {
     ctx.all_styles_mut(|s| {
         use eframe::egui::{FontId, TextStyle};
         // Font lebih besar dari default egui.
-        s.text_styles.insert(TextStyle::Body, FontId::proportional(16.0));
-        s.text_styles.insert(TextStyle::Button, FontId::proportional(15.0));
-        s.text_styles.insert(TextStyle::Heading, FontId::proportional(22.0));
+        // Tema Neon memakai monospace untuk seluruh UI (sesuai prototype F2-Neon).
+        // Font monospace bawaan egui adalah Hack; tidak ada font tambahan
+        // yang dibundel dan tidak ada perubahan ukuran biner.
+        let neon = matches!(theme, Theme::Neon);
+        let font = |size: f32| {
+            if neon {
+                FontId::monospace(size)
+            } else {
+                FontId::proportional(size)
+            }
+        };
+        s.text_styles.insert(TextStyle::Body, font(16.0));
+        s.text_styles.insert(TextStyle::Button, font(15.0));
+        s.text_styles.insert(TextStyle::Heading, font(22.0));
         s.text_styles.insert(TextStyle::Monospace, FontId::monospace(15.0));
-        s.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
+        s.text_styles.insert(TextStyle::Small, font(12.0));
         // Tombol lebih besar (seperti di prototype).
         s.spacing.button_padding = eframe::egui::vec2(12.0, 7.0);
         s.spacing.item_spacing = eframe::egui::vec2(8.0, 6.0);
         s.spacing.menu_margin = eframe::egui::Margin::same(8);
     });
+}
+
+/// Heading kecil untuk panel perkakas/pengaturan, gaya per-tema mengikuti prototype.
+///
+/// Teks di-uppercase, ~11px. egui tidak punya letter-spacing, jadi tracking
+/// 0.8–2px dari prototype tidak bisa direproduksi persis.
+pub fn panel_heading(ui: &mut eframe::egui::Ui, theme: Theme, text: &str) {
+    use eframe::egui::{epaint::text::LayoutJob, pos2, vec2, Color32, FontId, RichText, Sense, Stroke};
+    let upper = text.to_uppercase();
+    match theme {
+        Theme::DarkNavy => {
+            ui.label(RichText::new(upper).size(11.0).color(Color32::from_rgb(77, 106, 148)));
+        }
+        Theme::Neon => {
+            ui.label(
+                RichText::new(upper)
+                    .size(11.0)
+                    .monospace()
+                    .color(Color32::from_rgb(63, 122, 85)),
+            );
+        }
+        Theme::Mono => {
+            let color = Color32::BLACK;
+            let rect = ui.label(RichText::new(upper).size(11.0).color(color)).rect;
+            let y = rect.bottom() + 2.0;
+            ui.painter()
+                .line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(2.0_f32, color));
+        }
+        Theme::Aqua => {
+            // Bold palsu: egui tidak membundel font bold, jadi galley digambar
+            // dua kali dengan offset horizontal kecil.
+            let color = Color32::from_rgb(110, 110, 115);
+            let job = LayoutJob::simple(upper, FontId::proportional(11.0), color, f32::INFINITY);
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+            let painter = ui.painter();
+            painter.galley(rect.min, galley.clone(), color);
+            painter.galley(rect.min + vec2(0.75, 0.0), galley, color);
+        }
+    }
 }
 /// Gambar pratinjau mini tema (mockup UI kecil) di dalam `rect`.
 ///
