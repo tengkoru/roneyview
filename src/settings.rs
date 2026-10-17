@@ -50,6 +50,8 @@ pub struct State {
     /// Tampilkan toolbar perkakas di bawah menu utama.
     /// Mati secara bawaan; pengguna mengaktifkannya sendiri bila mau.
     pub show_toolbar: bool,
+    /// Tema tampilan ("Dark Navy", "Neon", "Mono", "Aqua").
+    pub theme: crate::themes::Theme,
     /// Daftar folder/arsip yang baru dibuka, paling baru di depan (maks 20).
     /// Hanya diisi bila `recent_folders` aktif.
     pub recent: Vec<String>,
@@ -70,6 +72,7 @@ impl Default for State {
             recent_folders: false,
             recent: Vec::new(),
             show_toolbar: true,
+            theme: crate::themes::Theme::default(),
         }
     }
 }

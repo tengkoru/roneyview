@@ -10,6 +10,7 @@ mod natsort;
 mod positions;
 mod settings;
 mod source;
+mod themes;
 mod wallpaper;
 
 use std::io::Write;

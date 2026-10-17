@@ -25,8 +25,8 @@ use crate::loader::{self, AnimFrame, Command, Loaded, Outcome};
 use crate::positions::{PositionStore, key_for};
 use crate::settings::{FitMode, Store};
 use crate::source::Listing;
+use crate::themes::{self, Theme};
 
-const BG: Color32 = Color32::from_gray(22);
 /// Gambar yang disimpan di cache: sekian di belakang dan di depan gambar aktif.
 const KEEP_BEHIND: usize = 2;
 const KEEP_AHEAD: usize = 3;
@@ -202,6 +202,14 @@ enum Zoom {
     Custom(f32),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum SettingsTab {
+    #[default]
+    Theme,
+    Language,
+    Folders,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
     Next,
@@ -234,6 +242,7 @@ enum Action {
     Help,
     About,
     Settings,
+    SetTheme(Theme),
     Quit,
 }
 
@@ -490,6 +499,7 @@ pub struct RoneyApp {
     display_scale: f32,
     lang: Lang,
     show_settings: bool,
+    settings_tab: SettingsTab,
     flip_accum: f32,
     flip_block_until: Instant,
 
@@ -579,11 +589,9 @@ impl RoneyApp {
         arg: Option<PathBuf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let ctx = cc.egui_ctx.clone();
-        ctx.set_theme(egui::Theme::Dark);
-        ctx.style_mut(|s| {
-            s.visuals.panel_fill = Color32::from_gray(30);
-            s.visuals.window_corner_radius = 6.0.into();
-        });
+        let mut store = Store::load();
+        // Tema tampilan dari pengaturan (bawaan: Dark Navy).
+        themes::apply_theme(&ctx, store.state.theme);
 
         // Mipmap membuat gambar besar yang dikecilkan tampak halus, tetapi
         // butuh OpenGL >= 3.0 (atau GLES >= 2.0); pada GPU lawas dimatikan.
@@ -597,7 +605,6 @@ impl RoneyApp {
         #[cfg(feature = "dialogs")]
         let (dialog_tx, dialog_rx) = mpsc::channel();
 
-        let store = Store::load();
         let fit = store.state.fit;
         let lang = Lang::from_code(&store.state.lang);
         let bar_locked = store.state.bar_locked;
@@ -658,6 +665,7 @@ impl RoneyApp {
             display_scale: 1.0,
             lang,
             show_settings: false,
+            settings_tab: SettingsTab::Theme,
             flip_accum: 0.0,
             flip_block_until: Instant::now(),
             anim_key: None,
@@ -1339,7 +1347,7 @@ impl RoneyApp {
             let (img_rect, img_resp) =
                 ui.allocate_exact_size(img_size, Sense::click_and_drag());
             let painter = ui.painter_at(img_rect);
-            painter.rect_filled(img_rect, 0.0, BG);
+            painter.rect_filled(img_rect, 0.0, self.theme_bg());
             let tool = self.edit.as_ref().map(|e| e.tool);
             if let (Some(e), Some(tex)) = (&self.edit, &self.edit_tex) {
                 let img = e.display_image();
@@ -2870,6 +2878,20 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         }
     }
 
+    /// Warna latar area gambar mengikuti tema aktif.
+    fn theme_bg(&self) -> Color32 {
+        self.store.state.theme.bg()
+    }
+
+    /// Ganti tema tampilan dan terapkan langsung.
+    fn set_theme(&mut self, ctx: &Context, theme: Theme) {
+        if self.store.state.theme != theme {
+            self.store.state.theme = theme;
+            self.store_dirty = true;
+            themes::apply_theme(ctx, theme);
+        }
+    }
+
     fn zoom_by(&mut self, ctx: &Context, factor: f32, anchor: Option<Pos2>) {
         let Some(sh) = self.shown.clone() else {
             return;
@@ -3042,6 +3064,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             Action::Help => self.show_help = !self.show_help,
             Action::About => self.about_open = true,
             Action::Settings => self.show_settings = true,
+            Action::SetTheme(t) => self.set_theme(ctx, t),
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
         ctx.request_repaint();
@@ -3218,6 +3241,36 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 item(ui, tr(lang, "modal_trash_title"), "Delete", acts, Action::Trash);
                 ui.separator();
                 item(ui, tr(lang, "menu_settings"), "Ctrl+,", acts, Action::Settings);
+                // Submenu Tema: pilihan tema + pratinjau mini tampilannya.
+                ui.menu_button(tr(lang, "menu_theme"), |ui| {
+                    let current = self.store.state.theme;
+                    for theme in Theme::all() {
+                        let sel = current == theme;
+                        // Pratinjau mini di atas, nama tema di bawah.
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(190.0, 52.0), egui::Sense::click());
+                        themes::draw_theme_preview(ui.painter(), rect.shrink(4.0), theme);
+                        if sel {
+                            ui.painter().rect_stroke(
+                                rect.shrink(2.0),
+                                6.0,
+                                egui::Stroke::new(2.0, theme.accent()),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                        ui.painter().text(
+                            egui::pos2(rect.min.x, rect.max.y + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            theme.name(),
+                            egui::FontId::proportional(12.0),
+                            ui.visuals().text_color(),
+                        );
+                        ui.allocate_exact_size(egui::vec2(190.0, 16.0), egui::Sense::hover());
+                        if resp.clicked() {
+                            acts.push(Action::SetTheme(theme));
+                            ui.close_menu();
+                        }
+                    }
+                });
                 ui.separator();
                 item(ui, tr(lang, "menu_quit"), "Ctrl+Q", acts, Action::Quit);
             });
@@ -3311,6 +3364,13 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     /// Toolbar perkakas di bawah menu utama (ikon, tanpa label).
     fn draw_toolbar(&mut self, ctx: &Context, ui: &mut egui::Ui) {
         let lang = self.lang;
+        // Warna ikon toolbar mengikuti tema: gelap di tema terang, terang di tema gelap.
+        let theme = self.store.state.theme;
+        let icon_color = match theme {
+            Theme::Mono | Theme::Aqua => Color32::from_rgb(35, 35, 35),
+            _ => Color32::from_rgb(225, 232, 245),
+        };
+        let accent = theme.accent();
         let has_page = self.listing.is_some();
         let is_archive = self.listing.as_ref().is_some_and(|l| l.is_archive());
         let animated = self.page_for(self.index).is_some_and(|p| p.anim.is_some());
@@ -3321,48 +3381,48 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             // Grup edit (perlu berkas asli, bukan arsip).
             let edit_tip = if is_archive { tr(lang, "toolbar_archive_tip") } else { "" };
             let crop_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_crop_tip") };
-            if toolbar_button(ui, ToolIcon::Crop, has_page && !is_archive, edit_tool == Some(EditTool::Crop), crop_tip) {
+            if toolbar_labeled_button(ui, ToolIcon::Crop, "Crop", has_page && !is_archive, edit_tool == Some(EditTool::Crop), crop_tip, icon_color, accent) {
                 self.edit_tool_clicked(EditTool::Crop);
             }
             let resize_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_resize_tip") };
-            if toolbar_button(ui, ToolIcon::Resize, has_page && !is_archive, edit_tool == Some(EditTool::Resize), resize_tip) {
+            if toolbar_labeled_button(ui, ToolIcon::Resize, "Resize", has_page && !is_archive, edit_tool == Some(EditTool::Resize), resize_tip, icon_color, accent) {
                 self.edit_tool_clicked(EditTool::Resize);
             }
             let rotate_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_rotate_tip") };
-            if toolbar_button(ui, ToolIcon::RotateCcw, has_page && !is_archive, edit_tool == Some(EditTool::Rotate), rotate_tip) {
+            if toolbar_labeled_button(ui, ToolIcon::RotateCcw, "", has_page && !is_archive, false, rotate_tip, icon_color, accent) {
                 self.rotate_edit_buffer(false);
             }
-            if toolbar_button(ui, ToolIcon::RotateCw, has_page && !is_archive, edit_tool == Some(EditTool::Rotate), rotate_tip) {
+            if toolbar_labeled_button(ui, ToolIcon::RotateCw, "", has_page && !is_archive, false, rotate_tip, icon_color, accent) {
                 self.rotate_edit_buffer(true);
             }
             ui.separator();
             // Grup navigasi frame (animasi, termasuk di dalam arsip).
-            if toolbar_button(ui, ToolIcon::FramePrev, animated && !editing, false, tr(lang, "toolbar_frame_prev_tip")) {
+            if toolbar_labeled_button(ui, ToolIcon::FramePrev, "", animated && !editing, false, tr(lang, "toolbar_frame_prev_tip"), icon_color, accent) {
                 self.step_frame(ctx, -1);
             }
             let play_icon = if self.anim_playing { ToolIcon::Pause } else { ToolIcon::Play };
-            if toolbar_button(ui, play_icon, animated && !editing, false, tr(lang, "toolbar_anim_tip")) {
+            if toolbar_labeled_button(ui, play_icon, "", animated && !editing, false, tr(lang, "toolbar_anim_tip"), icon_color, accent) {
                 self.perform(ctx, Action::TogglePlay);
             }
-            if toolbar_button(ui, ToolIcon::FrameNext, animated && !editing, false, tr(lang, "toolbar_frame_next_tip")) {
+            if toolbar_labeled_button(ui, ToolIcon::FrameNext, "", animated && !editing, false, tr(lang, "toolbar_frame_next_tip"), icon_color, accent) {
                 self.step_frame(ctx, 1);
             }
             ui.separator();
             // Grup ambil warna & tone (perlu berkas asli, bukan arsip).
             let picker_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_picker_tip") };
-            if toolbar_button(ui, ToolIcon::Picker, has_page && !is_archive, edit_tool == Some(EditTool::Picker), picker_tip) {
+            if toolbar_labeled_button(ui, ToolIcon::Picker, "Picker", has_page && !is_archive, edit_tool == Some(EditTool::Picker), picker_tip, icon_color, accent) {
                 self.edit_tool_clicked(EditTool::Picker);
             }
             let tone_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_tone_tip") };
-            if toolbar_button(ui, ToolIcon::Tone, has_page && !is_archive, edit_tool == Some(EditTool::Tone), tone_tip) {
+            if toolbar_labeled_button(ui, ToolIcon::Tone, "HDR", has_page && !is_archive, edit_tool == Some(EditTool::Tone), tone_tip, icon_color, accent) {
                 self.edit_tool_clicked(EditTool::Tone);
             }
             ui.separator();
             // Grup cetak & proyektor (boleh di arsip).
-            if toolbar_button(ui, ToolIcon::Print, has_page, self.print_open, tr(lang, "toolbar_print_tip")) {
+            if toolbar_labeled_button(ui, ToolIcon::Print, "Print", has_page, self.print_open, tr(lang, "toolbar_print_tip"), icon_color, accent) {
                 self.open_print_window();
             }
-            if toolbar_button(ui, ToolIcon::Projector, has_page, self.projector_open, tr(lang, "toolbar_projector_tip")) {
+            if toolbar_labeled_button(ui, ToolIcon::Projector, "Projector", has_page, self.projector_open, tr(lang, "toolbar_projector_tip"), icon_color, accent) {
                 self.projector_open = !self.projector_open;
                 if self.projector_open {
                     self.projector_tex = None;
@@ -3460,7 +3520,7 @@ impl RoneyApp {
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         self.panning = resp.dragged_by(PointerButton::Primary);
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, BG);
+        painter.rect_filled(rect, 0.0, self.theme_bg());
 
         let Some(sh) = self.current_content() else {
             self.draw_placeholder(&painter, rect);
@@ -3755,32 +3815,97 @@ impl RoneyApp {
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.heading(tr(lang, "settings_language"));
-                    for l in [Lang::Id, Lang::En] {
-                        if ui.radio(self.lang == l, l.display_name()).clicked() {
-                            self.set_lang(l);
-                        }
-                    }
-                    ui.add_space(8.0);
-                    ui.heading(tr(lang, "settings_folders"));
-                    let mut scan = self.store.state.scan_subfolders;
-                    if ui
-                        .checkbox(&mut scan, tr(lang, "settings_scan_subfolders"))
-                        .changed()
-                    {
-                        self.store.state.scan_subfolders = scan;
-                        self.store_dirty = true;
-                    }
-                    // Kategori pengaturan lain bisa ditambah di sini.
-                    ui.add_space(8.0);
-                    let mut recent = self.store.state.recent_folders;
-                    if ui
-                        .checkbox(&mut recent, tr(lang, "settings_recent_folders"))
-                        .changed()
-                    {
-                        self.store.state.recent_folders = recent;
-                        self.store_dirty = true;
-                    }
+                    ui.horizontal(|ui| {
+                        // Tab di samping kiri.
+                        ui.vertical(|ui| {
+                            ui.set_min_width(110.0);
+                            for (tab, label) in [
+                                (SettingsTab::Theme, tr(lang, "settings_theme")),
+                                (SettingsTab::Language, tr(lang, "settings_language")),
+                                (SettingsTab::Folders, tr(lang, "settings_folders")),
+                            ] {
+                                if ui.selectable_label(self.settings_tab == tab, label).clicked() {
+                                    self.settings_tab = tab;
+                                }
+                            }
+                        });
+                        ui.separator();
+                        // Isi sesuai tab aktif.
+                        ui.vertical(|ui| {
+                            ui.set_min_size(vec2(380.0, 280.0));
+                            match self.settings_tab {
+                                SettingsTab::Theme => {
+                                    ui.heading(tr(lang, "settings_theme"));
+                                    ui.add_space(6.0);
+                                    // Grid 2x2: pratinjau + nama tema.
+                                    egui::Grid::new("theme_grid")
+                                        .num_columns(2)
+                                        .spacing(vec2(12.0, 10.0))
+                                        .show(ui, |ui| {
+                                            for (i, theme) in Theme::all().iter().enumerate() {
+                                                let sel = self.store.state.theme == *theme;
+                                                ui.vertical(|ui| {
+                                                    let (rect, resp) = ui.allocate_exact_size(
+                                                        vec2(170.0, 96.0),
+                                                        egui::Sense::click(),
+                                                    );
+                                                    themes::draw_theme_preview(
+                                                        ui.painter(),
+                                                        rect,
+                                                        *theme,
+                                                    );
+                                                    if sel {
+                                                        ui.painter().rect_stroke(
+                                                            rect,
+                                                            6.0,
+                                                            egui::Stroke::new(2.5, theme.accent()),
+                                                            egui::StrokeKind::Outside,
+                                                        );
+                                                    }
+                                                    ui.label(theme.name());
+                                                    if resp.clicked() {
+                                                        self.set_theme(ctx, *theme);
+                                                    }
+                                                });
+                                                if i % 2 == 1 {
+                                                    ui.end_row();
+                                                }
+                                            }
+                                        });
+                                }
+                                SettingsTab::Language => {
+                                    ui.heading(tr(lang, "settings_language"));
+                                    ui.add_space(6.0);
+                                    for l in [Lang::Id, Lang::En] {
+                                        if ui.radio(self.lang == l, l.display_name()).clicked() {
+                                            self.set_lang(l);
+                                        }
+                                    }
+                                }
+                                SettingsTab::Folders => {
+                                    ui.heading(tr(lang, "settings_folders"));
+                                    ui.add_space(6.0);
+                                    let mut scan = self.store.state.scan_subfolders;
+                                    if ui
+                                        .checkbox(&mut scan, tr(lang, "settings_scan_subfolders"))
+                                        .changed()
+                                    {
+                                        self.store.state.scan_subfolders = scan;
+                                        self.store_dirty = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    let mut recent = self.store.state.recent_folders;
+                                    if ui
+                                        .checkbox(&mut recent, tr(lang, "settings_recent_folders"))
+                                        .changed()
+                                    {
+                                        self.store.state.recent_folders = recent;
+                                        self.store_dirty = true;
+                                    }
+                                }
+                            }
+                        });
+                    });
                 });
             self.show_settings = open;
         }
@@ -3932,7 +4057,7 @@ impl eframe::App for RoneyApp {
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(BG))
+            .frame(egui::Frame::NONE.fill(self.theme_bg()))
             .show(ctx, |ui| {
                 if self.edit.is_some() {
                     self.draw_edit_view(ctx, ui);
@@ -4306,34 +4431,84 @@ fn paint_tool_icon(painter: &egui::Painter, rect: Rect, icon: ToolIcon, color: C
     }
 }
 
-/// Tombol ikon toolbar 28x28: latar saat hover/aktif, ikon digambar sendiri.
-fn toolbar_button(
+/// Tombol toolbar (ikon + label opsional) mengikuti gaya prototype tema.
+///
+/// Selalu punya border warna aksen tema: redup saat normal, penuh saat
+/// aktif/hover. Background aktif = warna aksen tema.
+#[allow(clippy::too_many_arguments)]
+fn toolbar_labeled_button(
     ui: &mut egui::Ui,
     icon: ToolIcon,
+    label: &str,
     enabled: bool,
     active: bool,
     tooltip: &str,
+    icon_color: Color32,
+    accent: Color32,
 ) -> bool {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), sense);
+    let font = egui::FontId::proportional(14.0);
+    // Lebar dinamis: ikon saja (kotak) jika label kosong, ikon+teks jika ada.
+    let (w, h) = if label.is_empty() {
+        (38.0, 38.0)
+    } else {
+        let text_w = ui
+            .painter()
+            .layout_no_wrap(label.to_owned(), font.clone(), icon_color)
+            .size()
+            .x;
+        (20.0 + 8.0 + text_w + 24.0, 38.0)
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), sense);
     let hovered = enabled && resp.hovered();
     let pressed = enabled && resp.is_pointer_button_down_on();
     let painter = ui.painter();
+    let radius = ui.visuals().widgets.inactive.corner_radius;
+    // Background dari warna aksen tema (bukan abu-abu generik).
     let bg = if active {
-        Color32::from_rgba_unmultiplied(90, 160, 255, 110)
+        accent
     } else if pressed {
-        Color32::from_black_alpha(120)
+        accent.gamma_multiply(0.45)
     } else if hovered {
-        Color32::from_black_alpha(70)
+        accent.gamma_multiply(0.25)
     } else {
-        Color32::TRANSPARENT
+        accent.gamma_multiply(0.10)
     };
-    painter.rect_filled(rect, 5.0, bg);
-    if active {
-        painter.rect_stroke(rect, 5.0, egui::Stroke::new(1.0_f32, ACCENT), egui::StrokeKind::Inside);
+    painter.rect_filled(rect, radius, bg);
+    // Border: selalu warna aksen — redup saat normal, penuh saat aktif/hover.
+    let border_alpha: u8 = if active || hovered { 255 } else { 110 };
+    let border_col =
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), border_alpha);
+    painter.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.5, border_col),
+        egui::StrokeKind::Inside,
+    );
+    // Ikon/teks: putih di atas aksen, mengikuti tema jika tidak aktif.
+    let fg = if active {
+        Color32::WHITE
+    } else if enabled {
+        icon_color
+    } else {
+        icon_color.gamma_multiply(0.35)
+    };
+    if label.is_empty() {
+        paint_tool_icon(painter, rect.shrink(9.0), icon, fg);
+    } else {
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 12.0, rect.center().y - 10.0),
+            vec2(20.0, 20.0),
+        );
+        paint_tool_icon(painter, icon_rect, icon, fg);
+        painter.text(
+            egui::pos2(icon_rect.max.x + 8.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font,
+            fg,
+        );
     }
-    let col = if enabled { Color32::WHITE } else { Color32::from_white_alpha(70) };
-    paint_tool_icon(painter, rect.shrink(3.0), icon, col);
     resp.on_hover_text(tooltip).clicked()
 }
 
