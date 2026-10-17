@@ -6,14 +6,6 @@ An alternative to Honeyview; an image viewer for Linux; written in the Rust prog
 ## Where I can download Deb or Flatpak files?
 You can download at Releases place (location below "about" on repository github roneyview) or you just [klik this](https://github.com/tengkoru/roneyview/releases) to go to download page, scroll and klik dropdown menu named "Assets".
 
-
-![Screenshot1](tests/1.png) 
-![Screenshot1](tests/2.png) 
-![Screenshot2](tests/3.png)
-More Screenshot [klik here](tests/)
-
-[Thanks for pictures](tests/thanks-for-pictures.md)
-
 ## What can Roneyview do?
 - **Open images**, **folders**, and **archives**
 - **Supports image formats**: JPEG/JPG, PNG, GIF, WebP, BMP, TIFF, QOI, TGA, ICO, AVIF, HEIC/HEIF, HDR (.hdr)

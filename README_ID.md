@@ -6,14 +6,6 @@ Alternatif Honeyview; penampil gambar untuk Linux; ditulis dalam bahasa pemrogra
 ## Di mana saya bisa mengunduh file Deb atau Flatpak?
 Kamu bisa mengunduh di tempat Releases (lokasi di bawah "about" pada repositori github roneyview) atau cukup [klik ini](https://github.com/tengkoru/roneyview/releases) untuk menuju halaman unduhan, gulir lalu klik menu dropdown bernama "Assets".
 
-
-![Screenshot1](tests/1.png) 
-![Screenshot1](tests/2.png) 
-![Screenshot2](tests/3.png)
-Screenshot lainnya [klik di sini](tests/)
-
-[Terima kasih untuk gambar-gambarnya](tests/thanks-for-pictures.md)
-
 ## Apa yang bisa dilakukan Roneyview?
 - **Membuka gambar**, **folder**, dan **arsip**
 - **Mendukung format gambar**: JPEG/JPG, PNG, GIF, WebP, BMP, TIFF, QOI, TGA, ICO, AVIF, HEIC/HEIF, HDR (.hdr)
