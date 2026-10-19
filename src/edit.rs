@@ -300,6 +300,53 @@ impl Default for ToneParams {
     }
 }
 
+/// Parameter tone DASAR (sederhana): brightness/contrast/saturation.
+/// Nilai bawaan = identitas (tidak mengubah gambar).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BasicToneParams {
+    /// Kecerahan: -1..1, 0 = tidak berubah.
+    pub brightness: f32,
+    /// Kontras: 0..2, 1 = tidak berubah.
+    pub contrast: f32,
+    /// Saturasi: 0 = abu-abu, 1 = asli, 2 = jenuh ganda.
+    pub saturation: f32,
+}
+
+impl Default for BasicToneParams {
+    fn default() -> Self {
+        BasicToneParams { brightness: 0.0, contrast: 1.0, saturation: 1.0 }
+    }
+}
+
+/// Terapkan penyesuaian dasar (brightness/contrast/saturation) ke gambar.
+/// Sederhana dan cepat: cocok untuk pratinjau langsung maupun full-res.
+pub fn apply_basic_tone(img: &RgbaImage, p: &BasicToneParams) -> RgbaImage {
+    let (w, h) = (img.width(), img.height());
+    let mut out = RgbaImage::new(w, h);
+    let b = (p.brightness * 255.0) as i32;
+    for (dst, src) in out.pixels_mut().zip(img.pixels()) {
+        let mut r = src[0] as i32;
+        let mut g = src[1] as i32;
+        let mut bl = src[2] as i32;
+        // Brightness: geser nilai.
+        r += b; g += b; bl += b;
+        // Contrast: (v - 128) * c + 128.
+        r = (((r - 128) as f32 * p.contrast) as i32) + 128;
+        g = (((g - 128) as f32 * p.contrast) as i32) + 128;
+        bl = (((bl - 128) as f32 * p.contrast) as i32) + 128;
+        // Saturation: campur dengan luminance.
+        let lum = (r as f32 * 0.299 + g as f32 * 0.587 + bl as f32 * 0.114);
+        r = (lum + (r as f32 - lum) * p.saturation) as i32;
+        g = (lum + (g as f32 - lum) * p.saturation) as i32;
+        bl = (lum + (bl as f32 - lum) * p.saturation) as i32;
+        dst[0] = r.clamp(0, 255) as u8;
+        dst[1] = g.clamp(0, 255) as u8;
+        dst[2] = bl.clamp(0, 255) as u8;
+        dst[3] = src[3];
+    }
+    out
+}
+
 /// LUT sRGB byte -> linier float. Dibangun sekali per proses; mengubah 3x `powf`
 /// per piksel menjadi 3x lookup saat tone mapping.
 fn srgb_to_linear_lut() -> &'static [f32; 256] {
@@ -600,9 +647,91 @@ pub fn build_pdf(pages: &[PdfPage]) -> Vec<u8> {
 
 // ----------------------------------------------------------------------- tes
 
+/// Putar gambar dengan sudut bebas (derajat, positif = searah jarum jam).
+/// Menggunakan interpolasi bilinear; area di luar gambar diisi transparan.
+pub fn rotate_arbitrary(src: &RgbaImage, angle_deg: f32) -> RgbaImage {
+    use std::f32::consts::PI;
+    let (w, h) = (src.width() as f32, src.height() as f32);
+    let angle = angle_deg * PI / 180.0;
+    let (sin, cos) = angle.sin_cos();
+    // Ukuran output: bounding box dari gambar yang diputar.
+    let new_w = (w * cos.abs() + h * sin.abs()).ceil() as u32;
+    let new_h = (w * sin.abs() + h * cos.abs()).ceil() as u32;
+    let mut out = RgbaImage::from_pixel(new_w, new_h, image::Rgba([0, 0, 0, 0]));
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let (ncx, ncy) = (new_w as f32 / 2.0, new_h as f32 / 2.0);
+    for y in 0..new_h {
+        for x in 0..new_w {
+            // Koordinat relatif ke pusat output, diputar balik ke sumber.
+            let dx = x as f32 - ncx;
+            let dy = y as f32 - ncy;
+            let sx = cos * dx + sin * dy + cx;
+            let sy = -sin * dx + cos * dy + cy;
+            // Interpolasi bilinear.
+            let x0 = sx.floor() as i32;
+            let y0 = sy.floor() as i32;
+            let fx = sx - x0 as f32;
+            let fy = sy - y0 as f32;
+            let mut px = [0u8; 4];
+            for c in 0..4 {
+                let v00 = pixel_at(src, x0, y0, c);
+                let v10 = pixel_at(src, x0 + 1, y0, c);
+                let v01 = pixel_at(src, x0, y0 + 1, c);
+                let v11 = pixel_at(src, x0 + 1, y0 + 1, c);
+                let v = v00 * (1.0 - fx) * (1.0 - fy)
+                    + v10 * fx * (1.0 - fy)
+                    + v01 * (1.0 - fx) * fy
+                    + v11 * fx * fy;
+                px[c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            // Alpha: transparan bila semua sampel di luar gambar.
+            let a = if x0 < 0 || y0 < 0 || x0 >= src.width() as i32 - 1 || y0 >= src.height() as i32 - 1 {
+                // Cek apakah titik tepat di dalam.
+                if sx >= 0.0 && sx < w && sy >= 0.0 && sy < h {
+                    px[3]
+                } else {
+                    0
+                }
+            } else {
+                px[3]
+            };
+            out.put_pixel(x, y, image::Rgba([px[0], px[1], px[2], a]));
+        }
+    }
+    out
+}
+
+fn pixel_at(img: &RgbaImage, x: i32, y: i32, c: usize) -> f32 {
+    if x < 0 || y < 0 || x >= img.width() as i32 || y >= img.height() as i32 {
+        0.0
+    } else {
+        img.get_pixel(x as u32, y as u32)[c] as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rotate_arbitrary_90() {
+        // Gambar 2x4, putar 90 derajat -> jadi 4x2
+        let img = RgbaImage::from_pixel(2, 4, image::Rgba([255, 0, 0, 255]));
+        let out = rotate_arbitrary(&img, 90.0);
+        // Bounding box 90 derajat: w dan h bertukar
+        assert!(out.width() >= 3 && out.width() <= 5, "width: {}", out.width());
+        assert!(out.height() >= 1 && out.height() <= 3, "height: {}", out.height());
+    }
+    #[test]
+    fn rotate_arbitrary_0_identitas() {
+        let img = RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let out = rotate_arbitrary(&img, 0.0);
+        assert_eq!(out.width(), 4);
+        assert_eq!(out.height(), 4);
+        // Tengah harus tetap sama (toleransi interpolasi)
+        let px = out.get_pixel(2, 2);
+        assert!(px[0] >= 8 && px[0] <= 12, "r: {}", px[0]);
+    }
+
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() <= eps
@@ -696,6 +825,26 @@ mod tests {
         let p = gray.get_pixel(0, 0);
         assert_eq!(p[0], p[1]);
         assert_eq!(p[1], p[2]);
+    }
+
+    #[test]
+    fn basic_tone_identitas_dan_brightness() {
+        let img = RgbaImage::from_pixel(4, 4, image::Rgba([128, 128, 128, 255]));
+        // Identitas: tidak berubah.
+        let id = apply_basic_tone(&img, &BasicToneParams::default());
+        assert_eq!(id.get_pixel(0, 0)[0], 128);
+        // Brightness positif -> lebih terang, negatif -> lebih gelap.
+        let up = apply_basic_tone(&img, &BasicToneParams { brightness: 0.5, ..Default::default() });
+        let down = apply_basic_tone(&img, &BasicToneParams { brightness: -0.5, ..Default::default() });
+        assert!(up.get_pixel(0, 0)[0] > 128);
+        assert!(down.get_pixel(0, 0)[0] < 128);
+        // Saturasi 0 -> abu-abu, alpha tidak berubah.
+        let colored = RgbaImage::from_pixel(2, 2, image::Rgba([200, 30, 30, 255]));
+        let gray = apply_basic_tone(&colored, &BasicToneParams { saturation: 0.0, ..Default::default() });
+        let px = gray.get_pixel(0, 0);
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
+        assert_eq!(px[3], 255);
     }
 
     #[test]

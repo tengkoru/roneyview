@@ -50,11 +50,25 @@ pub struct State {
     /// Tampilkan toolbar perkakas di bawah menu utama.
     /// Mati secara bawaan; pengguna mengaktifkannya sendiri bila mau.
     pub show_toolbar: bool,
+    /// Tampilkan strip thumbnail di bawah area gambar untuk navigasi cepat.
+    pub show_strip: bool,
+    /// Interval slideshow dalam detik.
+    pub slideshow_secs: u64,
+    /// Lebar panel edit (piksel).
+    pub panel_width: f32,
     /// Tema tampilan ("Dark Navy", "Neon", "Mono", "Aqua").
     pub theme: crate::themes::Theme,
     /// Daftar folder/arsip yang baru dibuka, paling baru di depan (maks 20).
     /// Hanya diisi bila `recent_folders` aktif.
     pub recent: Vec<String>,
+    /// Setting batch convert terakhir (diingat antar sesi).
+    pub batch_format: usize,
+    pub batch_quality: u8,
+    pub batch_pct: u32,
+    pub batch_by_pct: bool,
+    pub batch_output: String,
+    pub batch_width: u32,
+    pub batch_height: u32,
 }
 
 impl Default for State {
@@ -72,7 +86,17 @@ impl Default for State {
             recent_folders: false,
             recent: Vec::new(),
             show_toolbar: true,
+            show_strip: true,
+            slideshow_secs: 5,
+            panel_width: 280.0,
             theme: crate::themes::Theme::default(),
+            batch_format: 0,
+            batch_quality: 85,
+            batch_pct: 50,
+            batch_by_pct: true,
+            batch_output: String::new(),
+            batch_width: 1920,
+            batch_height: 1080,
         }
     }
 }

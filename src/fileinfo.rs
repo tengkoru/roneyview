@@ -139,6 +139,56 @@ pub fn properties_rows(listing: &Listing, index: usize, facts: &PageFacts, lang:
         tr(lang, "prop_modified").to_string(),
         modified.unwrap_or_else(|| tr(lang, "prop_unknown").to_string()),
     ));
+    // Metadata EXIF (kamera, tanggal ambil, eksposur, dll) bila ada.
+    rows.extend(exif_rows(&loc, listing, index, lang));
+    rows
+}
+
+/// Baca tag EXIF umum dari berkas dan kembalikan sebagai baris properti.
+/// Mengembalikan vec kosong bila tidak ada EXIF atau gagal dibaca.
+fn exif_rows(loc: &Where, listing: &Listing, index: usize, lang: Lang) -> Vec<(String, String)> {
+    let bytes: Vec<u8> = match loc {
+        Where::File(p) => match std::fs::read(p) {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        },
+        Where::Archive { .. } => match listing.open_reader().and_then(|mut r| r.read(index)) {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        },
+    };
+    let mut cursor = std::io::Cursor::new(&bytes);
+    let exif = match exif::Reader::new().read_from_container(&mut cursor) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows = Vec::new();
+    let get = |tag: exif::Tag| {
+        exif.get_field(tag, exif::In::PRIMARY)
+            .map(|f| f.display_value().to_string())
+    };
+    // Kamera.
+    if let Some(make) = get(exif::Tag::Make) {
+        let model = get(exif::Tag::Model).unwrap_or_default();
+        rows.push((tr(lang, "prop_camera").to_string(), format!("{make} {model}").trim().to_string()));
+    }
+    // Tanggal ambil.
+    if let Some(dt) = get(exif::Tag::DateTimeOriginal) {
+        rows.push((tr(lang, "prop_taken").to_string(), dt));
+    }
+    // Eksposur.
+    if let Some(exp) = get(exif::Tag::ExposureTime) {
+        rows.push((tr(lang, "prop_exposure").to_string(), exp));
+    }
+    if let Some(fnum) = get(exif::Tag::FNumber) {
+        rows.push((tr(lang, "prop_aperture").to_string(), fnum));
+    }
+    if let Some(iso) = get(exif::Tag::PhotographicSensitivity) {
+        rows.push((tr(lang, "prop_iso").to_string(), iso));
+    }
+    if let Some(focal) = get(exif::Tag::FocalLength) {
+        rows.push((tr(lang, "prop_focal").to_string(), focal));
+    }
     rows
 }
 

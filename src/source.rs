@@ -64,7 +64,7 @@ fn file_name_string(path: &Path) -> String {
 
 enum Kind {
     Folder { files: Vec<PathBuf> },
-    Archive { zip_indices: Vec<usize> },
+    Archive { zip_indices: Vec<usize>, encrypted: bool },
     /// `ordinals`: urutan entri di dalam arsip RAR (RAR hanya bisa dibaca berurutan).
     #[cfg(feature = "rar")]
     Rar { ordinals: Vec<usize> },
@@ -82,6 +82,8 @@ pub struct Listing {
     /// Tanggal ubah tiap entri ARSIP ("2026-10-05 14:03:09"); kosong untuk folder
     /// (tanggal berkas folder dibaca langsung dari disk saat dibutuhkan).
     pub modified: Vec<Option<String>>,
+    /// Password arsip terenkripsi (bila ada). Disimpan per-sesi saja.
+    pub password: Option<Vec<u8>>,
     kind: Kind,
 }
 
@@ -90,6 +92,8 @@ pub enum Reader {
     Zip {
         archive: Box<ZipArchive<BufReader<File>>>,
         indices: Vec<usize>,
+        /// Password arsip (bila terenkripsi). Disimpan per-sesi saja.
+        password: Option<Vec<u8>>,
     },
     #[cfg(feature = "rar")]
     Rar {
@@ -108,6 +112,11 @@ impl Listing {
 
     pub fn is_archive(&self) -> bool {
         !matches!(self.kind, Kind::Folder { .. })
+    }
+
+    /// True bila arsip ZIP berisi entri terenkripsi.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.kind, Kind::Archive { encrypted: true, .. })
     }
 
     /// Buka path apa pun: folder, arsip, atau satu berkas gambar.
@@ -144,7 +153,7 @@ impl Listing {
     pub fn open_reader(&self) -> Result<Reader, String> {
         match &self.kind {
             Kind::Folder { files } => Ok(Reader::Folder(files.clone())),
-            Kind::Archive { zip_indices } => {
+            Kind::Archive { zip_indices, .. } => {
                 let file = File::open(&self.origin)
                     .map_err(|e| format!("Tidak dapat membuka arsip: {e}"))?;
                 let archive = ZipArchive::new(BufReader::new(file))
@@ -152,6 +161,7 @@ impl Listing {
                 Ok(Reader::Zip {
                     archive: Box::new(archive),
                     indices: zip_indices.clone(),
+                    password: self.password.clone(),
                 })
             }
             #[cfg(feature = "rar")]
@@ -179,13 +189,19 @@ impl Reader {
                 }
                 fs::read(p).map_err(|e| format!("Gagal membaca {}: {e}", p.display()))
             }
-            Reader::Zip { archive, indices } => {
+            Reader::Zip { archive, indices, password } => {
                 let zi = *indices
                     .get(i)
                     .ok_or_else(|| "Indeks gambar di luar jangkauan".to_string())?;
-                let file = archive
-                    .by_index(zi)
-                    .map_err(|e| format!("Gagal membuka entri arsip: {e}"))?;
+                // Buka dengan password bila arsip terenkripsi.
+                let mut file = match password {
+                    Some(pw) => archive
+                        .by_index_decrypt(zi, pw)
+                        .map_err(|e| format!("Gagal membuka entri arsip: {e}"))?,
+                    None => archive
+                        .by_index(zi)
+                        .map_err(|e| format!("Gagal membuka entri arsip: {e}"))?,
+                };
                 if file.size() > MAX_ENTRY_BYTES {
                     return Err(format!("Entri terlalu besar ({} MB)", file.size() >> 20));
                 }
@@ -279,6 +295,7 @@ fn list_folder(
         origin: dir.to_path_buf(),
         names,
         modified: Vec::new(),
+        password: None,
         kind: Kind::Folder { files },
     })
 }
@@ -404,6 +421,7 @@ fn list_rar(path: &Path) -> Result<Listing, String> {
         origin: path.to_path_buf(),
         names,
         modified,
+        password: None,
         kind: Kind::Rar { ordinals },
     })
 }
@@ -454,11 +472,28 @@ fn list_zip(path: &Path) -> Result<Listing, String> {
         zip_indices.push(i);
         modified.push(m);
     }
+    // Deteksi apakah ada entri terenkripsi.
+    let encrypted = {
+        let file = File::open(path).map_err(|e| format!("Tidak dapat membuka arsip: {e}"))?;
+        let mut archive = ZipArchive::new(BufReader::new(file))
+            .map_err(|e| format!("Arsip ZIP tidak valid: {e}"))?;
+        let mut enc = false;
+        for &zi in &zip_indices {
+            if let Ok(entry) = archive.by_index_raw(zi) {
+                if entry.encrypted() {
+                    enc = true;
+                    break;
+                }
+            }
+        }
+        enc
+    };
     Ok(Listing {
         origin: path.to_path_buf(),
         names,
         modified,
-        kind: Kind::Archive { zip_indices },
+        password: None,
+        kind: Kind::Archive { zip_indices, encrypted },
     })
 }
 

@@ -1,11 +1,13 @@
 //! Pilihan tema tampilan Roneyview.
 //!
-//! Empat tema yang bisa dipilih pengguna lewat menu Berkas > Tema:
-//! "Dark Navy", "Neon", "Mono", dan "Aqua".
+//! Bagian bertanda THEME-STUDIO digenerate oleh tool `theme-studio`
+//! (src/bin/theme-studio). Jangan edit manual — edit lewat tool tersebut.
+//! Bagian lain (panel_heading, draw_theme_preview) adalah kode tulis tangan.
 
 use eframe::egui::{Color32, Visuals};
 use serde::{Deserialize, Serialize};
 
+// ===== THEME-STUDIO BEGIN theme_enum =====
 /// Tema tampilan yang tersedia.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Theme {
@@ -19,7 +21,9 @@ pub enum Theme {
     /// Terang kebiruan gaya macOS dengan aksen biru.
     Aqua,
 }
+// ===== THEME-STUDIO END theme_enum =====
 
+// ===== THEME-STUDIO BEGIN theme_impl =====
 impl Theme {
     /// Nama tampilan tema (dipakai di menu & pengaturan, tidak diterjemahkan).
     pub fn name(self) -> &'static str {
@@ -55,8 +59,20 @@ impl Theme {
             Theme::Aqua => Color32::from_rgb(10, 132, 255),
         }
     }
-}
 
+    /// Warna ikon toolbar: gelap di tema terang, terang di tema gelap.
+    pub fn toolbar_icon(self) -> Color32 {
+        match self {
+            Theme::DarkNavy => Color32::from_rgb(225, 232, 245),
+            Theme::Neon => Color32::from_rgb(225, 232, 245),
+            Theme::Mono => Color32::from_rgb(35, 35, 35),
+            Theme::Aqua => Color32::from_rgb(35, 35, 35),
+        }
+    }
+}
+// ===== THEME-STUDIO END theme_impl =====
+
+// ===== THEME-STUDIO BEGIN theme_visuals =====
 /// Bangun `egui::Visuals` untuk tema yang diminta.
 pub fn theme_visuals(theme: Theme) -> Visuals {
     match theme {
@@ -66,14 +82,14 @@ pub fn theme_visuals(theme: Theme) -> Visuals {
             v.window_fill = Color32::from_rgb(10, 20, 40);
             v.extreme_bg_color = Color32::from_rgb(6, 13, 29);
             v.selection.bg_fill = Color32::from_rgb(30, 77, 158);
-            v.selection.stroke = eframe::egui::Stroke::new(1.0_f32, Color32::from_rgb(77, 159, 255));
+            v.selection.stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(77, 159, 255));
             v.widgets.hovered.bg_fill = Color32::from_rgb(20, 41, 77);
             v.widgets.active.bg_fill = Color32::from_rgb(30, 77, 158);
-            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
+            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
             v.window_corner_radius = 8.0.into();
-            for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-                w.corner_radius = 9.0.into();
-            }
+            v.widgets.inactive.corner_radius = 9.0.into();
+            v.widgets.hovered.corner_radius = 9.0.into();
+            v.widgets.active.corner_radius = 9.0.into();
             v
         }
         Theme::Neon => {
@@ -81,56 +97,55 @@ pub fn theme_visuals(theme: Theme) -> Visuals {
             v.panel_fill = Color32::from_rgb(8, 13, 10);
             v.window_fill = Color32::from_rgb(6, 10, 8);
             v.extreme_bg_color = Color32::from_rgb(4, 7, 5);
-            // Seleksi: hijau gelap + teks neon (bukan neon menyilaukan full).
             v.selection.bg_fill = Color32::from_rgb(16, 46, 30);
-            v.selection.stroke = eframe::egui::Stroke::new(1.5_f32, Color32::from_rgb(0, 255, 157));
+            v.selection.stroke = eframe::egui::Stroke::new(1.5, Color32::from_rgb(0, 255, 157));
             v.widgets.hovered.bg_fill = Color32::from_rgb(15, 31, 22);
-            v.widgets.hovered.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::from_rgb(0, 255, 157));
+            v.widgets.hovered.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(0, 255, 157));
             v.widgets.active.bg_fill = Color32::from_rgb(20, 55, 35);
-            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::from_rgb(0, 255, 157));
+            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(0, 255, 157));
             v.window_corner_radius = 8.0.into();
-            for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-                w.corner_radius = 8.0.into();
-            }
+            v.widgets.inactive.corner_radius = 8.0.into();
+            v.widgets.hovered.corner_radius = 8.0.into();
+            v.widgets.active.corner_radius = 8.0.into();
             v
         }
         Theme::Mono => {
             let mut v = Visuals::light();
-            v.panel_fill = Color32::WHITE;
+            v.panel_fill = Color32::from_rgb(255, 255, 255);
             v.window_fill = Color32::from_rgb(250, 250, 250);
             v.extreme_bg_color = Color32::from_rgb(240, 240, 240);
             v.selection.bg_fill = Color32::from_rgb(17, 17, 17);
-            v.selection.stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
+            v.selection.stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
             v.widgets.hovered.bg_fill = Color32::from_rgb(235, 235, 235);
             v.widgets.active.bg_fill = Color32::from_rgb(17, 17, 17);
-            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
+            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
             v.window_corner_radius = 2.0.into();
-            for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-                w.corner_radius = 2.0.into();
-            }
+            v.widgets.inactive.corner_radius = 2.0.into();
+            v.widgets.hovered.corner_radius = 2.0.into();
+            v.widgets.active.corner_radius = 2.0.into();
             v
         }
         Theme::Aqua => {
             let mut v = Visuals::light();
-            // Kontras dinaikkan: panel putih bersih vs background biru yang
-            // lebih pekat, agar elemen tidak pudar menyatu.
-            v.panel_fill = Color32::WHITE;
+            v.panel_fill = Color32::from_rgb(255, 255, 255);
             v.window_fill = Color32::from_rgb(240, 242, 246);
             v.extreme_bg_color = Color32::from_rgb(206, 219, 240);
             v.selection.bg_fill = Color32::from_rgb(10, 132, 255);
-            v.selection.stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
+            v.selection.stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
             v.widgets.hovered.bg_fill = Color32::from_rgb(230, 235, 242);
             v.widgets.active.bg_fill = Color32::from_rgb(10, 132, 255);
-            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0_f32, Color32::WHITE);
+            v.widgets.active.fg_stroke = eframe::egui::Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
             v.window_corner_radius = 10.0.into();
-            for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-                w.corner_radius = 10.0.into();
-            }
+            v.widgets.inactive.corner_radius = 10.0.into();
+            v.widgets.hovered.corner_radius = 10.0.into();
+            v.widgets.active.corner_radius = 10.0.into();
             v
         }
     }
 }
+// ===== THEME-STUDIO END theme_visuals =====
 
+// ===== THEME-STUDIO BEGIN apply_theme =====
 /// Terapkan tema ke context: visuals + ukuran font + padding tombol.
 ///
 /// Ukuran font dibesarkan dari default egui agar sesuai prototype
@@ -144,13 +159,12 @@ pub fn apply_theme(ctx: &eframe::egui::Context, theme: Theme) {
     ctx.set_visuals(theme_visuals(theme));
     ctx.all_styles_mut(|s| {
         use eframe::egui::{FontId, TextStyle};
-        // Font lebih besar dari default egui.
         // Tema Neon memakai monospace untuk seluruh UI (sesuai prototype F2-Neon).
         // Font monospace bawaan egui adalah Hack; tidak ada font tambahan
         // yang dibundel dan tidak ada perubahan ukuran biner.
-        let neon = matches!(theme, Theme::Neon);
+        let mono_all = matches!(theme, Theme::Neon);
         let font = |size: f32| {
-            if neon {
+            if mono_all {
                 FontId::monospace(size)
             } else {
                 FontId::proportional(size)
@@ -167,6 +181,7 @@ pub fn apply_theme(ctx: &eframe::egui::Context, theme: Theme) {
         s.spacing.menu_margin = eframe::egui::Margin::same(8);
     });
 }
+// ===== THEME-STUDIO END apply_theme =====
 
 /// Heading kecil untuk panel perkakas/pengaturan, gaya per-tema mengikuti prototype.
 ///
@@ -204,6 +219,11 @@ pub fn panel_heading(ui: &mut eframe::egui::Ui, theme: Theme, text: &str) {
             let painter = ui.painter();
             painter.galley(rect.min, galley.clone(), color);
             painter.galley(rect.min + vec2(0.75, 0.0), galley, color);
+        }
+        // Tema kustom (dari theme-studio): gaya netral mengikuti basis gelap/terang.
+        _ => {
+            let color = ui.visuals().text_color().gamma_multiply(0.6);
+            ui.label(RichText::new(upper).size(11.0).color(color));
         }
     }
 }

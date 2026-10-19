@@ -16,7 +16,7 @@ use eframe::egui::{
 use eframe::glow::HasContext;
 use image::{ImageDecoder, RgbaImage};
 
-use crate::edit::{self, ToneParams};
+use crate::edit::{self, BasicToneParams, ToneParams};
 
 use crate::dialogs::{self, Modal, ModalResult, PropsDialog, WallpaperDialog};
 use crate::fileinfo::{self, PageFacts};
@@ -208,6 +208,7 @@ enum SettingsTab {
     Theme,
     Language,
     Folders,
+    View,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -239,6 +240,10 @@ enum Action {
     FramePrev,
     FrameNext,
     ToggleToolbar,
+    ToggleStrip,
+    CopyImage,
+    BatchConvert,
+    ToggleSlideshow,
     Help,
     About,
     Settings,
@@ -325,12 +330,23 @@ struct EditSession {
     pick_hover: Option<(u32, u32)>,
     /// Tone mapping: parameter + pratinjau + buffer HDR linier (bila sumber .hdr).
     tone: ToneParams,
+    tone_basic: BasicToneParams,
+    /// true = mode Lanjutan (HDR), false = mode Dasar (brightness/contrast/saturation).
+    tone_advanced: bool,
     tone_float: Option<Vec<f32>>,
     tone_preview: Option<RgbaImage>,
     /// Sumber kecil yang di-cache untuk pratinjau cepat saat slider digeser.
     /// Dibangun sekali dari buffer; dibuang saat buffer berubah.
     tone_draft_src: Option<RgbaImage>,
     tone_draft_float: Option<(Vec<f32>, u32, u32)>,
+    /// Rotate bebas: sudut derajat (-180..180).
+    rotate_angle: f32,
+    /// Tone: mode banding (split before/after).
+    tone_compare: bool,
+    /// Posisi garis split (0.0-1.0).
+    tone_split: f32,
+    /// Cache gambar split-view (dibangun saat dibutuhkan).
+    tone_compare_img: Option<RgbaImage>,
     /// Ada perubahan yang belum disimpan.
     dirty: bool,
 }
@@ -355,17 +371,51 @@ impl EditSession {
             pick: None,
             pick_hover: None,
             tone: ToneParams::default(),
+            tone_basic: BasicToneParams::default(),
+            tone_advanced: false,
             tone_float: float,
             tone_preview: None,
             tone_draft_src: None,
             tone_draft_float: None,
+            rotate_angle: 0.0,
+            tone_compare: false,
+            tone_split: 0.5,
+            tone_compare_img: None,
             dirty: false,
         }
     }
 
     /// Gambar yang ditampilkan di tampilan edit: pratinjau tone bila ada.
-    fn display_image(&self) -> &RgbaImage {
-        self.tone_preview.as_ref().unwrap_or(&self.buffer)
+    /// Bila mode banding aktif, kembalikan gambar split (kiri=asli, kanan=tone).
+    fn display_image(&mut self) -> &RgbaImage {
+        if self.tone_compare {
+            if self.tone_compare_img.is_none() {
+                let preview = self.tone_preview.as_ref().unwrap_or(&self.buffer);
+                let (w, h) = (self.buffer.width(), self.buffer.height());
+                let split_x = (w as f32 * self.tone_split) as u32;
+                let mut img = RgbaImage::new(w, h);
+                for y in 0..h {
+                    for x in 0..w {
+                        let px = if x < split_x {
+                            self.buffer.get_pixel(x, y)
+                        } else {
+                            // Preview mungkin beda ukuran (draft kecil); pakai buffer bila begitu.
+                            if preview.width() == w && preview.height() == h {
+                                preview.get_pixel(x, y)
+                            } else {
+                                self.buffer.get_pixel(x, y)
+                            }
+                        };
+                        img.put_pixel(x, y, *px);
+                    }
+                }
+                self.tone_compare_img = Some(img);
+            }
+            self.tone_compare_img.as_ref().unwrap()
+        } else {
+            self.tone_compare_img = None;
+            self.tone_preview.as_ref().unwrap_or(&self.buffer)
+        }
     }
 }
 
@@ -384,6 +434,9 @@ enum EditPanelAction {
     RotateCw,
     RotateCcw,
     Rotate180,
+    RotateFree(f32),
+    FlipH,
+    FlipV,
     ApplyTone,
     ResetTone,
     ResetAll,
@@ -466,6 +519,29 @@ pub struct RoneyApp {
     modal: Option<Modal>,
     props: Option<PropsDialog>,
     wallpaper: Option<WallpaperDialog>,
+    /// Dialog input password arsip terenkripsi (aktif saat arsip butuh password).
+    pw_dialog: bool,
+    pw_input: String,
+    pw_error: Option<String>,
+    /// Listing arsip terenkripsi yang menunggu password.
+    pending_listing: Option<(crate::source::Listing, Option<usize>)>,
+    /// Dialog batch convert/resize.
+    batch_open: bool,
+    batch_width: u32,
+    batch_height: u32,
+    batch_pct: u32,
+    batch_by_pct: bool,
+    batch_format: usize, // 0=JPEG, 1=PNG, 2=WebP
+    batch_quality: u8,
+    batch_output: String,
+    batch_progress: Option<(usize, usize)>, // (selesai, total)
+    batch_done_msg: Option<String>,
+    /// True bila dialog folder untuk batch sedang dibuka.
+    batch_picking_folder: bool,
+    /// Konfirmasi timpa: None = belum ditanya, Some(true) = timpa semua, Some(false) = lewati yang ada.
+    batch_overwrite: Option<bool>,
+    /// File yang dipilih untuk batch (indeks). Kosong = semua.
+    batch_selected: Vec<usize>,
     /// Pesan dari thread latar belakang (mis. gagal membuka folder).
     note_tx: Sender<String>,
     note_rx: Receiver<String>,
@@ -507,6 +583,11 @@ pub struct RoneyApp {
     anim_frame: usize,
     anim_next: Instant,
     anim_playing: bool,
+    /// Slideshow otomatis: maju ke gambar berikut tiap interval.
+    slideshow: bool,
+    slideshow_next: Instant,
+    /// True bila pointer sedang di atas area gambar (slideshow dijeda sementara).
+    slideshow_hover_pause: bool,
 
     fullscreen: bool,
     show_help: bool,
@@ -536,6 +617,16 @@ pub struct RoneyApp {
     print_page: usize,
     print_thumbs: HashMap<usize, TextureHandle>,
     print_status: String,
+    /// Cache thumbnail kecil (96px) untuk strip, di-decode di thread latar.
+    thumb_cache: HashMap<usize, TextureHandle>,
+    /// Indeks yang sedang di-decode di thread latar (jangan kirim duplikat).
+    thumb_pending: std::collections::HashSet<usize>,
+    /// Indeks terakhir yang di-follow strip; bila berubah, scroll ke thumbnail aktif.
+    strip_last_index: usize,
+    /// Channel ke worker thumbnail: kirim (indeks, bytes file).
+    thumb_job_tx: Option<Sender<(usize, Vec<u8>)>>,
+    /// Channel hasil dari worker: terima (indeks, thumbnail 96px atau None bila gagal).
+    thumb_res_rx: Option<Receiver<(usize, Option<image::RgbaImage>)>>,
     /// Pekerjaan bangun PDF di thread latar (channel hasil + tujuan).
     print_job: Option<(Receiver<Result<Vec<u8>, String>>, PdfJobKind)>,
     /// Proyektor (jendela kedua).
@@ -612,6 +703,13 @@ impl RoneyApp {
         let rtl = store.state.rtl;
         let cover_alone = store.state.cover_alone;
         let low_memory_mode = store.state.low_memory;
+        let batch_width = store.state.batch_width;
+        let batch_height = store.state.batch_height;
+        let batch_pct = store.state.batch_pct;
+        let batch_by_pct = store.state.batch_by_pct;
+        let batch_format = store.state.batch_format;
+        let batch_quality = store.state.batch_quality;
+        let batch_output = store.state.batch_output.clone();
 
         let mut app = RoneyApp {
             store,
@@ -638,6 +736,23 @@ impl RoneyApp {
             ctx_target: 0,
             modal: None,
             props: None,
+            pw_dialog: false,
+            pw_input: String::new(),
+            pw_error: None,
+            pending_listing: None,
+            batch_open: false,
+            batch_width,
+            batch_height,
+            batch_pct,
+            batch_by_pct,
+            batch_format,
+            batch_quality,
+            batch_output,
+            batch_progress: None,
+            batch_done_msg: None,
+            batch_picking_folder: false,
+            batch_overwrite: None,
+            batch_selected: Vec::new(),
             wallpaper: None,
             note_tx,
             note_rx,
@@ -672,6 +787,9 @@ impl RoneyApp {
             anim_frame: 0,
             anim_next: Instant::now(),
             anim_playing: true,
+            slideshow: false,
+            slideshow_next: Instant::now(),
+            slideshow_hover_pause: false,
             fullscreen: false,
             show_help: false,
             about_open: false,
@@ -693,6 +811,11 @@ impl RoneyApp {
             print_page: 0,
             print_thumbs: HashMap::new(),
             print_status: String::new(),
+            thumb_cache: HashMap::new(),
+            thumb_pending: std::collections::HashSet::new(),
+            strip_last_index: usize::MAX,
+            thumb_job_tx: None,
+            thumb_res_rx: None,
             print_job: None,
             projector_open: false,
             projector_tex: None,
@@ -727,6 +850,15 @@ impl RoneyApp {
                 return;
             }
         };
+        // Arsip terenkripsi: minta password dulu.
+        if listing.is_encrypted() && listing.password.is_none() {
+            self.pw_dialog = true;
+            self.pw_input.clear();
+            self.pw_error = None;
+            // Simpan listing sementara agar bisa dipasang setelah password benar.
+            self.pending_listing = Some((listing, start));
+            return;
+        }
         self.install_listing(ctx, listing, start);
     }
 
@@ -759,6 +891,9 @@ impl RoneyApp {
         self.index = index;
         self.dir = 1;
         self.cache.clear();
+        self.thumb_cache.clear();
+        self.thumb_pending.clear();
+        self.strip_last_index = usize::MAX;
         self.pending.clear();
         self.errors.clear();
         self.dims.clear();
@@ -876,6 +1011,14 @@ impl RoneyApp {
         #[cfg(feature = "dialogs")]
         while let Ok(result) = self.dialog_rx.try_recv() {
             self.dialog_busy = false;
+            // Hasil picker folder untuk batch convert.
+            if self.batch_picking_folder {
+                self.batch_picking_folder = false;
+                if let Some(p) = result {
+                    self.batch_output = p.to_string_lossy().into_owned();
+                }
+                continue;
+            }
             match self.dialog_kind.take() {
                 Some(DialogKind::SaveImage { index, .. }) => {
                     if let Some(p) = result {
@@ -1209,10 +1352,71 @@ impl RoneyApp {
                         action = Some(EditPanelAction::Rotate180);
                     }
                 });
+                ui.horizontal(|ui| {
+                    if ui.button(tr(lang, "edit_flip_h")).clicked() {
+                        action = Some(EditPanelAction::FlipH);
+                    }
+                    if ui.button(tr(lang, "edit_flip_v")).clicked() {
+                        action = Some(EditPanelAction::FlipV);
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(tr(lang, "edit_rotate_free"));
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "edit_rotate_angle"));
+                    let mut angle = e.rotate_angle;
+                    ui.spacing_mut().slider_width = 80.0;
+                    if ui.add(egui::Slider::new(&mut angle, -180.0..=180.0).suffix("°")).changed() {
+                        e.rotate_angle = angle;
+                    }
+                });
+                if ui.button(tr(lang, "edit_rotate_apply")).clicked() {
+                    action = Some(EditPanelAction::RotateFree(e.rotate_angle));
+                    e.rotate_angle = 0.0;
+                }
             }
             EditTool::Tone => {
                 // Panel sempit (280px): kecilkan slider agar label tidak kepotong.
                 ui.spacing_mut().slider_width = 110.0;
+                // Switch mode: Dasar (sederhana) vs Lanjutan (HDR tone mapping).
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut e.tone_advanced, false, tr(lang, "edit_tone_basic"));
+                    ui.radio_value(&mut e.tone_advanced, true, tr(lang, "edit_tone_advanced"));
+                });
+                // Toggle banding before/after.
+                ui.horizontal(|ui| {
+                    let mut cmp = e.tone_compare;
+                    if ui.checkbox(&mut cmp, tr(lang, "edit_tone_compare")).changed() {
+                        e.tone_compare = cmp;
+                        e.tone_compare_img = None;
+                        self.edit_tex_dirty = true;
+                    }
+                    if e.tone_compare {
+                        let mut split = e.tone_split;
+                        if ui.add(egui::Slider::new(&mut split, 0.0..=1.0).show_value(false)).changed() {
+                            e.tone_split = split;
+                            e.tone_compare_img = None;
+                            self.edit_tex_dirty = true;
+                        }
+                    }
+                });
+                if !e.tone_advanced {
+                    // ---- Mode Dasar: brightness / contrast / saturation ----
+                    ui.label(tr(lang, "edit_tone_basic_hint"));
+                    tone_changed |= ui
+                        .add(egui::Slider::new(&mut e.tone_basic.brightness, -1.0..=1.0).text(tr(lang, "edit_tone_brightness")).step_by(0.05).max_decimals(2))
+                        .changed();
+                    tone_changed |= ui
+                        .add(egui::Slider::new(&mut e.tone_basic.contrast, 0.0..=2.0).text(tr(lang, "edit_tone_contrast")).step_by(0.05).max_decimals(2))
+                        .changed();
+                    tone_changed |= ui
+                        .add(egui::Slider::new(&mut e.tone_basic.saturation, 0.0..=2.0).text(tr(lang, "edit_tone_saturation")).step_by(0.05).max_decimals(2))
+                        .changed();
+                    let clamp2 = |v: f32, lo: f32, hi: f32| ((v * 100.0).round() / 100.0).clamp(lo, hi);
+                    e.tone_basic.brightness = clamp2(e.tone_basic.brightness, -1.0, 1.0);
+                    e.tone_basic.contrast = clamp2(e.tone_basic.contrast, 0.0, 2.0);
+                    e.tone_basic.saturation = clamp2(e.tone_basic.saturation, 0.0, 2.0);
+                } else {
                 ui.label(tr(lang, "edit_tone_hint"));
                 if e.tone_float.is_some() {
                     ui.colored_label(Color32::from_rgb(140, 220, 160), tr(lang, "edit_tone_hdr_note"));
@@ -1236,6 +1440,7 @@ impl RoneyApp {
                 e.tone.reference_white = clamp2(e.tone.reference_white, 0.5, 2.0);
                 e.tone.highlight = clamp2(e.tone.highlight, 0.0, 1.0);
                 e.tone.saturation = clamp2(e.tone.saturation, 0.0, 2.0);
+                } // end mode Lanjutan
                 ui.horizontal(|ui| {
                     if ui.button(tr(lang, "edit_apply_tone")).clicked() {
                         action = Some(EditPanelAction::ApplyTone);
@@ -1280,11 +1485,16 @@ impl RoneyApp {
                 self.rotate_edit_buffer(true);
                 self.rotate_edit_buffer(true);
             }
+            EditPanelAction::RotateFree(angle) => self.rotate_free(angle),
+            EditPanelAction::FlipH => self.flip_edit_buffer(true),
+            EditPanelAction::FlipV => self.flip_edit_buffer(false),
             EditPanelAction::ApplyTone => self.apply_tone(),
             EditPanelAction::ResetTone => {
                 if let Some(e) = &mut self.edit {
                     e.tone = ToneParams::default();
+                    e.tone_basic = BasicToneParams::default();
                     e.tone_preview = None;
+                    e.tone_compare_img = None;
                 }
                 self.edit_tex_dirty = true;
             }
@@ -1294,6 +1504,7 @@ impl RoneyApp {
                     e.crop_rect = None;
                     e.tone = ToneParams::default();
                     e.tone_preview = None;
+                    e.tone_compare_img = None;
                     e.tone_draft_src = None;
                     e.tone_draft_float = None;
                     e.dirty = false;
@@ -1331,7 +1542,7 @@ impl RoneyApp {
         }
         if self.edit_tex_dirty {
             self.edit_tex_dirty = false;
-            if let Some(e) = &self.edit {
+            if let Some(e) = &mut self.edit {
                 let img = e.display_image();
                 let ci = ColorImage::from_rgba_unmultiplied(
                     [img.width() as usize, img.height() as usize],
@@ -1344,14 +1555,14 @@ impl RoneyApp {
         // Tangkap area panel pusat SEBELUM layout horizontal: available_height()
         // di dalam layout horizontal hanya mengembalikan tinggi satu baris.
         let avail = ui.available_rect_before_wrap();
-        let img_size = vec2((avail.width() - 292.0).max(120.0), avail.height());
+        let img_size = vec2((avail.width() - self.store.state.panel_width - 12.0).max(120.0), avail.height());
         ui.horizontal(|ui| {
             let (img_rect, img_resp) =
                 ui.allocate_exact_size(img_size, Sense::click_and_drag());
             let painter = ui.painter_at(img_rect);
             painter.rect_filled(img_rect, 0.0, self.theme_bg());
             let tool = self.edit.as_ref().map(|e| e.tool);
-            if let (Some(e), Some(tex)) = (&self.edit, &self.edit_tex) {
+            if let (Some(e), Some(tex)) = (&mut self.edit, &self.edit_tex) {
                 let img = e.display_image();
                 let scale = fit_scale(
                     FitMode::Fit,
@@ -1370,8 +1581,20 @@ impl RoneyApp {
                 }
             }
             ui.separator();
+            // Handle drag untuk resize panel.
+            let (sep_rect, sep_resp) = ui.allocate_exact_size(egui::vec2(6.0, avail.height()), egui::Sense::drag());
+            if sep_resp.dragged() {
+                let delta = sep_resp.drag_delta().x;
+                // Geser kiri = panel lebih lebar (nilai negatif).
+                self.store.state.panel_width = (self.store.state.panel_width - delta).clamp(200.0, 500.0);
+                self.store_dirty = true;
+            }
+            // Kursor resize saat hover.
+            if sep_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
             ui.vertical(|ui| {
-                ui.set_width(280.0);
+                ui.set_width(self.store.state.panel_width);
                 let (a, tone_changed) = self.draw_edit_panel(ctx, ui);
                 action = a;
                 if tone_changed {
@@ -1677,6 +1900,9 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         };
         match Self::decode_edit_source(&bytes) {
             Ok((buffer, float)) => {
+                // Mode eksklusif: tutup print & projector saat mulai edit.
+                self.print_open = false;
+                self.projector_open = false;
                 self.edit = Some(EditSession::new(name, buffer, float, tool));
                 self.edit_tex = None;
                 self.edit_tex_dirty = true;
@@ -1691,6 +1917,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             e.tool = tool;
             if tool != EditTool::Tone {
                 e.tone_preview = None;
+                    e.tone_compare_img = None;
             }
         }
     }
@@ -1716,6 +1943,42 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         self.edit_tex_dirty = true;
     }
 
+    /// Balik gambar horizontal (kiri-kanan) atau vertikal (atas-bawah).
+    fn flip_edit_buffer(&mut self, horizontal: bool) {
+        if self.edit.is_none() {
+            self.start_edit(EditTool::Rotate);
+        }
+        self.switch_edit_tool(EditTool::Rotate);
+        if let Some(e) = &mut self.edit {
+            e.buffer = if horizontal {
+                image::imageops::flip_horizontal(&e.buffer)
+            } else {
+                image::imageops::flip_vertical(&e.buffer)
+            };
+            e.crop_rect = None;
+            e.tone_draft_src = None;
+            e.tone_draft_float = None;
+            e.dirty = true;
+        }
+        self.edit_tex_dirty = true;
+    }
+
+    /// Putar gambar dengan sudut bebas (derajat). Menggunakan interpolasi bilinear.
+    fn rotate_free(&mut self, angle_deg: f32) {
+        if self.edit.is_none() {
+            self.start_edit(EditTool::Rotate);
+        }
+        self.switch_edit_tool(EditTool::Rotate);
+        if let Some(e) = &mut self.edit {
+            e.buffer = crate::edit::rotate_arbitrary(&e.buffer, angle_deg);
+            e.crop_rect = None;
+            e.tone_draft_src = None;
+            e.tone_draft_float = None;
+            e.dirty = true;
+        }
+        self.edit_tex_dirty = true;
+    }
+
     /// Tutup sesi edit, membuang perubahan yang belum disimpan.
     fn close_edit(&mut self) {
         self.edit = None;
@@ -1725,7 +1988,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     /// Simpan buffer edit saat ini sebagai PNG (dialog "Simpan").
     fn save_edit_buffer(&mut self, dest: &Path) {
         let lang = self.lang;
-        let Some(e) = &self.edit else {
+        let Some(e) = &mut self.edit else {
             return;
         };
         let img = e.display_image().clone();
@@ -1781,6 +2044,13 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         let Some(e) = &mut self.edit else {
             return;
         };
+        if !e.tone_advanced {
+            // Mode Dasar: brightness/contrast/saturation sederhana.
+            let p = e.tone_basic;
+            let src = e.buffer.clone();
+            e.buffer = edit::apply_basic_tone(&src, &p);
+            e.tone_basic = BasicToneParams::default();
+        } else {
         let p = e.tone;
         if let Some(float) = e.tone_float.take() {
             let (w, h) = (e.buffer.width(), e.buffer.height());
@@ -1789,10 +2059,12 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             let src = e.buffer.clone();
             e.buffer = edit::tone_map_srgb(&src, &p);
         }
+        e.tone = ToneParams::default();
+        }
         e.tone_preview = None;
+                    e.tone_compare_img = None;
         e.tone_draft_src = None;
         e.tone_draft_float = None;
-        e.tone = ToneParams::default();
         e.dirty = true;
         self.edit_tex_dirty = true;
     }
@@ -1818,6 +2090,43 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         }
     }
 
+    /// Salin gambar yang sedang ditampilkan ke clipboard (mode lihat).
+    fn copy_current_image(&mut self) {
+        let lang = self.lang;
+        let Some(listing) = self.listing.clone() else {
+            return;
+        };
+        let index = self.index;
+        let mut reader = match listing.open_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                self.notify(e);
+                return;
+            }
+        };
+        let bytes = match reader.read(index) {
+            Ok(b) => b,
+            Err(e) => {
+                self.notify(e);
+                return;
+            }
+        };
+        match Self::decode_edit_source(&bytes) {
+            Ok((img, _)) => {
+                let data = arboard::ImageData {
+                    width: img.width() as usize,
+                    height: img.height() as usize,
+                    bytes: std::borrow::Cow::Owned(img.into_raw()),
+                };
+                match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
+                    Ok(_) => self.notify(tr(lang, "edit_copied")),
+                    Err(e) => self.notify(format!("{}: {e}", tr(lang, "notify_save_failed"))),
+                }
+            }
+            Err(e) => self.notify(e),
+        }
+    }
+
     /// Perbarui pratinjau tone mapping: versi KECIL (cepat) untuk tampilan
     /// saat slider digeser. Sumber kecil di-cache (buffer tidak berubah saat
     /// slider digeser), jadi tiap tick cuma tone mapping ~0.6MP.
@@ -1826,6 +2135,18 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         let Some(e) = &mut self.edit else {
             return;
         };
+        if !e.tone_advanced {
+            // Mode Dasar: pratinjau langsung dari buffer (cepat, tanpa draft).
+            let p = e.tone_basic;
+            if e.tone_draft_src.is_none() {
+                e.tone_draft_src = Some(edit::shrink_rgba(&e.buffer, edit::TONE_PREVIEW_MAX_SIDE));
+            }
+            let src = e.tone_draft_src.as_ref().unwrap();
+            e.tone_preview = Some(edit::apply_basic_tone(src, &p));
+            e.tone_compare_img = None;
+            self.edit_tex_dirty = true;
+            return;
+        }
         let p = e.tone;
         if let Some(float) = &e.tone_float {
             if e.tone_draft_float.is_none() {
@@ -1834,12 +2155,14 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             }
             let (small, sw, sh) = e.tone_draft_float.as_ref().unwrap();
             e.tone_preview = Some(edit::tone_map_linear_buffer(small, *sw, *sh, &p));
+            e.tone_compare_img = None;
         } else {
             if e.tone_draft_src.is_none() {
                 e.tone_draft_src = Some(edit::shrink_rgba(&e.buffer, edit::TONE_PREVIEW_MAX_SIDE));
             }
             let src = e.tone_draft_src.as_ref().unwrap();
             e.tone_preview = Some(edit::tone_map_srgb(src, &p));
+            e.tone_compare_img = None;
         }
         self.edit_tex_dirty = true;
     }
@@ -1876,6 +2199,9 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     }
 
     fn open_print_window(&mut self) {
+        // Mode eksklusif: tutup edit & projector saat buka print.
+        self.close_edit();
+        self.projector_open = false;
         self.print_open = true;
         self.print_page = 0;
         self.print_status.clear();
@@ -2309,6 +2635,13 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                             )
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                             .show(|ui| {
+                                ui.set_min_width(240.0);
+                                ui.set_max_width(240.0);
+                                // Preview warna besar di atas agar jelas.
+                                let preview_size = egui::vec2(240.0, 28.0);
+                                let (pr, _) = ui.allocate_exact_size(preview_size, egui::Sense::hover());
+                                ui.painter().rect_filled(pr, 4.0, self.projector_pen_color);
+                                ui.add_space(6.0);
                                 egui::color_picker::color_picker_color32(
                                     ui,
                                     &mut self.projector_pen_color,
@@ -2678,6 +3011,8 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     }
 
     fn go_next(&mut self, ctx: &Context) {
+        // Navigasi manual menghentikan slideshow.
+        self.slideshow = false;
         let lang = self.lang;
         let n = self.count();
         if n == 0 {
@@ -2692,6 +3027,8 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     }
 
     fn go_prev(&mut self, ctx: &Context, land_bottom: bool) {
+        // Navigasi manual menghentikan slideshow.
+        self.slideshow = false;
         let lang = self.lang;
         let wide = |i: usize| self.is_wide(i);
         match prev_start_for(self.index, self.two_page_mode, self.cover_alone, &wide) {
@@ -3024,6 +3361,37 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 self.store.state.show_toolbar = !self.store.state.show_toolbar;
                 self.store_dirty = true;
             }
+            Action::ToggleStrip => {
+                self.store.state.show_strip = !self.store.state.show_strip;
+                self.store_dirty = true;
+                if self.store.state.show_strip {
+                    // Strip diaktifkan kembali: paksa decode ulang + scroll ke aktif.
+                    self.strip_last_index = usize::MAX;
+                } else {
+                    // Strip dimatikan: buang hasil decode thumbnail dari memori.
+                    self.thumb_cache.clear();
+                    self.thumb_pending.clear();
+                }
+            }
+            Action::CopyImage => self.copy_current_image(),
+            Action::ToggleSlideshow => {
+                self.slideshow = !self.slideshow;
+                if self.slideshow {
+                    self.slideshow_next = Instant::now() + Duration::from_secs(self.store.state.slideshow_secs);
+                }
+            }
+            Action::BatchConvert => {
+                self.batch_open = true;
+                self.batch_progress = None;
+                self.batch_done_msg = None;
+                // Default output: folder yang sama dengan "_converted".
+                if self.batch_output.is_empty() {
+                    if let Some(l) = &self.listing {
+                        let base = l.origin.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+                        self.batch_output = base.join("converted").to_string_lossy().into_owned();
+                    }
+                }
+            }
             Action::OpenRecent(i) => {
                 if let Some(p) = self.store.state.recent.get(i).cloned() {
                     self.open_path(ctx, Path::new(&p));
@@ -3095,6 +3463,10 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         let rtl = self.rtl;
         let goto_open = self.goto_open;
         let modal_open = self.modal.is_some();
+        let projector_open = self.projector_open;
+        // Shortcut single-key jangan aktif saat: user mengetik di text field,
+        // atau projector (window baru) sedang terbuka.
+        let typing = ctx.wants_keyboard_input();
         ctx.input_mut(|i| {
             let mut out = FrameInput {
                 zoom: 1.0,
@@ -3105,6 +3477,10 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             let shift = Modifiers::SHIFT;
             {
                 let mut take = |m: Modifiers, k: Key, a: Action, i: &mut egui::InputState| {
+                    // Single-key shortcut dimatikan saat mengetik atau projector buka.
+                    if m == Modifiers::NONE && (typing || projector_open) {
+                        return;
+                    }
                     if i.consume_key(m, k) {
                         out.actions.push(a);
                     }
@@ -3113,6 +3489,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 take(ctrl, Key::O, Action::OpenFile, i);
                 take(ctrl, Key::Q, Action::Quit, i);
                 take(ctrl, Key::Comma, Action::Settings, i);
+                take(ctrl, Key::C, Action::CopyImage, i);
                 take(ctrl, Key::G, Action::GoToPage, i);
                 take(shift, Key::R, Action::RotateCcw, i);
                 take(none, Key::R, Action::RotateCw, i);
@@ -3144,6 +3521,8 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 take(none, Key::K, Action::ToggleRtl, i);
                 take(none, Key::M, Action::ToggleLowMemory, i);
                 take(none, Key::T, Action::ToggleToolbar, i);
+                take(none, Key::V, Action::ToggleStrip, i);
+                take(none, Key::S, Action::ToggleSlideshow, i);
                 // Enter jangan dicaplok saat dialog "Lompat ke halaman" atau
                 // kotak konfirmasi/modal terbuka: Enter dipakai untuk konfirmasi di sana.
                 if !goto_open && !modal_open {
@@ -3241,6 +3620,8 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 }
                 item(ui, tr(lang, "ctx_extract"), "", acts, Action::ExtractPage);
                 item(ui, tr(lang, "modal_trash_title"), "Delete", acts, Action::Trash);
+                item(ui, tr(lang, "menu_copy_image"), "Ctrl+C", acts, Action::CopyImage);
+                item(ui, tr(lang, "menu_batch"), "", acts, Action::BatchConvert);
                 ui.separator();
                 item(ui, tr(lang, "menu_settings"), "Ctrl+,", acts, Action::Settings);
                 // Submenu Tema: pilihan tema + pratinjau mini tampilannya.
@@ -3317,6 +3698,12 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 if ui.add(toolbar).clicked() {
                     acts.push(Action::ToggleToolbar);
                 }
+                let strip = egui::Button::new(tr(lang, "view_strip"))
+                    .selected(self.store.state.show_strip)
+                    .shortcut_text("V");
+                if ui.add(strip).clicked() {
+                    acts.push(Action::ToggleStrip);
+                }
                 let saver = egui::Button::new(tr(lang, "view_lowmem"))
                     .selected(self.low_memory_mode)
                     .shortcut_text("M");
@@ -3366,71 +3753,109 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     /// Toolbar perkakas di bawah menu utama (ikon, tanpa label).
     fn draw_toolbar(&mut self, ctx: &Context, ui: &mut egui::Ui) {
         let lang = self.lang;
-        // Warna ikon toolbar mengikuti tema: gelap di tema terang, terang di tema gelap.
+        // Warna ikon toolbar mengikuti tema (diatur via theme-studio).
         let theme = self.store.state.theme;
-        let icon_color = match theme {
-            Theme::Mono | Theme::Aqua => Color32::from_rgb(35, 35, 35),
-            _ => Color32::from_rgb(225, 232, 245),
-        };
+        let icon_color = theme.toolbar_icon();
         let accent = theme.accent();
         let has_page = self.listing.is_some();
         let is_archive = self.listing.as_ref().is_some_and(|l| l.is_archive());
         let animated = self.page_for(self.index).is_some_and(|p| p.anim.is_some());
         let editing = self.edit.is_some();
         let edit_tool = self.edit.as_ref().map(|e| e.tool);
+        // Scroll horizontal bila tombol melebihi lebar layar.
+        egui::ScrollArea::horizontal().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
             // Grup edit (perlu berkas asli, bukan arsip).
             let edit_tip = if is_archive { tr(lang, "toolbar_archive_tip") } else { "" };
+            // ===== THEME-STUDIO BEGIN toolbar_buttons =====
+            // TS-BTN-BEGIN crop
             let crop_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_crop_tip") };
             if toolbar_labeled_button(ui, ToolIcon::Crop, "Crop", has_page && !is_archive, edit_tool == Some(EditTool::Crop), crop_tip, icon_color, accent) {
                 self.edit_tool_clicked(EditTool::Crop);
             }
+            // TS-BTN-END crop
+            // TS-BTN-BEGIN resize
             let resize_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_resize_tip") };
             if toolbar_labeled_button(ui, ToolIcon::Resize, "Resize", has_page && !is_archive, edit_tool == Some(EditTool::Resize), resize_tip, icon_color, accent) {
                 self.edit_tool_clicked(EditTool::Resize);
             }
+            // TS-BTN-END resize
+            // TS-BTN-BEGIN rotate_ccw
             let rotate_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_rotate_tip") };
             if toolbar_labeled_button(ui, ToolIcon::RotateCcw, "", has_page && !is_archive, false, rotate_tip, icon_color, accent) {
                 self.rotate_edit_buffer(false);
             }
+            // TS-BTN-END rotate_ccw
+            // TS-BTN-BEGIN rotate_cw
+            let rotate_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_rotate_tip") };
             if toolbar_labeled_button(ui, ToolIcon::RotateCw, "", has_page && !is_archive, false, rotate_tip, icon_color, accent) {
                 self.rotate_edit_buffer(true);
             }
+            // TS-BTN-END rotate_cw
+            // TS-BTN-BEGIN sep1
             ui.separator();
-            // Grup navigasi frame (animasi, termasuk di dalam arsip).
+            // TS-BTN-END sep1
+            // TS-BTN-BEGIN frame_prev
             if toolbar_labeled_button(ui, ToolIcon::FramePrev, "", animated && !editing, false, tr(lang, "toolbar_frame_prev_tip"), icon_color, accent) {
                 self.step_frame(ctx, -1);
             }
+            // TS-BTN-END frame_prev
+            // TS-BTN-BEGIN play_pause
             let play_icon = if self.anim_playing { ToolIcon::Pause } else { ToolIcon::Play };
             if toolbar_labeled_button(ui, play_icon, "", animated && !editing, false, tr(lang, "toolbar_anim_tip"), icon_color, accent) {
                 self.perform(ctx, Action::TogglePlay);
             }
+            // TS-BTN-END play_pause
+            // TS-BTN-BEGIN frame_next
             if toolbar_labeled_button(ui, ToolIcon::FrameNext, "", animated && !editing, false, tr(lang, "toolbar_frame_next_tip"), icon_color, accent) {
                 self.step_frame(ctx, 1);
             }
+            // TS-BTN-END frame_next
+            // TS-BTN-BEGIN sep2
             ui.separator();
-            // Grup ambil warna & tone (perlu berkas asli, bukan arsip).
+            // TS-BTN-END sep2
+            // TS-BTN-BEGIN picker
             let picker_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_picker_tip") };
             if toolbar_labeled_button(ui, ToolIcon::Picker, "Picker", has_page && !is_archive, edit_tool == Some(EditTool::Picker), picker_tip, icon_color, accent) {
                 self.edit_tool_clicked(EditTool::Picker);
             }
+            // TS-BTN-END picker
+            // TS-BTN-BEGIN tone
             let tone_tip = if is_archive { edit_tip } else { tr(lang, "toolbar_tone_tip") };
             if toolbar_labeled_button(ui, ToolIcon::Tone, "HDR", has_page && !is_archive, edit_tool == Some(EditTool::Tone), tone_tip, icon_color, accent) {
                 self.edit_tool_clicked(EditTool::Tone);
             }
+            // TS-BTN-END tone
+            // TS-BTN-BEGIN sep3
             ui.separator();
-            // Grup cetak & proyektor (boleh di arsip).
+            // TS-BTN-END sep3
+            // TS-BTN-BEGIN print
             if toolbar_labeled_button(ui, ToolIcon::Print, "Print", has_page, self.print_open, tr(lang, "toolbar_print_tip"), icon_color, accent) {
                 self.open_print_window();
             }
+            // TS-BTN-END print
+            // TS-BTN-BEGIN projector
             if toolbar_labeled_button(ui, ToolIcon::Projector, "Projector", has_page, self.projector_open, tr(lang, "toolbar_projector_tip"), icon_color, accent) {
                 self.projector_open = !self.projector_open;
                 if self.projector_open {
+                    // Mode eksklusif: tutup edit & print saat buka projector.
+                    self.close_edit();
+                    self.print_open = false;
                     self.projector_tex = None;
                     self.projector_key = None;
                 }
             }
+            // TS-BTN-END projector
+            // TS-BTN-BEGIN slideshow
+            if toolbar_labeled_button(ui, ToolIcon::Play, "Slide", has_page && !editing, self.slideshow, tr(lang, "toolbar_slideshow_tip"), icon_color, accent) {
+                self.slideshow = !self.slideshow;
+                if self.slideshow {
+                    self.slideshow_next = Instant::now() + Duration::from_secs(self.store.state.slideshow_secs);
+                }
+            }
+            // TS-BTN-END slideshow
+            // ===== THEME-STUDIO END toolbar_buttons =====
             // Tombol sembunyikan toolbar di kanan.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("✕").on_hover_text(tr(lang, "toolbar_hide_tip")).clicked() {
@@ -3438,6 +3863,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     self.store_dirty = true;
                 }
             });
+        });
         });
     }
 
@@ -3453,6 +3879,184 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         } else {
             self.start_edit(tool);
         }
+    }
+
+    /// Pastikan worker thumbnail berjalan; buat bila belum ada.
+    fn ensure_thumb_worker(&mut self) {
+        if self.thumb_job_tx.is_some() {
+            return;
+        }
+        let (job_tx, job_rx) = mpsc::channel::<(usize, Vec<u8>)>();
+        let (res_tx, res_rx) = mpsc::channel::<(usize, Option<image::RgbaImage>)>();
+        std::thread::Builder::new()
+            .name("roneyview-thumb".into())
+            .spawn(move || {
+                for (idx, bytes) in job_rx {
+                    // Decode kecil saja (maks 96px) — jauh lebih cepat dari full.
+                    let thumb = image::load_from_memory(&bytes)
+                        .ok()
+                        .map(|d| d.thumbnail(96, 96).to_rgba8());
+                    let _ = res_tx.send((idx, thumb));
+                }
+            })
+            .ok();
+        self.thumb_job_tx = Some(job_tx);
+        self.thumb_res_rx = Some(res_rx);
+    }
+
+    /// Ambil hasil decode thumbnail dari worker, buat texture-nya.
+    fn poll_thumb_results(&mut self, ctx: &egui::Context) {
+        let mut done = Vec::new();
+        if let Some(rx) = &self.thumb_res_rx {
+            while let Ok((idx, thumb)) = rx.try_recv() {
+                done.push((idx, thumb));
+                if done.len() >= 12 {
+                    break;
+                }
+            }
+        }
+        let has_results = !done.is_empty();
+        for (idx, thumb) in done {
+            self.thumb_pending.remove(&idx);
+            if let Some(img) = thumb {
+                let (w, h) = (img.width() as usize, img.height() as usize);
+                let pixels = img.into_raw();
+                let tex = ctx.load_texture(
+                    format!("thumb{idx}"),
+                    egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.thumb_cache.insert(idx, tex);
+            }
+        }
+        // Batasi cache: buang yang terjauh dari indeks aktif bila > 240.
+        if self.thumb_cache.len() > 240 {
+            let cur = self.index;
+            let mut keys: Vec<usize> = self.thumb_cache.keys().copied().collect();
+            keys.sort_by_key(|&i| i.abs_diff(cur));
+            for &k in keys.iter().skip(200) {
+                self.thumb_cache.remove(&k);
+            }
+        }
+        if has_results {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Strip thumbnail di bawah area gambar: navigasi cepat antar gambar.
+    /// Memakai texture dari cache bila ada; placeholder bila belum di-decode.
+    /// Antrekan prefetch thumbnail: baca beberapa file terdekat yang belum di-cache,
+    /// kirim bytes-nya ke worker thread untuk di-decode kecil.
+    fn prefetch_thumbs(&mut self, ctx: &egui::Context, lo: usize, hi: usize) {
+        self.ensure_thumb_worker();
+        let tx = match &self.thumb_job_tx {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+        let Some(listing) = &self.listing else { return };
+        // Prioritaskan yang terdekat dari gambar aktif.
+        let cur = self.index;
+        let mut candidates: Vec<usize> = (lo..=hi)
+            .filter(|&i| !self.thumb_cache.contains_key(&i) && !self.thumb_pending.contains(&i))
+            .collect();
+        candidates.sort_by_key(|&i| i.abs_diff(cur));
+        // Batasi 4 per frame agar I/O tidak menumpuk.
+        let candidates: Vec<usize> = candidates.into_iter().take(4).collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let mut reader = match listing.open_reader() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut queued = 0;
+        for i in candidates {
+            match reader.read(i) {
+                Ok(bytes) => {
+                    self.thumb_pending.insert(i);
+                    let _ = tx.send((i, bytes));
+                    queued += 1;
+                }
+                Err(_) => {}
+            }
+        }
+        // Minta repaint agar prefetch lanjut di frame berikutnya.
+        if queued > 0 {
+            ctx.request_repaint();
+        }
+    }
+
+    fn draw_strip(&mut self, ui: &mut egui::Ui) {
+        let count = self.count();
+        if count == 0 {
+            return;
+        }
+        let cur = self.index;
+        // Tampilkan window ±30 di sekitar gambar aktif agar strip tidak terlalu panjang.
+        let lo = cur.saturating_sub(30);
+        let hi = (cur + 30).min(count.saturating_sub(1));
+        // Prefetch thumbnail kecil di background + ambil hasilnya.
+        let ctx = ui.ctx().clone();
+        self.poll_thumb_results(&ctx);
+        self.prefetch_thumbs(&ctx, lo, hi);
+        // Bila indeks berubah (navigasi next/prev), scroll agar thumbnail aktif terlihat.
+        let follow = self.strip_last_index != cur;
+        self.strip_last_index = cur;
+        egui::ScrollArea::horizontal().max_height(76.0).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for i in lo..=hi {
+                    let is_cur = i == cur;
+                    let thumb_size = egui::vec2(64.0, 64.0);
+                    let (rect, resp) = ui.allocate_exact_size(thumb_size, egui::Sense::click());
+                    // Scroll ke thumbnail aktif bila baru navigasi.
+                    if is_cur && follow {
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
+                    // Background: highlight bila aktif.
+                    let bg = if is_cur {
+                        self.store.state.theme.accent()
+                    } else {
+                        ui.visuals().extreme_bg_color
+                    };
+                    ui.painter().rect_filled(rect, 4.0, bg);
+                    // Gambar thumbnail kecil dari thumb_cache bila ada.
+                    if let Some(tex) = self.thumb_cache.get(&i) {
+                        let tsize = tex.size_vec2();
+                        let scale = (rect.width() / tsize.x).min(rect.height() / tsize.y);
+                        let size = egui::vec2(tsize.x * scale, tsize.y * scale);
+                        let r = egui::Rect::from_center_size(rect.center(), size);
+                        ui.painter().image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    } else if let Some(page) = self.cache.get(&i) {
+                        // Fallback: pakai texture full bila sudah di-cache.
+                        let tex = page.tex.clone();
+                        let [tw, th] = page.decoded;
+                        let scale = (rect.width() / tw as f32).min(rect.height() / th as f32);
+                        let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+                        let r = egui::Rect::from_center_size(rect.center(), size);
+                        ui.painter().image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    } else {
+                        // Placeholder: nomor indeks.
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}", i + 1),
+                            egui::FontId::proportional(14.0),
+                            ui.visuals().text_color(),
+                        );
+                    }
+                    if resp.clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.go_to(&ctx, i, false);
+                    }
+                    // Tooltip: nama file saat hover.
+                    if let Some(l) = &self.listing {
+                        if let Some(name) = l.names.get(i) {
+                            resp.on_hover_text(name);
+                        }
+                    }
+                }
+            });
+        });
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
@@ -3521,6 +4125,8 @@ impl RoneyApp {
         self.view_rect = rect;
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         self.panning = resp.dragged_by(PointerButton::Primary);
+        // Slideshow dijeda saat pointer di atas gambar.
+        self.slideshow_hover_pause = resp.hovered();
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, self.theme_bg());
 
@@ -3676,7 +4282,7 @@ impl RoneyApp {
         }
     }
 
-    /// Pil status loading di tengah atas area gambar.
+    /// Pil status loading di tengah area gambar.
     fn draw_loading_badge(&self, painter: &egui::Painter, rect: Rect) {
         // Jangan tampilkan badge kalau belum ada berkas/folder/arsip yang dibuka.
         if self.listing.is_none() {
@@ -3693,12 +4299,12 @@ impl RoneyApp {
         let Some(text) = badge else { return };
         let galley = painter.layout_no_wrap(
             text.to_owned(),
-            egui::FontId::proportional(14.0),
+            egui::FontId::proportional(16.0),
             Color32::WHITE,
         );
-        let pad = vec2(14.0, 7.0);
+        let pad = vec2(18.0, 10.0);
         let size = galley.size() + pad * 2.0;
-        let br = Rect::from_center_size(rect.center_top() + vec2(0.0, 12.0), size);
+        let br = Rect::from_center_size(rect.center(), size);
         painter.rect_filled(br, 10.0, Color32::from_black_alpha(170));
         painter.galley(br.min + pad, galley, Color32::WHITE);
     }
@@ -3825,6 +4431,7 @@ impl RoneyApp {
                                 (SettingsTab::Theme, tr(lang, "settings_theme")),
                                 (SettingsTab::Language, tr(lang, "settings_language")),
                                 (SettingsTab::Folders, tr(lang, "settings_folders")),
+                                (SettingsTab::View, tr(lang, "settings_view")),
                             ] {
                                 if ui.selectable_label(self.settings_tab == tab, label).clicked() {
                                     self.settings_tab = tab;
@@ -3905,6 +4512,22 @@ impl RoneyApp {
                                         self.store_dirty = true;
                                     }
                                 }
+                                SettingsTab::View => {
+                                    themes::panel_heading(ui, self.store.state.theme, &tr(lang, "settings_view"));
+                                    ui.add_space(6.0);
+                                    let mut strip = self.store.state.show_strip;
+                                    if ui.checkbox(&mut strip, tr(lang, "settings_show_strip")).changed() {
+                                        self.store.state.show_strip = strip;
+                                        self.store_dirty = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(tr(lang, "settings_slideshow_secs"));
+                                    let mut secs = self.store.state.slideshow_secs;
+                                    if ui.add(egui::Slider::new(&mut secs, 1..=30).suffix(" detik")).changed() {
+                                        self.store.state.slideshow_secs = secs;
+                                        self.store_dirty = true;
+                                    }
+                                }
                             }
                         });
                     });
@@ -3956,6 +4579,25 @@ impl RoneyApp {
     /// Majukan frame animasi bila waktunya. Tidak menjadwalkan repaint saat dijeda
     /// atau saat halaman bukan animasi, jadi CPU tetap idle untuk gambar statis.
     fn tick_animation(&mut self, ctx: &Context) {
+        // Slideshow otomatis: maju ke gambar berikut tiap interval.
+        // (Di awal agar jalan juga untuk gambar statis.)
+        // Dijeda sementara saat pointer di atas gambar.
+        if self.slideshow && !self.slideshow_hover_pause {
+            let now = Instant::now();
+            if now >= self.slideshow_next {
+                let count = self.count();
+                if count > 1 {
+                    let next = (self.index + 1) % count;
+                    self.go_to(ctx, next, false);
+                }
+                self.slideshow_next = now + Duration::from_secs(self.store.state.slideshow_secs);
+            }
+            ctx.request_repaint_after(self.slideshow_next.saturating_duration_since(Instant::now()));
+        } else if self.slideshow {
+            // Hover: geser jadwal agar tidak langsung loncat saat pointer pergi.
+            self.slideshow_next = Instant::now() + Duration::from_secs(self.store.state.slideshow_secs);
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
         let Some(sh) = self.current_content() else {
             return;
         };
@@ -4057,6 +4699,10 @@ impl eframe::App for RoneyApp {
                 egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.draw_toolbar(ctx, ui));
             }
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+            // Strip thumbnail (di atas status bar) untuk navigasi cepat.
+            if self.store.state.show_strip {
+                egui::TopBottomPanel::bottom("strip").show(ctx, |ui| self.draw_strip(ui));
+            }
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(self.theme_bg()))
@@ -4438,6 +5084,18 @@ fn paint_tool_icon(painter: &egui::Painter, rect: Rect, icon: ToolIcon, color: C
 /// Selalu punya border warna aksen tema: redup saat normal, penuh saat
 /// aktif/hover. Background aktif = warna aksen tema.
 #[allow(clippy::too_many_arguments)]
+// ===== THEME-STUDIO BEGIN toolbar_style =====
+// Gaya tombol toolbar — digenerate oleh theme-studio, jangan edit manual.
+const TS_ICON_BTN: f32 = 38.0;
+const TS_LABELED_H: f32 = 38.0;
+const TS_LABEL_FONT: f32 = 14.0;
+const TS_BORDER_W: f32 = 1.5;
+const TS_BG_IDLE: f32 = 0.10;
+const TS_BG_HOVER: f32 = 0.25;
+const TS_BG_PRESSED: f32 = 0.45;
+const TS_BORDER_ALPHA_IDLE: u8 = 110;
+// ===== THEME-STUDIO END toolbar_style =====
+
 fn toolbar_labeled_button(
     ui: &mut egui::Ui,
     icon: ToolIcon,
@@ -4449,17 +5107,17 @@ fn toolbar_labeled_button(
     accent: Color32,
 ) -> bool {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let font = egui::FontId::proportional(14.0);
+    let font = egui::FontId::proportional(TS_LABEL_FONT);
     // Lebar dinamis: ikon saja (kotak) jika label kosong, ikon+teks jika ada.
     let (w, h) = if label.is_empty() {
-        (38.0, 38.0)
+        (TS_ICON_BTN, TS_ICON_BTN)
     } else {
         let text_w = ui
             .painter()
             .layout_no_wrap(label.to_owned(), font.clone(), icon_color)
             .size()
             .x;
-        (20.0 + 8.0 + text_w + 24.0, 38.0)
+        (20.0 + 8.0 + text_w + 24.0, TS_LABELED_H)
     };
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), sense);
     let hovered = enabled && resp.hovered();
@@ -4470,21 +5128,21 @@ fn toolbar_labeled_button(
     let bg = if active {
         accent
     } else if pressed {
-        accent.gamma_multiply(0.45)
+        accent.gamma_multiply(TS_BG_PRESSED)
     } else if hovered {
-        accent.gamma_multiply(0.25)
+        accent.gamma_multiply(TS_BG_HOVER)
     } else {
-        accent.gamma_multiply(0.10)
+        accent.gamma_multiply(TS_BG_IDLE)
     };
     painter.rect_filled(rect, radius, bg);
     // Border: selalu warna aksen — redup saat normal, penuh saat aktif/hover.
-    let border_alpha: u8 = if active || hovered { 255 } else { 110 };
+    let border_alpha: u8 = if active || hovered { 255 } else { TS_BORDER_ALPHA_IDLE };
     let border_col =
         Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), border_alpha);
     painter.rect_stroke(
         rect,
         radius,
-        egui::Stroke::new(1.5_f32, border_col),
+        egui::Stroke::new(TS_BORDER_W, border_col),
         egui::StrokeKind::Inside,
     );
     // Ikon/teks: putih di atas aksen, mengikuti tema jika tidak aktif.
@@ -4668,6 +5326,65 @@ fn draw_bar(ui: &mut egui::Ui, inp: &BarInput) -> BarOutput {
     out
 }
 
+/// Ekstrak segmen APP1 (EXIF) dari bytes JPEG.
+/// Mengembalikan bytes segmen lengkap termasuk marker FF E1 dan length,
+/// atau None bila tidak ada.
+fn extract_exif_app1(jpeg: &[u8]) -> Option<Vec<u8>> {
+    // Harus diawali SOI (FF D8).
+    if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return None;
+    }
+    let mut pos = 2;
+    while pos + 4 <= jpeg.len() {
+        if jpeg[pos] != 0xFF {
+            break;
+        }
+        let marker = jpeg[pos + 1];
+        // SOS (FF DA) atau EOI (FF D9): berhenti.
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        // Marker tanpa length: RST0-RST7, TEM.
+        if (0xD0..=0xD7).contains(&marker) || marker == 0x01 {
+            pos += 2;
+            continue;
+        }
+        if pos + 4 > jpeg.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]) as usize;
+        if len < 2 || pos + 2 + len > jpeg.len() {
+            break;
+        }
+        // APP1 (FF E1) dengan header "Exif\0\0".
+        if marker == 0xE1 && len >= 8 {
+            let data_start = pos + 4;
+            if data_start + 6 <= jpeg.len() && &jpeg[data_start..data_start + 6] == b"Exif\0\0" {
+                return Some(jpeg[pos..pos + 2 + len].to_vec());
+            }
+        }
+        pos += 2 + len;
+    }
+    None
+}
+
+/// Sisipkan segmen APP1 (EXIF) ke bytes JPEG tepat setelah SOI.
+/// Bila JPEG tidak valid atau sudah ada APP1 EXIF, kembalikan bytes asli.
+fn insert_exif_app1(mut jpeg: Vec<u8>, app1: &[u8]) -> Vec<u8> {
+    if jpeg.len() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return jpeg;
+    }
+    // Jangan duplikat bila sudah ada EXIF.
+    if extract_exif_app1(&jpeg).is_some() {
+        return jpeg;
+    }
+    let mut out = Vec::with_capacity(jpeg.len() + app1.len());
+    out.extend_from_slice(&jpeg[..2]);
+    out.extend_from_slice(app1);
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
 impl RoneyApp {
     fn page_for(&self, index: usize) -> Option<Arc<Page>> {
         self.cache
@@ -4787,6 +5504,423 @@ impl RoneyApp {
         self.notify(format!("Dipindahkan ke Tempat Sampah: {name}"));
     }
 
+    /// Dialog batch convert/resize: proses semua gambar di listing.
+    fn draw_batch_dialog(&mut self, ctx: &Context) {
+        let lang = self.lang;
+        let mut close = false;
+        let mut start = false;
+        let mut overwrite_choice: Option<bool> = None;
+        let count = self.count();
+        egui::Window::new(tr(lang, "menu_batch"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(format!("{}: {}", tr(lang, "batch_images"), count));
+                // Pilih file: daftar checkbox dalam scroll area.
+                if count > 0 {
+                    // Inisialisasi: pilih semua bila kosong.
+                    if self.batch_selected.is_empty() {
+                        self.batch_selected = (0..count).collect();
+                    }
+                    // Bersihkan indeks yang sudah tidak valid.
+                    self.batch_selected.retain(|&i| i < count);
+                    ui.add_space(4.0);
+                    let sel_count = self.batch_selected.len();
+                    egui::CollapsingHeader::new(format!(
+                        "{}: {sel_count}/{count}",
+                        tr(lang, "batch_select_files")
+                    ))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.small_button(tr(lang, "batch_select_all")).clicked() {
+                                self.batch_selected = (0..count).collect();
+                            }
+                            if ui.small_button(tr(lang, "batch_select_none")).clicked() {
+                                self.batch_selected.clear();
+                            }
+                        });
+                        egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                            if let Some(listing) = &self.listing {
+                                for i in 0..count {
+                                    let name = listing.names.get(i).map(|s| s.as_str()).unwrap_or("?");
+                                    let mut checked = self.batch_selected.contains(&i);
+                                    if ui.checkbox(&mut checked, name).changed() {
+                                        if checked {
+                                            if !self.batch_selected.contains(&i) {
+                                                self.batch_selected.push(i);
+                                            }
+                                        } else {
+                                            self.batch_selected.retain(|&x| x != i);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    });
+                }
+                ui.add_space(8.0);
+                // Mode ukuran.
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.batch_by_pct, true, tr(lang, "batch_by_pct"));
+                    ui.radio_value(&mut self.batch_by_pct, false, tr(lang, "batch_by_size"));
+                });
+                if self.batch_by_pct {
+                    ui.horizontal(|ui| {
+                        ui.label(tr(lang, "batch_percent"));
+                        ui.add(egui::Slider::new(&mut self.batch_pct, 1..=100).suffix("%"));
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(tr(lang, "batch_width"));
+                        ui.add(egui::DragValue::new(&mut self.batch_width).range(1..=16384));
+                        ui.label(tr(lang, "batch_height"));
+                        ui.add(egui::DragValue::new(&mut self.batch_height).range(1..=16384));
+                    });
+                }
+                ui.add_space(4.0);
+                // Format output.
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "batch_format"));
+                    egui::ComboBox::from_id_salt("batch_fmt")
+                        .selected_text(["JPEG", "PNG", "WebP"][self.batch_format])
+                        .show_ui(ui, |ui| {
+                            for (i, f) in ["JPEG", "PNG", "WebP"].iter().enumerate() {
+                                ui.selectable_value(&mut self.batch_format, i, *f);
+                            }
+                        });
+                    if self.batch_format != 1 {
+                        ui.label(tr(lang, "batch_quality"));
+                        let mut q = self.batch_quality as u32;
+                        if ui.add(egui::Slider::new(&mut q, 1..=100)).changed() {
+                            self.batch_quality = q as u8;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "batch_output"));
+                    ui.text_edit_singleline(&mut self.batch_output);
+                    if ui.small_button(tr(lang, "batch_browse")).clicked() {
+                        if !self.dialog_busy {
+                            self.dialog_busy = true;
+                            self.batch_picking_folder = true;
+                            // Buka dialog folder via thread rfd.
+                            let tx = self.dialog_tx.clone();
+                            let ctx2 = ctx.clone();
+                            std::thread::Builder::new()
+                                .name("roneyview-batch-folder".into())
+                                .spawn(move || {
+                                    let picked = rfd::FileDialog::new().pick_folder();
+                                    let _ = tx.send(picked);
+                                    ctx2.request_repaint();
+                                })
+                                .ok();
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                // Preview: contoh hasil untuk gambar saat ini.
+                if let Some(sh) = self.current_content() {
+                    if let Some((_, page)) = sh.slots.first() {
+                        let (sw, sh_) = (page.orig[0], page.orig[1]);
+                        let (tw, th) = if self.batch_by_pct {
+                            let p = self.batch_pct as f32 / 100.0;
+                            ((sw as f32 * p).max(1.0) as u32, (sh_ as f32 * p).max(1.0) as u32)
+                        } else {
+                            (self.batch_width.max(1), self.batch_height.max(1))
+                        };
+                        let ext = match self.batch_format { 1 => "png", 2 => "webp", _ => "jpg" };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(140, 180, 255),
+                            format!("{}: {}x{} -> {}x{} (.{} )", tr(lang, "batch_preview"), sw, sh_, tw, th, ext),
+                        );
+                        ui.add_space(4.0);
+                    }
+                }
+                // Progress.
+                if let Some((done, total)) = self.batch_progress {
+                    let frac = done as f32 / total.max(1) as f32;
+                    ui.add(egui::ProgressBar::new(frac).text(format!("{done}/{total}")));
+                    ui.add_space(4.0);
+                }
+                // Konfirmasi timpa file.
+                if let Some(msg) = &self.batch_done_msg {
+                    if let Some(n_str) = msg.strip_prefix("OVERWRITE_ASK:") {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 200, 100),
+                            format!("{} file sudah ada di folder output. Timpa?", n_str),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(tr(lang, "batch_overwrite_all")).clicked() {
+                                overwrite_choice = Some(true);
+                            }
+                            if ui.button(tr(lang, "batch_skip_existing")).clicked() {
+                                overwrite_choice = Some(false);
+                            }
+                        });
+                        ui.add_space(4.0);
+                    } else {
+                        ui.colored_label(egui::Color32::from_rgb(100, 255, 100), msg);
+                        ui.add_space(4.0);
+                    }
+                }
+                ui.horizontal(|ui| {
+                    let running = self.batch_progress.is_some();
+                    let can_start = !running && count > 0 && !self.batch_selected.is_empty();
+                    if ui.add_enabled(can_start, egui::Button::new(tr(lang, "batch_start"))).clicked() {
+                        start = true;
+                    }
+                    if ui.button(tr(lang, "pw_cancel")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            self.batch_open = false;
+            self.batch_progress = None;
+            self.batch_done_msg = None;
+            self.batch_overwrite = None;
+            // Simpan setting batch ke state.
+            self.store.state.batch_format = self.batch_format;
+            self.store.state.batch_quality = self.batch_quality;
+            self.store.state.batch_pct = self.batch_pct;
+            self.store.state.batch_by_pct = self.batch_by_pct;
+            self.store.state.batch_output = self.batch_output.clone();
+            self.store.state.batch_width = self.batch_width;
+            self.store.state.batch_height = self.batch_height;
+            self.store_dirty = true;
+        }
+        if let Some(choice) = overwrite_choice {
+            self.batch_overwrite = Some(choice);
+            self.batch_done_msg = None;
+            self.run_batch_convert();
+        }
+        if start {
+            // Reset pilihan timpa setiap klik Mulai baru.
+            self.batch_overwrite = None;
+            self.run_batch_convert();
+        }
+    }
+
+    /// Jalankan batch convert: resize + simpan semua gambar ke folder output.
+    fn run_batch_convert(&mut self) {
+        let Some(listing) = &self.listing else { return };
+        let count = listing.len();
+        if count == 0 { return; }
+        // Daftar indeks yang diproses: yang dipilih user, atau semua bila kosong.
+        let targets: Vec<usize> = if self.batch_selected.is_empty() {
+            (0..count).collect()
+        } else {
+            self.batch_selected.iter().copied().filter(|&i| i < count).collect()
+        };
+        if targets.is_empty() {
+            self.batch_done_msg = Some("Tidak ada file dipilih.".to_string());
+            return;
+        }
+        let out_dir = std::path::PathBuf::from(&self.batch_output);
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.batch_done_msg = Some(format!("Gagal buat folder: {e}"));
+            return;
+        }
+        // Cek apakah ada file output yang sudah ada.
+        let overwrite = self.batch_overwrite.unwrap_or(false);
+        if self.batch_overwrite.is_none() {
+            let ext = match self.batch_format { 1 => "png", 2 => "webp", _ => "jpg" };
+            let mut existing = 0;
+            for &i in &targets {
+                let src_name = listing.names.get(i).map(|s| s.as_str()).unwrap_or("img");
+                let stem = std::path::Path::new(src_name)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("img{i}"));
+                if out_dir.join(format!("{stem}.{ext}")).exists() {
+                    existing += 1;
+                }
+            }
+            if existing > 0 {
+                // Minta konfirmasi dulu; dialog akan tampilkan pilihan.
+                self.batch_overwrite = Some(false); // sementara: tandai sudah dicek
+                self.batch_done_msg = Some(format!("OVERWRITE_ASK:{existing}"));
+                return;
+            }
+        }
+        let total = targets.len();
+        self.batch_progress = Some((0, total));
+        let mut reader = match listing.open_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                self.batch_done_msg = Some(e);
+                self.batch_progress = None;
+                return;
+            }
+        };
+        let mut ok = 0;
+        let mut skipped = 0;
+        let mut failed: Vec<String> = Vec::new();
+        for (pos, &i) in targets.iter().enumerate() {
+            self.batch_progress = Some((pos, total));
+            let src_name = listing.names.get(i).map(|s| s.as_str()).unwrap_or("img").to_string();
+            let bytes = match reader.read(i) {
+                Ok(b) => b,
+                Err(e) => { failed.push(format!("{src_name}: baca gagal ({e})")); continue; }
+            };
+            let img = match image::load_from_memory(&bytes) {
+                Ok(d) => d.to_rgba8(),
+                Err(_) => { failed.push(format!("{src_name}: format tidak didukung")); continue; }
+            };
+            let (tw, th) = if self.batch_by_pct {
+                let p = self.batch_pct as f32 / 100.0;
+                ((img.width() as f32 * p).max(1.0) as u32, (img.height() as f32 * p).max(1.0) as u32)
+            } else {
+                (self.batch_width.max(1), self.batch_height.max(1))
+            };
+            let resized = if tw != img.width() || th != img.height() {
+                image::imageops::resize(&img, tw, th, image::imageops::FilterType::Lanczos3)
+            } else {
+                img
+            };
+            let src_name = listing.names.get(i).map(|s| s.as_str()).unwrap_or("img");
+            let stem = std::path::Path::new(src_name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("img{i}"));
+            let dynimg = image::DynamicImage::ImageRgba8(resized);
+            let ext = match self.batch_format { 1 => "png", 2 => "webp", _ => "jpg" };
+            let out_path = out_dir.join(format!("{stem}.{ext}"));
+            // Lewati bila file sudah ada dan user memilih tidak menimpa.
+            if out_path.exists() && !overwrite {
+                skipped += 1;
+                continue;
+            }
+            let saved = match self.batch_format {
+                1 => dynimg.save(&out_path).is_ok(),
+                2 => dynimg.save(&out_path).is_ok(),
+                _ => {
+                    // Encode ke buffer dulu agar bisa sisipkan EXIF.
+                    let mut buf: Vec<u8> = Vec::new();
+                    let enc_ok = {
+                        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, self.batch_quality);
+                        enc.encode_image(&dynimg).is_ok()
+                    };
+                    if !enc_ok {
+                        false
+                    } else {
+                        // Pertahankan EXIF bila sumber JPEG punya EXIF.
+                        if let Some(app1) = extract_exif_app1(&bytes) {
+                            buf = insert_exif_app1(buf, &app1);
+                        }
+                        std::fs::write(&out_path, &buf).is_ok()
+                    }
+                }
+            };
+            if saved {
+                ok += 1;
+            } else {
+                failed.push(format!("{src_name}: gagal simpan"));
+            }
+        }
+        self.batch_progress = None;
+        // Reset pilihan timpa untuk batch berikutnya.
+        self.batch_overwrite = None;
+        let mut msg = format!("Selesai: {ok}/{total}");
+        if skipped > 0 {
+            msg.push_str(&format!(", {skipped} dilewati (sudah ada)"));
+        }
+        msg.push_str(&format!(" -> {}", out_dir.display()));
+        if !failed.is_empty() {
+            msg.push_str(&format!("\nGagal {}: {}", failed.len(), failed.join(", ")));
+        }
+        self.batch_done_msg = Some(msg);
+    }
+
+    /// Dialog input password untuk arsip terenkripsi.
+    fn draw_password_dialog(&mut self, ctx: &Context) {
+        let lang = self.lang;
+        let mut submit = false;        let mut cancel = false;
+        let mut open = true;
+        // Fokus sekali saja saat dialog dibuka.
+        let focus_now = self.pw_input.is_empty() && self.pw_error.is_none();
+        egui::Window::new(tr(lang, "pw_title"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(380.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(tr(lang, "pw_prompt"));
+                ui.add_space(8.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.pw_input)
+                        .password(true)
+                        .hint_text(tr(lang, "pw_hint"))
+                        .desired_width(280.0),
+                );
+                if focus_now {
+                    resp.request_focus();
+                }
+                // Enter = submit (saat field fokus).
+                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if let Some(err) = &self.pw_error {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(tr(lang, "pw_ok")).clicked() {
+                        submit = true;
+                    }
+                    if ui.button(tr(lang, "pw_cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if cancel || !open {
+            self.pw_dialog = false;
+            self.pending_listing = None;
+            self.pw_input.clear();
+            self.pw_error = None;
+            return;
+        }
+        if submit {
+            self.try_password(ctx);
+        }
+    }
+
+    /// Coba password yang dimasukkan; bila benar, pasang listing arsip.
+    fn try_password(&mut self, ctx: &Context) {
+        let Some((mut listing, start)) = self.pending_listing.take() else {
+            self.pw_dialog = false;
+            return;
+        };
+        let pw = self.pw_input.as_bytes().to_vec();
+        listing.password = Some(pw);
+        // Verifikasi dengan membaca entri pertama.
+        let ok = listing
+            .open_reader()
+            .and_then(|mut r| r.read(0).map(|_| ()))
+            .is_ok();
+        if ok {
+            self.pw_dialog = false;
+            self.pw_input.clear();
+            self.pw_error = None;
+            // Hapus password dari memori UI (sudah disalin ke listing).
+            self.install_listing(ctx, listing, start);
+        } else {
+            self.pw_error = Some(tr(self.lang, "pw_wrong").to_string());
+            self.pending_listing = Some((listing, start));
+            // Kosongkan password yang salah dari listing.
+            if let Some((ref mut l, _)) = self.pending_listing {
+                l.password = None;
+            }
+        }
+    }
+
     fn draw_dialogs(&mut self, ctx: &Context) {
         let lang = self.lang;
         while let Ok(msg) = self.note_rx.try_recv() {
@@ -4817,6 +5951,14 @@ impl RoneyApp {
             if open && !inner_close {
                 self.props = Some(dlg);
             }
+        }
+        // Dialog password arsip terenkripsi.
+        if self.pw_dialog {
+            self.draw_password_dialog(ctx);
+        }
+        // Dialog batch convert/resize.
+        if self.batch_open {
+            self.draw_batch_dialog(ctx);
         }
         if let Some(mut dlg) = self.wallpaper.take() {
             let mut open = true;
