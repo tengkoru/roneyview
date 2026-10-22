@@ -27,6 +27,11 @@ pub const ARCHIVE_EXTS: &[&str] = &["zip", "cbz"];
 /// Batas ukuran satu berkas gambar yang mau dibaca ke memori.
 pub const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Batas jumlah entri yang dipindai saat listing arsip. Arsip rekayasa dapat
+/// mendeklarasikan jutaan entri; tanpa batas, membukanya menggantung aplikasi
+/// (CPU + memori daftar nama) sebelum satu pun gambar didekode.
+pub const MAX_ARCHIVE_ENTRIES: usize = 100_000;
+
 fn ext_lower(name: &str) -> Option<String> {
     Path::new(name)
         .extension()
@@ -250,6 +255,11 @@ impl Reader {
                         let (data, rest) = header
                             .read()
                             .map_err(|e| rar_error("Gagal mengekstrak entri RAR", &e))?;
+                        // Sama seperti jalur ZIP: jangan percaya ukuran deklarasi
+                        // header saja, verifikasi ukuran hasil akhirnya.
+                        if data.len() as u64 > MAX_ENTRY_BYTES {
+                            return Err("Entri terlalu besar".to_string());
+                        }
                         *cursor = Some((ordinal + 1, rest));
                         return Ok(data);
                     }
@@ -387,7 +397,14 @@ fn list_rar(path: &Path) -> Result<Listing, String> {
         .open_for_listing()
         .map_err(|e| rar_error("Arsip RAR tidak dapat dibuka", &e))?;
     let mut items: Vec<(String, usize, Option<String>)> = Vec::new();
+    let mut scanned = 0usize;
     for (ordinal, entry) in archive.enumerate() {
+        scanned += 1;
+        if scanned > MAX_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "Arsip berisi terlalu banyak entri (maks {MAX_ARCHIVE_ENTRIES})"
+            ));
+        }
         // Header rusak di tengah arsip: pakai entri yang sudah terbaca.
         let Ok(entry) = entry else { break };
         if entry.is_directory() {
@@ -430,6 +447,12 @@ fn list_zip(path: &Path) -> Result<Listing, String> {
     let file = File::open(path).map_err(|e| format!("Tidak dapat membuka arsip: {e}"))?;
     let mut archive = ZipArchive::new(BufReader::new(file))
         .map_err(|e| format!("Arsip ZIP tidak valid: {e}"))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "Arsip berisi terlalu banyak entri ({} entri, maks {MAX_ARCHIVE_ENTRIES})",
+            archive.len()
+        ));
+    }
     let mut items: Vec<(String, usize, Option<String>)> = Vec::new();
     for i in 0..archive.len() {
         let Ok(entry) = archive.by_index_raw(i) else {
@@ -438,7 +461,12 @@ fn list_zip(path: &Path) -> Result<Listing, String> {
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        // zip 9: `name()` fallible (UTF-8 ketat, fallback CP437). Nama yang
+        // benar-benar tidak terdekode dilewati saja, sama seperti entri rusak.
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let name = name.into_owned();
         let base = name.rsplit('/').next().unwrap_or(&name);
         if name.starts_with("__MACOSX/") || base.starts_with('.') {
             continue;

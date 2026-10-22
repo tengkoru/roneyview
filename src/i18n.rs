@@ -149,6 +149,15 @@ mod tests {
     }
 
     #[test]
+    fn menu_konteks_terlokalisasi() {
+        // Item menu konteks tidak boleh tampil Inggris di UI Indonesia.
+        assert_eq!(tr(Lang::Id, "ctx_properties"), "Properti");
+        assert_eq!(tr(Lang::Id, "ctx_wallpaper_title"), "Jadikan wallpaper...");
+        assert_eq!(tr(Lang::En, "ctx_properties"), "Properties");
+        assert_eq!(tr(Lang::En, "ctx_wallpaper_title"), "Set as wallpaper...");
+    }
+
+    #[test]
     fn tr_fmt_mengganti_urutan() {
         let s = tr_fmt(Lang::Id, "prop_dimensions", &[&2, &10]);
         assert_eq!(s, "2 x 10 piksel");

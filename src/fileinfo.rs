@@ -1,11 +1,12 @@
 //! Informasi berkas untuk jendela Properties: ukuran, format, tanggal ubah,
 //! serta jalur arsip + jalur di dalam arsip.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::i18n::{Lang, tr, tr_fmt};
-use crate::source::Listing;
+use crate::source::{Listing, MAX_ENTRY_BYTES};
 
 /// Konversi detik-sejak-epoch (UTC) ke (tahun, bulan, hari, jam, menit, detik).
 /// Algoritma "civil from days" (Howard Hinnant), berlaku untuk tanggal Gregorian.
@@ -148,10 +149,21 @@ pub fn properties_rows(listing: &Listing, index: usize, facts: &PageFacts, lang:
 /// Mengembalikan vec kosong bila tidak ada EXIF atau gagal dibaca.
 fn exif_rows(loc: &Where, listing: &Listing, index: usize, lang: Lang) -> Vec<(String, String)> {
     let bytes: Vec<u8> = match loc {
-        Where::File(p) => match std::fs::read(p) {
-            Ok(b) => b,
-            Err(_) => return Vec::new(),
-        },
+        // Samakan dengan jalur baca normal (Reader::read): berkas yang lebih
+        // besar dari MAX_ENTRY_BYTES tidak dibaca utuh hanya untuk EXIF.
+        Where::File(p) => {
+            let read_bounded = (|| -> std::io::Result<Vec<u8>> {
+                let mut buf = Vec::new();
+                std::fs::File::open(p)?
+                    .take(MAX_ENTRY_BYTES + 1)
+                    .read_to_end(&mut buf)?;
+                Ok(buf)
+            })();
+            match read_bounded {
+                Ok(b) if (b.len() as u64) <= MAX_ENTRY_BYTES => b,
+                _ => return Vec::new(),
+            }
+        }
         Where::Archive { .. } => match listing.open_reader().and_then(|mut r| r.read(index)) {
             Ok(b) => b,
             Err(_) => return Vec::new(),

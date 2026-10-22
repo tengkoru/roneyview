@@ -562,6 +562,19 @@ fn load_raw(bytes: &[u8]) -> Result<RawImage, String> {
     Ok(RawImage { img, orientation })
 }
 
+/// Dekode berpenjaga untuk jalur sekunder (worker thumbnail, batch convert):
+/// pertahanan memori yang sama seperti jalur utama — batas dimensi/alokasi
+/// lewat `load_raw`, dan panic dekoder ditangkap menjadi pesan galat. Orientasi
+/// EXIF TIDAK diterapkan (sama seperti `image::load_from_memory` yang digantikan
+/// fungsi ini), supaya perilaku pemanggil tidak berubah.
+pub fn decode_guarded(bytes: &[u8]) -> Result<DynamicImage, String> {
+    match catch_unwind(AssertUnwindSafe(|| load_raw(bytes))) {
+        Ok(Ok(raw)) => Ok(raw.img),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("Dekoder gagal memproses berkas ini (data kemungkinan rusak)".into()),
+    }
+}
+
 fn finish_raw(raw: RawImage, max_side: u32, max_pixels: usize) -> Result<Pixels, String> {
     let (w, h) = (raw.img.width(), raw.img.height());
     if w == 0 || h == 0 {
@@ -1179,6 +1192,29 @@ mod tests {
         g.extend_from_slice(&65535u16.to_le_bytes());
         g.extend_from_slice(&[0, 0, 0, b';']);
         assert!(decode_sharp(&g, 4096, max_pixels()).is_err());
+    }
+
+    #[test]
+    fn decode_guarded_menolak_png_raksasa_dan_menerima_png_biasa() {
+        // Jalur sekunder (thumbnail, batch) memakai decode_guarded: gambar yang
+        // mengaku raksasa harus ditolak SEBELUM alokasi, bukan didekode polos.
+        let data: &[u8] = include_bytes!("../tests/fixtures/enorme.png");
+        assert!(decode_guarded(data).is_err());
+        let ok = decode_guarded(&png_bytes(40, 30)).unwrap();
+        assert_eq!((ok.width(), ok.height()), (40, 30));
+    }
+
+    #[test]
+    fn decode_guarded_pesan_galat_spesifik_untuk_batch() {
+        // Batch convert meneruskan pesan ini apa adanya ke daftar berkas
+        // gagal ("{nama}: {pesan}"), jadi pesannya harus menyebut sebab
+        // sebenarnya — bukan "format tidak didukung" yang generik.
+        let data: &[u8] = include_bytes!("../tests/fixtures/enorme.png");
+        let err = decode_guarded(data).unwrap_err();
+        assert!(
+            err.contains("terlalu besar"),
+            "pesan harus menyebut ukuran berlebih, dapat: {err}"
+        );
     }
 
     #[test]

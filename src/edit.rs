@@ -279,6 +279,36 @@ pub fn resize_image(img: &RgbaImage, w: u32, h: u32, filter: FilterType) -> Rgba
     dyn_img.resize(w.max(1), h.max(1), filter).into_rgba8()
 }
 
+/// Dimensi yang BENAR-BENAR dihasilkan `resize_image` untuk kotak target
+/// (`target_w` x `target_h`). `DynamicImage::resize` mempertahankan rasio
+/// sumber dan memuat hasil di dalam kotak, jadi pada satu sumbu hasilnya
+/// bisa lebih kecil dari kotak (mis. sumber 872x546, kotak 602x376 ->
+/// hasil 600x376, bukan 602x376). Fungsi ini meniru persis matematika
+/// `resize_dimensions` (fill=false) pada crate image 0.25, supaya teks
+/// "Ukuran baru" di panel Resize menjanjikan angka yang sama dengan hasil
+/// prosesnya — jangan ubah tanpa memeriksa `resize_image`.
+pub fn resize_result_size(orig_w: u32, orig_h: u32, target_w: u32, target_h: u32) -> (u32, u32) {
+    let tw = target_w.max(1);
+    let th = target_h.max(1);
+    if orig_w == 0 || orig_h == 0 || (tw, th) == (orig_w, orig_h) {
+        return (tw, th);
+    }
+    let wratio = f64::from(tw) / f64::from(orig_w);
+    let hratio = f64::from(th) / f64::from(orig_h);
+    let ratio = f64::min(wratio, hratio);
+    let nw = ((f64::from(orig_w) * ratio).round() as u64).max(1);
+    let nh = ((f64::from(orig_h) * ratio).round() as u64).max(1);
+    if nw > u64::from(u32::MAX) {
+        let r = f64::from(u32::MAX) / f64::from(orig_w);
+        (u32::MAX, ((f64::from(orig_h) * r).round() as u32).max(1))
+    } else if nh > u64::from(u32::MAX) {
+        let r = f64::from(u32::MAX) / f64::from(orig_h);
+        (((f64::from(orig_w) * r).round() as u32).max(1), u32::MAX)
+    } else {
+        (nw as u32, nh as u32)
+    }
+}
+
 // ---------------------------------------------------------------- tone map
 
 /// Parameter tone mapping. Nilai bawaan = identitas.
@@ -806,6 +836,28 @@ mod tests {
         let img = RgbaImage::from_pixel(10, 10, image::Rgba([9, 9, 9, 255]));
         let r = resize_image(&img, 5, 5, FilterType::Nearest);
         assert_eq!((r.width(), r.height()), (5, 5));
+    }
+
+    #[test]
+    fn ukuran_hasil_resize_jujur_terhadap_proses() {
+        // Repro temuan lapangan 0.8.15: sumber 872x546 (hasil crop), kotak
+        // 602x376 -> proses menghasilkan 600x376, BUKAN 602x376 seperti yang
+        // dulu ditulis panel. Teks "Ukuran baru" memakai fungsi ini.
+        assert_eq!(resize_result_size(872, 546, 602, 376), (600, 376));
+        // Kasus angka bulat tetap persis dengan kotak.
+        assert_eq!(resize_result_size(640, 960, 640, 960), (640, 960));
+        assert_eq!(resize_result_size(800, 600, 400, 300), (400, 300));
+        // Kotak persegi pada sumber lebar: hasil dibatasi lebar kotak.
+        assert_eq!(resize_result_size(872, 546, 400, 400), (400, 250));
+        // Kunci fungsi janji ke proses nyata: dimensi keluaran resize_image
+        // harus selalu sama dengan resize_result_size untuk kotak yang sama.
+        let img = RgbaImage::new(872, 546);
+        let out = resize_image(&img, 602, 376, FilterType::Triangle);
+        assert_eq!((out.width(), out.height()), (600, 376));
+        assert_eq!(
+            (out.width(), out.height()),
+            resize_result_size(872, 546, 602, 376)
+        );
     }
 
     #[test]

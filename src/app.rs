@@ -136,6 +136,12 @@ fn step_index(cur: usize, n: usize, dir: i32) -> usize {
     (cur as i32 + dir).rem_euclid(n as i32) as usize
 }
 
+/// Apakah jumlah frame tergolong animasi multi-frame. Navigasi frame hanya
+/// melangkahi frame bila benar; gambar 0/1 frame memakai navigasi halaman.
+fn is_multiframe(frame_count: usize) -> bool {
+    frame_count > 1
+}
+
 /// Ubah `ColorImage` (egui) menjadi `RgbaImage` (crate image) untuk disimpan.
 /// `ColorImage` menyimpan alpha premultiplied; PNG butuh straight alpha,
 /// jadi di sini dikembalikan dulu (piksel opak/transparan penuh tidak berubah).
@@ -383,6 +389,18 @@ impl EditSession {
             tone_compare_img: None,
             dirty: false,
         }
+    }
+
+    /// Sinkronkan field Resize dengan ukuran buffer kerja saat ini.
+    /// Dipanggil setiap operasi yang mengubah dimensi buffer (crop, putar,
+    /// reset) supaya panel Resize selalu berangkat dari ukuran gambar yang
+    /// sedang dikerjakan — bukan ukuran file asli yang sudah usang, yang
+    /// membuat "Terapkan resize" diam-diam meng-upscale hasil crop.
+    /// Mode persen ikut direset ke 100% karena persen dihitung dari buffer.
+    fn sync_resize_to_buffer(&mut self) {
+        self.resize_w = self.buffer.width();
+        self.resize_h = self.buffer.height();
+        self.resize_pct = 100;
     }
 
     /// Gambar yang ditampilkan di tampilan edit: pratinjau tone bila ada.
@@ -1171,18 +1189,33 @@ impl RoneyApp {
 
     /// Maju/mundur satu frame pada animasi yang sedang tampil (`dir` +1/-1).
     /// Otomatis menjeda animasi; melingkar di ujung.
+    /// Gambar satu-frame (dan mode dua halaman, yang memang tidak bisa
+    /// melangkahi frame): aksi frame berpindah HALAMAN pada listing, supaya
+    /// tombol/shortcut frame tidak terasa mati saat membaca arsip komik
+    /// berisi JPEG satu-frame.
     fn step_frame(&mut self, ctx: &Context, dir: i32) {
-        let (shown_index, page) = match self.current_content() {
-            Some(sh) if sh.slots.len() == 1 => {
-                let (i, p) = sh.slots[0].clone();
-                (i, p)
+        let single = match self.current_content() {
+            Some(sh) if sh.slots.len() == 1 => Some(sh.slots[0].clone()),
+            _ => None,
+        };
+        let frame_count = single
+            .as_ref()
+            .and_then(|(_, p)| p.anim.as_ref().map(|a| a.frames.len()))
+            .unwrap_or(0);
+        if !is_multiframe(frame_count) {
+            if self.count() == 0 {
+                return;
             }
-            _ => return,
-        };
-        let n = match &page.anim {
-            Some(a) => a.frames.len(),
-            None => return,
-        };
+            // Satu-frame: navigasi frame = navigasi halaman.
+            if dir > 0 {
+                self.go_next(ctx);
+            } else {
+                self.go_prev(ctx, false);
+            }
+            return;
+        }
+        let (shown_index, page) = single.unwrap();
+        let n = frame_count;
         self.anim_playing = false;
         self.anim_frame = step_index(self.anim_frame, n, dir);
         self.upload_frame(&page, self.anim_frame);
@@ -1295,8 +1328,13 @@ impl RoneyApp {
                             ui.selectable_value(&mut e.resize_filter, i, *f);
                         }
                     });
-                let mp = (e.resize_w as f64 * e.resize_h as f64) / 1_000_000.0;
-                ui.label(format!("{}: {} × {} px ({:.2} MP)", tr(lang, "edit_new_size"), e.resize_w, e.resize_h, mp));
+                // Janji yang jujur: tampilkan dimensi yang benar-benar akan
+                // dihasilkan proses resize (fit di dalam kotak target dengan
+                // rasio sumber), bukan sekadar isi field — keduanya bisa
+                // berbeda 1-2 px pada rasio tidak bulat.
+                let (nw, nh) = edit::resize_result_size(bw, bh, e.resize_w, e.resize_h);
+                let mp = (nw as f64 * nh as f64) / 1_000_000.0;
+                ui.label(format!("{}: {} × {} px ({:.2} MP)", tr(lang, "edit_new_size"), nw, nh, mp));
                 if ui.button(tr(lang, "edit_apply_resize")).clicked() {
                     action = Some(EditPanelAction::ApplyResize);
                 }
@@ -1501,6 +1539,7 @@ impl RoneyApp {
             EditPanelAction::ResetAll => {
                 if let Some(e) = &mut self.edit {
                     e.buffer = e.original.clone();
+                    e.sync_resize_to_buffer();
                     e.crop_rect = None;
                     e.tone = ToneParams::default();
                     e.tone_preview = None;
@@ -1935,6 +1974,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             } else {
                 image::imageops::rotate270(&e.buffer)
             };
+            e.sync_resize_to_buffer();
             e.crop_rect = None;
             e.tone_draft_src = None;
             e.tone_draft_float = None;
@@ -1971,6 +2011,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         self.switch_edit_tool(EditTool::Rotate);
         if let Some(e) = &mut self.edit {
             e.buffer = crate::edit::rotate_arbitrary(&e.buffer, angle_deg);
+            e.sync_resize_to_buffer();
             e.crop_rect = None;
             e.tone_draft_src = None;
             e.tone_draft_float = None;
@@ -2013,6 +2054,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         };
         e.buffer = edit::crop_image(&e.buffer, rect);
         e.crop_rect = None;
+        e.sync_resize_to_buffer();
         e.tone_float = None; // buffer berubah -> sumber HDR linier tidak lagi cocok
         e.tone_draft_src = None;
         e.tone_draft_float = None;
@@ -3797,7 +3839,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             ui.separator();
             // TS-BTN-END sep1
             // TS-BTN-BEGIN frame_prev
-            if toolbar_labeled_button(ui, ToolIcon::FramePrev, "", animated && !editing, false, tr(lang, "toolbar_frame_prev_tip"), icon_color, accent) {
+            if toolbar_labeled_button(ui, ToolIcon::FramePrev, "", !editing && (animated || self.count() > 1), false, tr(lang, "toolbar_frame_prev_tip"), icon_color, accent) {
                 self.step_frame(ctx, -1);
             }
             // TS-BTN-END frame_prev
@@ -3808,7 +3850,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             }
             // TS-BTN-END play_pause
             // TS-BTN-BEGIN frame_next
-            if toolbar_labeled_button(ui, ToolIcon::FrameNext, "", animated && !editing, false, tr(lang, "toolbar_frame_next_tip"), icon_color, accent) {
+            if toolbar_labeled_button(ui, ToolIcon::FrameNext, "", !editing && (animated || self.count() > 1), false, tr(lang, "toolbar_frame_next_tip"), icon_color, accent) {
                 self.step_frame(ctx, 1);
             }
             // TS-BTN-END frame_next
@@ -3892,8 +3934,9 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             .name("roneyview-thumb".into())
             .spawn(move || {
                 for (idx, bytes) in job_rx {
-                    // Decode kecil saja (maks 96px) — jauh lebih cepat dari full.
-                    let thumb = image::load_from_memory(&bytes)
+                    // Decode berpenjaga loader (batas dimensi/alokasi sama seperti
+                    // jalur utama); hasilnya lalu dikecilkan ke maks 96px.
+                    let thumb = loader::decode_guarded(&bytes)
                         .ok()
                         .map(|d| d.thumbnail(96, 96).to_rgba8());
                     let _ = res_tx.send((idx, thumb));
@@ -5674,7 +5717,16 @@ impl RoneyApp {
                     if ui.add_enabled(can_start, egui::Button::new(tr(lang, "batch_start"))).clicked() {
                         start = true;
                     }
-                    if ui.button(tr(lang, "pw_cancel")).clicked() {
+                    // Setelah konversi selesai (ada pesan hasil, bukan prompt
+                    // timpa), tombol ini menutup dialog -> label "Tutup";
+                    // sebelum/selama proses tetap "Batal".
+                    let finished = !running
+                        && self
+                            .batch_done_msg
+                            .as_deref()
+                            .is_some_and(|m| !m.starts_with("OVERWRITE_ASK:"));
+                    let close_label = if finished { tr(lang, "btn_close") } else { tr(lang, "pw_cancel") };
+                    if ui.button(close_label).clicked() {
                         close = true;
                     }
                 });
@@ -5768,9 +5820,9 @@ impl RoneyApp {
                 Ok(b) => b,
                 Err(e) => { failed.push(format!("{src_name}: baca gagal ({e})")); continue; }
             };
-            let img = match image::load_from_memory(&bytes) {
+            let img = match loader::decode_guarded(&bytes) {
                 Ok(d) => d.to_rgba8(),
-                Err(_) => { failed.push(format!("{src_name}: format tidak didukung")); continue; }
+                Err(e) => { failed.push(format!("{src_name}: {e}")); continue; }
             };
             let (tw, th) = if self.batch_by_pct {
                 let p = self.batch_pct as f32 / 100.0;
@@ -6249,6 +6301,35 @@ mod tests {
         assert_eq!(step_index(2, 5, -1), 1);
         assert_eq!(step_index(0, 1, 1), 0);
         assert_eq!(step_index(0, 0, 1), 0, "tanpa frame tidak panik");
+    }
+
+    #[test]
+    fn multiframe_hanya_di_atas_satu_frame() {
+        // Navigasi frame melangkahi frame hanya untuk animasi multi-frame;
+        // 0/1 frame (JPEG komik, gambar diam) memakai navigasi halaman.
+        assert!(!is_multiframe(0));
+        assert!(!is_multiframe(1));
+        assert!(is_multiframe(2));
+        assert!(is_multiframe(24));
+    }
+
+    #[test]
+    fn resize_mengikuti_ukuran_buffer_kerja() {
+        let mut e = EditSession::new(
+            "test.jpg".to_string(),
+            RgbaImage::new(1920, 1280),
+            None,
+            EditTool::Resize,
+        );
+        // Sesi yang belum diedit: field resize = ukuran buffer (tak berubah).
+        assert_eq!((e.resize_w, e.resize_h, e.resize_pct), (1920, 1280, 100));
+        // Simulasi hasil crop 1920x1280 -> 902x677: buffer diganti, lalu
+        // sinkronisasi (yang dipanggil apply_crop/rotate) menyelaraskan field.
+        e.buffer = RgbaImage::new(902, 677);
+        e.resize_pct = 50; // sisa niat lama tidak boleh ikut terbawa
+        e.sync_resize_to_buffer();
+        assert_eq!((e.resize_w, e.resize_h), (902, 677));
+        assert_eq!(e.resize_pct, 100, "persen dihitung dari buffer kerja saat ini");
     }
 
     #[test]

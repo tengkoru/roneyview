@@ -1,6 +1,6 @@
 [package]
 name = "roneyview"
-version = "0.8.13"
+version = "0.8.16"
 edition = "2021"
 rust-version = "1.88"
 description = "Image viewer; not only for picture, you can see a folder with pictures, archive with pictures, and comic files like CBZ"
@@ -24,7 +24,7 @@ arboard = "3"
 # Dipakai langsung hanya untuk iterasi halaman TIFF multi-page
 # (image::TiffDecoder tidak mengekspos next_image/more_images).
 tiff = "0.11"
-zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
+zip = { version = "9", default-features = false, features = ["deflate", "aes-crypto"] }
 # Resize SIMD ~20x lebih cepat daripada `image::imageops::resize` untuk
 # foto besar (murni Rust, tanpa dependensi sistem). Fitur `image` memberi
 # integrasi langsung dengan `DynamicImage`, dengan fallback ke resize
