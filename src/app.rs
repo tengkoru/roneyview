@@ -1049,6 +1049,12 @@ pub struct RoneyApp {
     offset: Vec2,
     land_bottom: bool,
     view_rect: Rect,
+    /// Tinggi panel (poin) yang terukur frame lalu: menu, toolbar, status,
+    /// strip. Dipakai `current_view_rect` untuk memprediksi persegi area
+    /// gambar frame INI tanpa menunggu `draw_view` memperbarui `view_rect`
+    /// (yang baru terjadi SESUDAH panel status digambar). Nol = belum
+    /// pernah terukur (frame pertama / uji unit).
+    panel_h: [f32; 4],
     display_scale: f32,
     lang: Lang,
     show_settings: bool,
@@ -1255,6 +1261,7 @@ impl RoneyApp {
             offset: Vec2::ZERO,
             land_bottom: false,
             view_rect: Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
+            panel_h: [0.0; 4],
             display_scale: 1.0,
             lang,
             show_settings: false,
@@ -4397,6 +4404,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         let rtl = self.rtl;
         let goto_open = self.goto_open;
         let modal_open = self.modal.is_some();
+        let settings_open = self.show_settings;
         let projector_open = self.projector_open;
         // Shortcut single-key jangan aktif saat: user mengetik di text field,
         // atau projector (window baru) sedang terbuka.
@@ -4468,7 +4476,13 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 take(none, Key::Delete, Action::Trash, i);
                 take(none, Key::F11, Action::ToggleFullscreen, i);
                 take(none, Key::F1, Action::Help, i);
-                if fullscreen {
+                // Esc adalah milik dialog Pengaturan selama ia terbuka: di
+                // sana Esc berarti "tutup dialog" (lihat draw_overlays).
+                // Jangan dicaplok untuk keluar layar penuh, supaya satu
+                // tekanan tidak menutup dialog DAN mengubah jendela utama
+                // pada frame yang sama. Pola penjagaan yang sama seperti
+                // Enter untuk dialog Lompat/modal di atas.
+                if fullscreen && !settings_open {
                     take(none, Key::Escape, Action::ExitFullscreen, i);
                 }
             }
@@ -5003,6 +5017,104 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         });
     }
 
+    /// Persegi area gambar untuk frame INI, diprediksi dari viewport saat
+    /// ini dikurangi tinggi panel yang terukur frame lalu (`panel_h`).
+    ///
+    /// Panel status digambar SEBELUM panel pusat, jadi `view_rect` pada
+    /// saat itu masih berisi persegi frame SEBELUMNYA. Selama layout
+    /// menetap keduanya sama, tetapi pada frame pertama sesi (alokasi
+    /// panel egui belum mencapai tinggi mapannya: terukur area pusat
+    /// 1100x652 pada frame pertama vs 1100x605 mapan) dan pada setiap
+    /// perubahan layout, angka dari persegi basi menyimpang — terukur
+    /// 29% vs 28% pada pratinjau EXIF 3840x2160 dan transien 51% -> 47%
+    /// pada `med.jpg` (putaran 0.8.26; akar R1/R2 lapangan 0.8.25).
+    /// Prediksi ini memakai viewport frame berjalan (selalu segar) dan
+    /// tinggi panel terukur frame lalu (panel-panel aplikasi ini
+    /// tingginya konstan antar-frame selama tema/bahasa/visibilitasnya
+    /// tidak berubah), sehingga hasilnya sama dengan persegi yang akan
+    /// dipakai `draw_view` pada frame yang sama.
+    ///
+    /// Sebelum ada pengukuran panel apa pun (frame pertama proses, atau
+    /// uji unit yang tidak menjalankan `update`), jatuh ke `view_rect`
+    /// apa adanya — perilaku lama persis.
+    fn current_view_rect(&self, ctx: &Context) -> Rect {
+        if self.fullscreen {
+            return ctx.viewport_rect();
+        }
+        if self.panel_h[2] <= 0.0 {
+            return self.view_rect;
+        }
+        let vp = ctx.viewport_rect();
+        let top = self.panel_h[0]
+            + if self.store.state.show_toolbar {
+                self.panel_h[1]
+            } else {
+                0.0
+            };
+        let bottom = self.panel_h[2]
+            + if self.store.state.show_strip {
+                self.panel_h[3]
+            } else {
+                0.0
+            };
+        Rect::from_min_max(
+            pos2(vp.min.x, vp.min.y + top),
+            pos2(vp.max.x, (vp.max.y - bottom).max(vp.min.y + top)),
+        )
+    }
+
+    /// Skala untuk segmen status, dihitung SEGAR dari halaman yang tampil
+    /// dan persegi tampil saat ini — bukan dari `display_scale` tersimpan.
+    ///
+    /// `display_scale` baru diperbarui di `draw_view`, yang berjalan
+    /// SESUDAH panel status dalam satu frame (panel bawah digambar lebih
+    /// dulu). Jadi pada frame pertama sebuah halaman tampil, segmen status
+    /// membaca skala halaman sebelumnya (atau 100% bawaan di awal), dan
+    /// untuk gambar statis tidak ada repaint lain yang dijadwalkan selama
+    /// fase menunggu — angka basi itu bertahan selama seluruh fase
+    /// pratinjau EXIF (S1): thumbnail-nya sendiri tampil ter-fit (mis.
+    /// 19%) tetapi status menulis 100%. Menghitung di sini dari `orig`
+    /// (dimensi PENUH, yang juga dipakai geometri tampilan) membuat fase
+    /// pratinjau dan fase tajam menampilkan nilai yang sama persis:
+    /// pratinjau EXIF membawa `orig` dimensi penuh sejak awal (lihat
+    /// `loader::jpeg_exif_preview`). Jalur GIF streaming berakar sama dan
+    /// terobati sama: halaman pratinjaunya ber-`orig` kanvas penuh.
+    ///
+    /// Persegi tampilnya dari `current_view_rect` (prediksi frame ini),
+    /// BUKAN `view_rect` basi frame lalu (putaran 0.8.26, akar R1/R2).
+    ///
+    /// Selama sesi edit, yang tampil BUKAN tampilan normal melainkan
+    /// buffer edit yang ter-fit ke area gambar edit; segmen skala harus
+    /// melaporkan skala tampil yang sebenarnya itu (fit buffer ke area
+    /// edit, geometri yang sama seperti `draw_edit_view`). Sebelumnya
+    /// mode edit mewarisi geometri tampilan normal — termasuk mode fit
+    /// tersimpan — sehingga status bisa membaca 47% atau bahkan 100%
+    /// (mode Ukuran Asli) padahal gambar edit tampil ter-fit ±41%
+    /// (temuan R3 lapangan 0.8.25; bukan regresi, bawaan lama).
+    fn status_scale(&self, ctx: &Context) -> f32 {
+        let view = self.current_view_rect(ctx);
+        if let Some(e) = &self.edit {
+            let area = vec2(
+                edit_image_width(
+                    view.width(),
+                    self.store.state.panel_width,
+                    ctx.style().spacing.item_spacing.x,
+                ),
+                view.height(),
+            );
+            return fit_scale(
+                FitMode::Fit,
+                vec2(e.buffer.width() as f32, e.buffer.height() as f32),
+                area,
+            );
+        }
+        let Some(sh) = self.shown.as_ref().filter(|sh| sh.start == self.index) else {
+            return self.display_scale;
+        };
+        let dims = self.shown_dims(ctx, sh);
+        self.geometry(ctx, dims, view).scale
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let lang = self.lang;
         ui.horizontal(|ui| {
@@ -5035,7 +5147,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     ui.separator();
                     ui.label(fileinfo::human_size(total));
                     ui.separator();
-                    let scale = self.display_scale;
+                    let scale = self.status_scale(ui.ctx());
                     ui.label(format!("{:.0}%", scale * 100.0));
                     ui.separator();
                     if let Some(a) = &page.anim {
@@ -5496,6 +5608,17 @@ impl RoneyApp {
                         });
                     });
                 });
+            // Esc menutup dialog Pengaturan. Preseden di aplikasi ini:
+            // dialog Lompat ke halaman (Esc = tutup), kotak modal galat
+            // (Esc = tutup/OK), dan jendela viewport terpisah Properties/
+            // Wallpaper (Esc = tutup). Ini aditif murni: modalitas dan
+            // perilaku lain dialog tidak berubah (tombol X tetap jalan).
+            // read_input sengaja tidak mencaplok Esc untuk keluar layar
+            // penuh selama dialog ini terbuka, jadi tekanan yang sama
+            // tidak bocor ke jendela utama.
+            if open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                open = false;
+            }
             self.show_settings = open;
         }
         if self.goto_open {
@@ -5704,14 +5827,31 @@ impl eframe::App for RoneyApp {
 
         let mut acts: Vec<Action> = Vec::new();
         if !self.fullscreen {
-            egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui, &mut acts));
-            if self.store.state.show_toolbar {
-                egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.draw_toolbar(ctx, ui));
-            }
-            egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+            let rm = egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui, &mut acts));
+            let rtb = if self.store.state.show_toolbar {
+                Some(egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.draw_toolbar(ctx, ui)))
+            } else {
+                None
+            };
+            let rs = egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
             // Strip thumbnail (di atas status bar) untuk navigasi cepat.
-            if self.store.state.show_strip {
-                egui::TopBottomPanel::bottom("strip").show(ctx, |ui| self.draw_strip(ui));
+            let rt = if self.store.state.show_strip {
+                Some(egui::TopBottomPanel::bottom("strip").show(ctx, |ui| self.draw_strip(ui)))
+            } else {
+                None
+            };
+            // Ingat tinggi panel yang tampil frame ini: `status_scale`
+            // memprediksi persegi area gambar frame berjalan dari
+            // angka-angka ini (lihat `current_view_rect`). Panel yang
+            // sedang disembunyikan tidak menimpa catatan terakhirnya;
+            // visibilitasnya disaring saat prediksi.
+            self.panel_h[0] = rm.response.rect.height();
+            if let Some(r) = &rtb {
+                self.panel_h[1] = r.response.rect.height();
+            }
+            self.panel_h[2] = rs.response.rect.height();
+            if let Some(r) = &rt {
+                self.panel_h[3] = r.response.rect.height();
             }
         }
         egui::CentralPanel::default()
@@ -8050,6 +8190,7 @@ mod tests {
             offset: Vec2::ZERO,
             land_bottom: false,
             view_rect: Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
+            panel_h: [0.0; 4],
             display_scale: 1.0,
             lang,
             show_settings: false,
@@ -8260,6 +8401,245 @@ mod tests {
         assert!(app.cache.contains_key(&0), "pratinjau tetap tampil");
         assert!(!app.static_previews.contains(&0), "tidak lagi menunggu");
         assert!(app.errors.contains_key(&0), "galat tercatat untuk status");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------- putaran 0.8.25
+
+    /// Item 1: segmen skala status selama fase pratinjau EXIF harus
+    /// menampilkan skala yang sama dengan sesudah gambar penuh tiba.
+    /// Akar bugnya: status membaca `display_scale` tersimpan, yang baru
+    /// diperbarui `draw_view` SESUDAH panel status digambar — pada frame
+    /// pratinjau pertama ia masih berisi nilai bawaan 1.0 (100%) dan tak
+    /// ada repaint susulan selama fase menunggu, jadi 100% itu bertahan.
+    /// Pembeda angka: persegi tampil 80x60, gambar penuh 400x300 ->
+    /// fit 20%; dari resolusi thumbnail 160x120 hasilnya 50%, dari cache
+    /// basi hasilnya 100% — hanya hitungan dari dimensi PENUH yang benar.
+    #[test]
+    fn skala_status_pratinjau_exif_sama_dengan_sesudah_tajam() {
+        let (mut app, ctx, dir) = aplikasi_uji("skala-pratinjau", &["1.jpg", "2.jpg"]);
+        let (tx, rx) = mpsc::channel::<loader::Loaded>();
+        app.out_rx = rx;
+        app.index = 0;
+        app.view_rect = Rect::from_min_size(Pos2::ZERO, vec2(80.0, 60.0));
+
+        tx.send(loader::Loaded {
+            session: 0,
+            index: 0,
+            outcome: loader::Outcome::StaticPreview(piksel_uji([160, 120], [400, 300])),
+        })
+        .unwrap();
+        app.poll_loader(&ctx);
+        app.current_content();
+        app.display_scale = 1.0; // nilai basi yang dulu terbaca status
+        let skala_pratinjau = app.status_scale(&ctx);
+        assert!(
+            (skala_pratinjau - 0.2).abs() < 1e-6,
+            "selama pratinjau skala harus 20% (dari dimensi penuh), dapat {skala_pratinjau}"
+        );
+
+        tx.send(loader::Loaded {
+            session: 0,
+            index: 0,
+            outcome: loader::Outcome::Ready(piksel_uji([400, 300], [400, 300])),
+        })
+        .unwrap();
+        app.poll_loader(&ctx);
+        app.current_content();
+        app.display_scale = 1.0;
+        let skala_tajam = app.status_scale(&ctx);
+        assert_eq!(skala_pratinjau, skala_tajam, "pratinjau == tajam");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 1, jalur GIF: halaman pratinjau streaming ber-`orig` kanvas
+    /// PENUH dengan tekstur frame pada resolusi tier — skala status harus
+    /// dari kanvas penuh (akar & obat yang sama dengan pratinjau EXIF).
+    #[test]
+    fn skala_status_preview_gif_dari_kanvas_penuh() {
+        let (mut app, ctx, dir) = aplikasi_uji("skala-gif", &["1.gif", "2.jpg"]);
+        let (tx, rx) = mpsc::channel::<loader::Loaded>();
+        app.out_rx = rx;
+        app.index = 0;
+        app.view_rect = Rect::from_min_size(Pos2::ZERO, vec2(80.0, 60.0));
+
+        let frame0 = loader::AnimFrame {
+            image: Arc::new(ColorImage::new([200, 150], vec![Color32::GRAY; 200 * 150])),
+            delay: Duration::from_millis(50),
+        };
+        let mut d = piksel_uji([200, 150], [400, 300]);
+        d.pixels.frames = Some(vec![loader::AnimFrame {
+            image: frame0.image.clone(),
+            delay: frame0.delay,
+        }]);
+        let meta = loader::AnimMeta {
+            total: 3,
+            delays: vec![Duration::from_millis(50); 3],
+            disposes: vec![loader::Dispose::Keep; 3],
+            cadence: 8,
+            truncated: false,
+        };
+        tx.send(loader::Loaded {
+            session: 0,
+            index: 0,
+            outcome: loader::Outcome::Preview(d, meta),
+        })
+        .unwrap();
+        app.poll_loader(&ctx);
+        app.current_content();
+        app.display_scale = 1.0;
+        let skala = app.status_scale(&ctx);
+        assert!(
+            (skala - 0.2).abs() < 1e-6,
+            "preview GIF: skala dari kanvas penuh 400x300 = 20%, dapat {skala}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------- putaran 0.8.26
+
+    /// R1 lapangan 0.8.25: skala status pratinjau EXIF berkas 3840x2160
+    /// (thumbnail 320x180) membaca 29% selama pratinjau vs 28% sesudah
+    /// tajam. Akar terukur di rig: status memakai `view_rect` frame
+    /// SEBELUMNYA; pada frame pertama sesi alokasi panel egui belum
+    /// mapan (area pusat terukur 1100x652 vs 1100x605 mapan), dan fit
+    /// 3840x2160 berpindah rezim tepat di antara keduanya — dari
+    /// persegi basi hasilnya dibatasi lebar (1100/3840 = 0,28646 ->
+    /// "29%"), dari persegi frame ini dibatasi tinggi (605/2160 =
+    /// 0,28009 -> "28%"). (Pada 6000x3375 kedua persegi membulatkan ke
+    /// 18% yang sama, sesuai laporan.) Uji ini memasang keadaan persis
+    /// itu — tinggi panel mapan di `panel_h`, `view_rect` basi 1100x652,
+    /// viewport 1100x760 — dan menuntut skala dari persegi frame ini,
+    /// sama dari jalur pratinjau maupun penuh.
+    #[test]
+    fn skala_status_3840_thumbnail_sama_dari_pratinjau_dan_penuh() {
+        let (mut app, ctx, dir) = aplikasi_uji("skala-3840", &["1.jpg", "2.jpg"]);
+        let (tx, rx) = mpsc::channel::<loader::Loaded>();
+        app.out_rx = rx;
+        app.index = 0;
+        app.panel_h = [22.0, 42.0, 23.0, 68.0];
+        app.view_rect = Rect::from_min_size(Pos2::ZERO, vec2(1100.0, 652.0));
+        let skala_dalam_run = |app: &RoneyApp| -> f32 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1100.0, 760.0))),
+                ..Default::default()
+            };
+            let mut out = None;
+            let _ = ctx.run(raw, |c| {
+                out = Some(app.status_scale(c));
+            });
+            out.unwrap()
+        };
+
+        tx.send(loader::Loaded {
+            session: 0,
+            index: 0,
+            outcome: loader::Outcome::StaticPreview(piksel_uji([320, 180], [3840, 2160])),
+        })
+        .unwrap();
+        app.poll_loader(&ctx);
+        app.current_content();
+        let skala_pratinjau = skala_dalam_run(&app);
+        let harapan = 605.0f32 / 2160.0;
+        assert!(
+            (skala_pratinjau - harapan).abs() < 1e-4,
+            "pratinjau 3840x2160 harus {harapan:.5} (28%), dapat {skala_pratinjau:.5} \
+             (dari persegi basi hasilnya 0.28646 = 29%)"
+        );
+
+        tx.send(loader::Loaded {
+            session: 0,
+            index: 0,
+            outcome: loader::Outcome::Ready(piksel_uji([1886, 1061], [3840, 2160])),
+        })
+        .unwrap();
+        app.poll_loader(&ctx);
+        app.current_content();
+        let skala_tajam = skala_dalam_run(&app);
+        assert_eq!(skala_pratinjau, skala_tajam, "pratinjau == tajam untuk 3840x2160");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3 lapangan 0.8.25: di mode Crop status mewarisi geometri
+    /// tampilan normal — 47% pada mode fit Muat, 100% bila mode fit
+    /// tersimpan adalah Ukuran Asli — padahal gambar edit tampil
+    /// ter-fit ke area edit (buffer 1920x1280 ke area 784x605 pada
+    /// jendela 1100x760 + panel 280 = 40,8%). Skala status selama edit
+    /// harus skala tampil edit itu, kebal terhadap mode fit normal.
+    #[test]
+    fn skala_status_mode_edit_dari_area_edit() {
+        let (mut app, ctx, dir) = aplikasi_uji("skala-edit", &["1.jpg"]);
+        app.index = 0;
+        app.panel_h = [22.0, 42.0, 23.0, 68.0];
+        app.view_rect = Rect::from_min_size(Pos2::ZERO, vec2(1100.0, 652.0));
+        app.store.state.panel_width = 280.0;
+        let buf = RgbaImage::new(1920, 1280);
+        app.edit = Some(EditSession::new("1.jpg".to_string(), buf, None, EditTool::Crop));
+        let skala_dalam_run = |app: &RoneyApp| -> f32 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1100.0, 760.0))),
+                ..Default::default()
+            };
+            let mut out = None;
+            let _ = ctx.run(raw, |c| {
+                out = Some(app.status_scale(c));
+            });
+            out.unwrap()
+        };
+        for mode in [FitMode::Fit, FitMode::Original] {
+            app.fit = mode;
+            app.zoom = Zoom::Fit(mode);
+            let skala = skala_dalam_run(&app);
+            assert!(
+                (skala - 0.40833).abs() < 1e-4,
+                "mode edit (fit normal {mode:?}): skala harus 0.40833 (41%, fit buffer \
+                 ke area edit), dapat {skala:.5}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 2: Esc saat dialog Pengaturan terbuka adalah milik dialog
+    /// (tutup dialog), BUKAN keluar layar penuh — dan sebaliknya, tanpa
+    /// dialog, Esc di layar penuh tetap keluar seperti sebelumnya.
+    /// Diuji lewat `read_input` dengan masukan mentah berisi tekanan Esc.
+    #[test]
+    fn esc_di_pengaturan_tidak_keluar_layar_penuh() {
+        let (mut app, ctx, dir) = aplikasi_uji("esc-pengaturan", &["1.jpg"]);
+        app.fullscreen = true;
+        let tekan_esc = |app: &RoneyApp| {
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: Some(egui::Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let mut inp = None;
+            let _ = ctx.run(raw, |ctx| {
+                inp = Some(app.read_input(ctx));
+            });
+            inp.unwrap()
+        };
+
+        // Dialog tertutup: perilaku lama utuh (Esc -> keluar layar penuh).
+        app.show_settings = false;
+        let inp = tekan_esc(&app);
+        assert!(
+            inp.actions.contains(&Action::ExitFullscreen),
+            "tanpa dialog, Esc harus tetap keluar layar penuh"
+        );
+
+        // Dialog terbuka: Esc tidak boleh menjadi aksi jendela utama.
+        app.show_settings = true;
+        let inp = tekan_esc(&app);
+        assert!(
+            !inp.actions.contains(&Action::ExitFullscreen),
+            "Esc saat Pengaturan terbuka tidak boleh bocor ke jendela utama"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
