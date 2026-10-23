@@ -200,7 +200,7 @@ impl WallpaperDialog {
         }
     }
 
-    fn start_apply(&mut self, ctx: &Context) {
+    fn start_apply(&mut self, ctx: &Context, lang: Lang) {
         let (tx, rx): (Sender<Result<String, String>>, _) = mpsc::channel();
         self.rx = Some(rx);
         self.status = WpStatus::Working;
@@ -227,12 +227,12 @@ impl WallpaperDialog {
                     wallpaper::apply(&backend, &img, original.as_deref(), prefs.style, prefs.mode, prefs.color)
                 };
                 let res = catch_unwind(AssertUnwindSafe(work))
-                    .unwrap_or_else(|_| Err("Kesalahan internal saat menerapkan wallpaper".into()));
+                    .unwrap_or_else(|_| Err(tr(lang, "wp_err_internal").to_string()));
                 let _ = tx.send(res);
                 ctx.request_repaint();
             });
         if spawned.is_err() {
-            self.status = WpStatus::Failed("Tidak dapat memulai proses penerapan".into());
+            self.status = WpStatus::Failed(tr(lang, "wp_err_spawn").to_string());
             self.rx = None;
         }
     }
@@ -304,6 +304,28 @@ fn draw_preview(ui: &mut Ui, dlg: &WallpaperDialog) {
     );
 }
 
+/// Label mode warna untuk DITAMPILKAN sesuai bahasa UI. (Persistensi mode
+/// memakai nama varian serde, bukan label tampil.)
+fn wp_mode_label(lang: Lang, m: ColorMode) -> &'static str {
+    tr(lang, match m {
+        ColorMode::Solid => "wp_mode_solid",
+        ColorMode::Transparent => "wp_mode_transparent",
+    })
+}
+
+/// Label gaya penempatan untuk DITAMPILKAN sesuai bahasa UI (alasan sama
+/// seperti `wp_mode_label`: `WpStyle::label` adalah format persistensi).
+fn wp_style_label(lang: Lang, s: WpStyle) -> &'static str {
+    tr(lang, match s {
+        WpStyle::None => "wp_style_none",
+        WpStyle::Centered => "wp_style_centered",
+        WpStyle::Tiled => "wp_style_tiled",
+        WpStyle::Stretched => "wp_style_stretched",
+        WpStyle::Scaled => "wp_style_scaled",
+        WpStyle::Zoomed => "wp_style_zoomed",
+    })
+}
+
 /// Isi jendela "Set as wallpaper". Mengembalikan true bila harus ditutup.
 pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog, lang: Lang) -> bool {
     if let Some(rx) = &dlg.rx {
@@ -322,17 +344,17 @@ pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog, lan
     ui.add_space(6.0);
 
     egui::Grid::new("wp_grid").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
-        ui.label("Color");
+        ui.label(tr(lang, "wp_color"));
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("wp_color_mode")
-                .selected_text(dlg.prefs.mode.label())
+                .selected_text(wp_mode_label(lang, dlg.prefs.mode))
                 .width(130.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut dlg.prefs.mode, ColorMode::Solid, ColorMode::Solid.label());
+                    ui.selectable_value(&mut dlg.prefs.mode, ColorMode::Solid, wp_mode_label(lang, ColorMode::Solid));
                     ui.selectable_value(
                         &mut dlg.prefs.mode,
                         ColorMode::Transparent,
-                        ColorMode::Transparent.label(),
+                        wp_mode_label(lang, ColorMode::Transparent),
                     );
                 });
             if dlg.prefs.mode == ColorMode::Solid {
@@ -352,13 +374,13 @@ pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog, lan
         });
         ui.end_row();
 
-        ui.label("Style");
+        ui.label(tr(lang, "wp_style"));
         egui::ComboBox::from_id_salt("wp_style")
-            .selected_text(dlg.prefs.style.label())
+            .selected_text(wp_style_label(lang, dlg.prefs.style))
             .width(130.0)
             .show_ui(ui, |ui| {
                 for s in WpStyle::ALL {
-                    ui.selectable_value(&mut dlg.prefs.style, s, s.label());
+                    ui.selectable_value(&mut dlg.prefs.style, s, wp_style_label(lang, s));
                 }
             });
         ui.end_row();
@@ -393,8 +415,8 @@ pub fn draw_wallpaper(ctx: &Context, ui: &mut Ui, dlg: &mut WallpaperDialog, lan
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         let can = dlg.backend.supported() && !matches!(dlg.status, WpStatus::Working);
-        if ui.add_enabled(can, egui::Button::new("Apply")).clicked() {
-            dlg.start_apply(ctx);
+        if ui.add_enabled(can, egui::Button::new(tr(lang, "wp_apply"))).clicked() {
+            dlg.start_apply(ctx, lang);
         }
         if ui.button(tr(lang, "btn_close")).clicked() {
             close = true;

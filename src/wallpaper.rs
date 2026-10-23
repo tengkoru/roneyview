@@ -64,15 +64,6 @@ pub enum ColorMode {
     Transparent,
 }
 
-impl ColorMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            ColorMode::Solid => "Solid color",
-            ColorMode::Transparent => "Transparent",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WpPrefs {

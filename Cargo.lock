@@ -2296,11 +2296,12 @@ dependencies = [
 
 [[package]]
 name = "roneyview"
-version = "0.8.16"
+version = "0.8.20"
 dependencies = [
  "arboard",
  "eframe",
  "fast_image_resize",
+ "gif",
  "image",
  "kamadak-exif",
  "libc",

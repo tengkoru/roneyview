@@ -2,8 +2,10 @@
 //! thread UI. Permintaan "utama" (gambar yang sedang dilihat) selalu didahulukan;
 //! prefetch yang sudah basi dilewati.
 
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -111,7 +113,7 @@ fn describe(e: &image::ImageError, fallback: &str) -> String {
     }
 }
 /// Anggaran memori untuk semua frame satu animasi (RGBA). Lebih dari ini dipotong.
-const ANIM_BUDGET: usize = 128 * 1024 * 1024;
+pub const ANIM_BUDGET: usize = 128 * 1024 * 1024;
 const MAX_ANIM_FRAMES: usize = 1500;
 /// TIFF tidak menyimpan jeda antar-halaman; pakai nilai tetap yang nyaman
 /// untuk dilihat (tetap bisa di-step manual per frame).
@@ -144,6 +146,44 @@ pub enum Command {
     /// baru saja diminta sebagai gambar utama ke worker satunya). Tidak bisa
     /// membatalkan decode yang sudah berjalan; itu tidak apa-apa (hasilnya tetap benar).
     Forget { session: u64, index: usize },
+    /// Lanjutkan stream GIF halaman `index` mulai `start_frame`, mengomposit
+    /// di ruang tier di atas snapshot kanvas `base` (kanvas SESUDAH frame
+    /// `start_frame - 1` diterapkan disposalnya; `None` = kanvas kosong,
+    /// hanya sah untuk `start_frame == 0`). Hasil dikirim sebagai
+    /// `Outcome::AnimChunk`/`AnimDone`/`AnimFailed` seperti stream awal.
+    AnimStream {
+        session: u64,
+        index: usize,
+        start_frame: usize,
+        base: Option<Arc<ColorImage>>,
+        max_side: usize,
+        max_pixels: usize,
+    },
+    /// Batalkan stream GIF yang sedang berjalan/antre untuk indeks ini
+    /// (stream lama digantikan stream baru, atau halamannya dibuang).
+    CancelAnim { session: u64, index: usize },
+    /// Simpan frame ke-`frame` dari GIF animasi halaman `index` sebagai PNG
+    /// di `dest`, didekode penuh berurutan di worker (UI tidak membeku).
+    /// Hasil: `Outcome::AnimSaved` / `Outcome::AnimJobFailed`.
+    SaveAnimFrame {
+        session: u64,
+        index: usize,
+        frame: usize,
+        dest: PathBuf,
+        max_side: usize,
+        max_pixels: usize,
+    },
+    /// Ekspor SEMUA frame GIF animasi halaman `index` sebagai PNG ke `dir`
+    /// (nama `{stem}_frameNNN.png`), didekode berurutan di worker.
+    /// Hasil: `Outcome::AnimExported` / `Outcome::AnimJobFailed`.
+    ExportAnimFrames {
+        session: u64,
+        index: usize,
+        dir: PathBuf,
+        stem: String,
+        max_side: usize,
+        max_pixels: usize,
+    },
 }
 
 pub struct AnimFrame {
@@ -170,8 +210,111 @@ pub struct Decoded {
     pub file_size: u64,
 }
 
+/// Metode disposal satu frame GIF (cara kanvas diperlakukan sesudah frame
+/// ini ditampilkan), nilai yang sama seperti `gif::DisposalMethod`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dispose {
+    Any,
+    Keep,
+    Background,
+    Previous,
+}
+
+impl Dispose {
+    fn from_gif(d: gif::DisposalMethod) -> Self {
+        match d {
+            gif::DisposalMethod::Any => Dispose::Any,
+            gif::DisposalMethod::Keep => Dispose::Keep,
+            gif::DisposalMethod::Background => Dispose::Background,
+            gif::DisposalMethod::Previous => Dispose::Previous,
+        }
+    }
+
+    /// True bila kanvas sesudah frame ini SAMA dengan gambar frame yang
+    /// tampil — hanya saat itu gambar frame tersimpan bisa dipakai sebagai
+    /// kanvas dasar untuk mengomposit frame berikutnya.
+    pub fn keeps_canvas(self) -> bool {
+        matches!(self, Dispose::Any | Dispose::Keep)
+    }
+}
+
+/// Indeks satu frame GIF dari pemindaian dua fase: semua yang perlu
+/// diketahui TANPA mendekode piksel frame itu.
+#[derive(Clone, Debug)]
+pub struct GifFrameInfo {
+    /// Posisi byte awal grup blok frame ini (GCE bila ada, kalau tidak
+    /// deskriptor gambarnya) — titik mulai untuk membuka dekoder tepat
+    /// di frame ini (dengan awalan header berkas di depannya).
+    pub offset: usize,
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Jeda tampil, sudah dinormalisasi seperti jalur lama
+    /// (delay GIF x10 ms; < 20 ms -> 100 ms; maks 10 detik).
+    pub delay: Duration,
+    pub dispose: Dispose,
+    /// Indeks palet transparan frame ini, bila ada.
+    pub transparent: Option<u8>,
+    /// True bila rect frame menutupi seluruh kanvas logis.
+    pub full_cover: bool,
+}
+
+/// Indeks lengkap satu berkas GIF animasi (fase satu streaming).
+#[derive(Clone, Debug)]
+pub struct GifIndex {
+    /// Dimensi kanvas logis GIF.
+    pub canvas: [u32; 2],
+    pub frames: Vec<GifFrameInfo>,
+    /// Panjang awalan berkas sebelum grup blok frame pertama
+    /// (header + deskriptor layar + palet global + ekstensi awal).
+    pub prefix_len: usize,
+    /// True bila berkas punya frame melebihi `MAX_ANIM_FRAMES`
+    /// (frame selebihnya tidak diindeks dan tidak akan dimuat).
+    pub truncated: bool,
+}
+
+/// Metadata animasi yang dikirim bersama `Outcome::Preview` versi
+/// streaming: total frame dan tabel jeda/disposal SUDAH diketahui penuh
+/// sejak awal berkat indeks dua fase, walau frame-frame-nya sendiri
+/// masih mengalir lewat `Outcome::AnimChunk`.
+pub struct AnimMeta {
+    pub total: usize,
+    pub delays: Vec<Duration>,
+    pub disposes: Vec<Dispose>,
+    /// Jarak snapshot checkpoint kanvas (dalam frame) yang dikirim
+    /// worker bersama potongan frame.
+    pub cadence: usize,
+    /// True bila total dipotong pada `MAX_ANIM_FRAMES`.
+    pub truncated: bool,
+}
+
 pub enum Outcome {
     Ready(Decoded),
+    /// Frame pertama GIF animasi dari jalur streaming, dikirim segera
+    /// supaya langsung tampil selagi frame sisanya mengalir. Disusul
+    /// `AnimChunk`* lalu tepat satu `AnimDone`/`AnimFailed`.
+    Preview(Decoded, AnimMeta),
+    /// Potongan frame komposit hasil streaming (frame `start` ..
+    /// `start + frames.len()`), ditambahkan app ke halaman yang tampil.
+    /// `checkpoints` berisi snapshot kanvas (resolusi tier) SESUDAH
+    /// frame berindeks itu diterapkan disposalnya.
+    AnimChunk {
+        start: usize,
+        frames: Vec<AnimFrame>,
+        checkpoints: Vec<(usize, Arc<ColorImage>)>,
+    },
+    /// Stream GIF selesai: semua frame sampai `total` sudah dikirim.
+    AnimDone { total: usize },
+    /// Stream GIF putus di tengah: frame sebelum `from_frame` tetap
+    /// tampil, sisanya tidak termuat.
+    AnimFailed { from_frame: usize, message: String },
+    /// Ekspor frame selesai (atau berhenti lebih awal: `done < total`).
+    AnimExported { done: usize, total: usize, dir: PathBuf },
+    /// Satu frame animasi tersimpan sebagai PNG lewat worker.
+    AnimSaved { dest: PathBuf },
+    /// Tugas animasi sampingan (simpan/ekspor frame) gagal.
+    AnimJobFailed { message: String },
     Failed(String),
     Skipped,
 }
@@ -192,6 +335,32 @@ struct Job {
     seq: u64,
 }
 
+/// Tugas animasi sampingan untuk worker utama, diproses di sela-sela
+/// antrean `Load` (sesudah permintaan utama, sebelum diam total).
+enum AnimTask {
+    Stream {
+        index: usize,
+        start_frame: usize,
+        base: Option<Arc<ColorImage>>,
+        max_side: usize,
+        max_pixels: usize,
+    },
+    SaveFrame {
+        index: usize,
+        frame: usize,
+        dest: PathBuf,
+        max_side: usize,
+        max_pixels: usize,
+    },
+    Export {
+        index: usize,
+        dir: PathBuf,
+        stem: String,
+        max_side: usize,
+        max_pixels: usize,
+    },
+}
+
 struct Worker {
     ctx: Context,
     tx: Sender<Loaded>,
@@ -204,6 +373,14 @@ struct Worker {
     /// true = worker utama (hanya memproses permintaan utama),
     /// false = worker prefetch (hanya memproses prefetch).
     handles_primary: bool,
+    /// Kanal perintah, disimpan supaya loop streaming bisa menguras
+    /// perintah yang datang di tengah stream (batal / sesi baru).
+    rx: Option<Receiver<Command>>,
+    anim_tasks: VecDeque<AnimTask>,
+    /// (sesi, indeks) stream yang SEDANG berjalan di worker ini.
+    stream_key: Option<(u64, usize)>,
+    /// Ditetapkan saat stream berjalan harus berhenti di potongan berikut.
+    abort_stream: bool,
 }
 
 /// Mulai thread pemuat. Mengembalikan `(utama, prefetch, hasil)`:
@@ -241,6 +418,10 @@ pub fn spawn(
                     seq: 0,
                     focus: 0,
                     handles_primary,
+                    rx: None,
+                    anim_tasks: VecDeque::new(),
+                    stream_key: None,
+                    abort_stream: false,
                 }
                 .run(rx)
             })?;
@@ -250,32 +431,45 @@ pub fn spawn(
 
 impl Worker {
     fn run(mut self, rx: Receiver<Command>) {
+        self.rx = Some(rx);
         loop {
-            if self.queue.is_empty() {
-                match rx.recv() {
-                    Ok(c) => self.apply(c),
-                    Err(_) => return, // UI sudah tutup
+            if self.queue.is_empty() && self.anim_tasks.is_empty() {
+                match self.rx.as_ref().map(|r| r.recv()) {
+                    Some(Ok(c)) => self.apply(c),
+                    _ => return, // UI sudah tutup
                 }
             }
-            while let Ok(c) = rx.try_recv() {
-                self.apply(c);
+            self.drain_commands();
+            if let Some(job) = self.next_job() {
+                let outcome = self.process(&job);
+                // Permintaan ganda untuk indeks yang sama tidak perlu didekode lagi.
+                self.queue.retain(|j| j.index != job.index);
+                let msg = Loaded {
+                    session: self.session,
+                    index: job.index,
+                    outcome,
+                };
+                if self.tx.send(msg).is_err() {
+                    return;
+                }
+                self.ctx.request_repaint();
+            } else if let Some(task) = self.anim_tasks.pop_front() {
+                self.process_anim_task(task);
             }
-            let Some(job) = self.next_job() else {
-                continue;
-            };
-            let outcome = self.process(&job);
-            // Permintaan ganda untuk indeks yang sama tidak perlu didekode lagi.
-            self.queue.retain(|j| j.index != job.index);
-            let msg = Loaded {
-                session: self.session,
-                index: job.index,
-                outcome,
-            };
-            if self.tx.send(msg).is_err() {
-                return;
-            }
-            self.ctx.request_repaint();
         }
+    }
+
+    /// Terapkan semua perintah yang sudah menunggu di kanal. Dipakai juga
+    /// dari tengah loop streaming: perintah `Open`/`CancelAnim` yang tiba
+    /// saat stream berjalan harus segera terasa efeknya.
+    fn drain_commands(&mut self) {
+        let Some(rx) = self.rx.take() else {
+            return;
+        };
+        while let Ok(c) = rx.try_recv() {
+            self.apply(c);
+        }
+        self.rx = Some(rx);
     }
 
     fn apply(&mut self, cmd: Command) {
@@ -285,6 +479,10 @@ impl Worker {
                 self.listing = Some(listing);
                 self.reader = None;
                 self.queue.clear();
+                self.anim_tasks.clear();
+                // Stream sesi lama (kalau sedang berjalan) berhenti di
+                // potongan berikutnya.
+                self.abort_stream = true;
                 self.focus = 0;
             }
             Command::Load {
@@ -340,6 +538,78 @@ impl Worker {
                 // balasan: peminta sudah mencatatnya sebagai permintaan utama.
                 self.queue.retain(|j| j.index != index);
             }
+            Command::AnimStream {
+                session,
+                index,
+                start_frame,
+                base,
+                max_side,
+                max_pixels,
+            } => {
+                if !self.handles_primary || session != self.session {
+                    return;
+                }
+                // Stream baru untuk indeks yang sama menggantikan yang antre.
+                self.anim_tasks.retain(|t| {
+                    !matches!(t, AnimTask::Stream { index: i, .. } if *i == index)
+                });
+                self.anim_tasks.push_back(AnimTask::Stream {
+                    index,
+                    start_frame,
+                    base,
+                    max_side,
+                    max_pixels,
+                });
+            }
+            Command::CancelAnim { session, index } => {
+                if session != self.session {
+                    return;
+                }
+                self.anim_tasks.retain(|t| {
+                    !matches!(t, AnimTask::Stream { index: i, .. } if *i == index)
+                });
+                if self.stream_key == Some((session, index)) {
+                    self.abort_stream = true;
+                }
+            }
+            Command::SaveAnimFrame {
+                session,
+                index,
+                frame,
+                dest,
+                max_side,
+                max_pixels,
+            } => {
+                if !self.handles_primary || session != self.session {
+                    return;
+                }
+                self.anim_tasks.push_back(AnimTask::SaveFrame {
+                    index,
+                    frame,
+                    dest,
+                    max_side,
+                    max_pixels,
+                });
+            }
+            Command::ExportAnimFrames {
+                session,
+                index,
+                dir,
+                stem,
+                max_side,
+                max_pixels,
+            } => {
+                if !self.handles_primary || session != self.session {
+                    return;
+                }
+                self.anim_tasks.push_back(AnimTask::Export {
+                    index,
+                    dir,
+                    stem,
+                    max_side,
+                    max_pixels,
+                });
+            }
         }
     }
 
@@ -361,22 +631,27 @@ impl Worker {
         Some(self.queue.swap_remove(pos))
     }
 
-    fn process(&mut self, job: &Job) -> Outcome {
-        if !job.primary && job.index.abs_diff(self.focus) > PREFETCH_RADIUS {
-            return Outcome::Skipped;
-        }
+    /// Baca byte satu entri listing lewat reader sesi ini (dibuka malas).
+    /// Dipakai jalur `Load` maupun tugas animasi; pesan galatnya sama.
+    fn read_listing_bytes(&mut self, index: usize) -> Result<Vec<u8>, String> {
         let Some(listing) = self.listing.clone() else {
-            return Outcome::Failed("Tidak ada sumber yang terbuka".into());
+            return Err("Tidak ada sumber yang terbuka".into());
         };
         if self.reader.is_none() {
             self.reader = Some(listing.open_reader());
         }
-        let reader = match self.reader.as_mut() {
-            Some(Ok(r)) => r,
-            Some(Err(e)) => return Outcome::Failed(e.clone()),
-            None => return Outcome::Failed("Pembaca sumber tidak tersedia".into()),
-        };
-        let bytes = match reader.read(job.index) {
+        match self.reader.as_mut() {
+            Some(Ok(r)) => r.read(index),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("Pembaca sumber tidak tersedia".into()),
+        }
+    }
+
+    fn process(&mut self, job: &Job) -> Outcome {
+        if !job.primary && job.index.abs_diff(self.focus) > PREFETCH_RADIUS {
+            return Outcome::Skipped;
+        }
+        let bytes = match self.read_listing_bytes(job.index) {
             Ok(b) => b,
             Err(e) => return Outcome::Failed(e),
         };
@@ -393,6 +668,14 @@ impl Worker {
                 }
             }
         }
+        // GIF animasi pada permintaan utama: jalur streaming (indeks dua
+        // fase, frame pertama segera, sisa frame mengalir sebagai
+        // potongan). Semua pesannya dikirim langsung dari sini; `true`
+        // berarti berkas ini sudah tertangani penuh (termasuk galatnya).
+        // Bukan GIF animasi -> `false`, jalur decode biasa di bawah.
+        if job.primary && self.stream_gif_initial(job, &bytes) {
+            return Outcome::Skipped;
+        }
         match catch_unwind(AssertUnwindSafe(|| {
             decode_progressive(&bytes, job.max_side, job.max_pixels)
         })) {
@@ -405,6 +688,876 @@ impl Worker {
                 "Dekoder gagal memproses berkas ini (data kemungkinan rusak)".into(),
             ),
         }
+    }
+}
+
+// ------------------------------------------------------------ streaming GIF
+//
+// Jalur khusus GIF animasi untuk permintaan utama. Dua fase:
+// (1) INDEKS — struktur blok dipindai mentah (offset tiap frame) dan
+//     metadata semua frame dibaca lewat dekoder `gif` dengan
+//     `skip_frame_decoding` (tanpa mendekode piksel), jadi total frame,
+//     jeda, rect, dan disposal diketahui sejak awal;
+// (2) STREAM — dekoder dibuka tepat di offset frame yang dibutuhkan dan
+//     frame dikomposit SATU per satu ke satu kanvas (semantik disposal
+//     sama persis dengan iterator `image::codecs::gif`), frame pertama
+//     dikirim segera sebagai `Preview`, sisanya sebagai `AnimChunk`.
+// Karena komposit dilakukan berurutan dari SATU aliran, frame lama yang
+// terdesak anggaran di sisi app bisa dibuat ulang kapan pun dari
+// checkpoint + offset indeks — tidak ada lagi pemotongan permanen.
+
+/// Pindai struktur blok GIF mentah: posisi awal grup blok tiap frame
+/// (dimulai dari GCE frame itu bila ada, kalau tidak dari deskriptor
+/// gambarnya). `None` = struktur tidak dikenali (pemanggil jatuh ke
+/// jalur lama); berkas terpotong juga menghasilkan `None` di sini —
+/// jalur lama yang memutuskan galat/parsialnya.
+fn gif_block_offsets(bytes: &[u8]) -> Option<Vec<usize>> {
+    if bytes.len() < 14 || !matches!(&bytes[0..6], b"GIF87a" | b"GIF89a") {
+        return None;
+    }
+    // Lewati rangkaian sub-blok data: (ukuran, isi)* diakhiri ukuran 0.
+    fn skip_sub_blocks(bytes: &[u8], mut pos: usize) -> Option<usize> {
+        loop {
+            let n = *bytes.get(pos)? as usize;
+            pos += 1;
+            if n == 0 {
+                return Some(pos);
+            }
+            pos = pos.checked_add(n)?;
+            if pos > bytes.len() {
+                return None;
+            }
+        }
+    }
+    let packed = *bytes.get(10)?;
+    let mut pos = 13usize;
+    if packed & 0x80 != 0 {
+        // Palet global: 3 * 2^(N+1) byte.
+        pos = pos.checked_add(3usize << ((packed & 0x07) + 1))?;
+    }
+    let mut offsets = Vec::new();
+    // Awal grup blok frame berikutnya (ekstensi pertama sesudah frame
+    // sebelumnya); GCE sebuah frame selalu di dalam grupnya sendiri.
+    let mut group_start: Option<usize> = None;
+    loop {
+        let b = *bytes.get(pos)?;
+        match b {
+            0x3B => break, // trailer
+            0x21 => {
+                // Ekstensi: label 1 byte lalu sub-blok (GCE pun berbentuk
+                // sub-blok berukuran 4, jadi aturan umum ini berlaku).
+                if group_start.is_none() {
+                    group_start = Some(pos);
+                }
+                pos = skip_sub_blocks(bytes, pos + 2)?;
+            }
+            0x2C => {
+                let start = group_start.take().unwrap_or(pos);
+                offsets.push(start);
+                // Deskriptor gambar: 9 byte sesudah 0x2C; byte terakhir
+                // (packed) menentukan palet lokal.
+                let desc_packed = *bytes.get(pos + 9)?;
+                pos += 10;
+                if desc_packed & 0x80 != 0 {
+                    pos = pos.checked_add(3usize << ((desc_packed & 0x07) + 1))?;
+                }
+                pos += 1; // LZW minimum code size
+                pos = skip_sub_blocks(bytes, pos)?;
+            }
+            _ => return None,
+        }
+    }
+    if offsets.is_empty() {
+        None
+    } else {
+        Some(offsets)
+    }
+}
+
+fn gif_memory_limit() -> gif::MemoryLimit {
+    match std::num::NonZeroU64::new(alloc_limit().max(1)) {
+        Some(n) => gif::MemoryLimit::Bytes(n),
+        None => gif::MemoryLimit::Unlimited,
+    }
+}
+
+/// Fase satu streaming: bangun indeks lengkap GIF dari `bytes`.
+/// `None` = bukan GIF, bukan animasi (< 2 frame), strukturnya tidak
+/// konsisten, atau berkasnya rusak di tingkat header — dalam semua
+/// kasus itu jalur decode lama yang menangani (dan melaporkan galatnya)
+/// supaya perilaku di luar jalur streaming tidak berubah sedikit pun.
+fn scan_gif_index(bytes: &[u8]) -> Option<GifIndex> {
+    if image::guess_format(bytes).ok() != Some(ImageFormat::Gif) {
+        return None;
+    }
+    let offsets = gif_block_offsets(bytes)?;
+    let mut opts = gif::DecodeOptions::new();
+    opts.set_color_output(gif::ColorOutput::RGBA);
+    opts.skip_frame_decoding(true);
+    opts.set_memory_limit(gif_memory_limit());
+    let mut dec = opts.read_info(Cursor::new(bytes)).ok()?;
+    let (cw, ch) = (u32::from(dec.width()), u32::from(dec.height()));
+    // Bom dimensi ditolak jalur lama dengan pesan yang jelas; di sini
+    // cukup jangan masuk jalur streaming.
+    check_canvas(cw, ch).ok()?;
+    let mut frames: Vec<GifFrameInfo> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let info = match dec.next_frame_info() {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(_) => return None,
+        };
+        if frames.len() >= MAX_ANIM_FRAMES {
+            truncated = true;
+            break;
+        }
+        // Sama seperti `image`: delay satuan 10 ms, lalu normalisasi
+        // peramban yang sama seperti `decode_animated`.
+        let ms_raw = u32::from(info.delay) * 10;
+        let ms = if ms_raw < 20 { 100 } else { ms_raw.min(10_000) };
+        let (left, top, w, h) = (
+            u32::from(info.left),
+            u32::from(info.top),
+            u32::from(info.width),
+            u32::from(info.height),
+        );
+        frames.push(GifFrameInfo {
+            offset: 0, // diisi di bawah sesudah jumlahnya cocok
+            left,
+            top,
+            width: w,
+            height: h,
+            delay: Duration::from_millis(u64::from(ms)),
+            dispose: Dispose::from_gif(info.dispose),
+            transparent: info.transparent,
+            full_cover: left == 0 && top == 0 && w == cw && h == ch,
+        });
+    }
+    if frames.len() < 2 {
+        return None;
+    }
+    // Dua pemindai independen harus sepakat soal jumlah frame; bila
+    // tidak, struktur berkas ini tidak dipahami — jalur lama saja.
+    if truncated {
+        if offsets.len() <= frames.len() {
+            return None;
+        }
+    } else if offsets.len() != frames.len() {
+        return None;
+    }
+    for (f, off) in frames.iter_mut().zip(offsets.iter()) {
+        f.offset = *off;
+    }
+    Some(GifIndex {
+        canvas: [cw, ch],
+        prefix_len: offsets[0],
+        frames,
+        truncated,
+    })
+}
+
+/// Campur satu piksel seperti iterator GIF di crate `image`:
+/// piksel frame beralfa 0 mempertontonkan piksel kanvas sebelumnya;
+/// kanvas diperbarui menurut disposal frame ini.
+fn blend_pixel(dispose: Dispose, previous: &mut image::Rgba<u8>, current: &mut image::Rgba<u8>) {
+    if current.0[3] == 0 {
+        *current = *previous;
+    }
+    match dispose {
+        Dispose::Any | Dispose::Keep => *previous = *current,
+        Dispose::Background => *previous = image::Rgba([0, 0, 0, 0]),
+        Dispose::Previous => {}
+    }
+}
+
+/// Komposit `frame` (RGBA seukuran rect-nya) ke `canvas` pada posisi
+/// (left, top) dengan aturan disposal `dispose`; `canvas` bermutasi
+/// menjadi keadaan untuk frame BERIKUTNYA dan nilai kembaliannya
+/// adalah gambar yang tampil untuk frame ini. Semantiknya meniru
+/// persis `GifFrameIterator` di crate `image` (termasuk mengabaikan
+/// warna latar, seperti komentar di sana: demi kompatibilitas web).
+fn composite_onto(
+    canvas: &mut RgbaImage,
+    frame: &RgbaImage,
+    left: u32,
+    top: u32,
+    dispose: Dispose,
+) -> RgbaImage {
+    let (cw, ch) = canvas.dimensions();
+    let mut out = canvas.clone();
+    let x0 = left.min(cw);
+    let y0 = top.min(ch);
+    let x1 = left.saturating_add(frame.width()).min(cw);
+    let y1 = top.saturating_add(frame.height()).min(ch);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut cur = *frame.get_pixel(x - left, y - top);
+            let prev = canvas.get_pixel_mut(x, y);
+            blend_pixel(dispose, prev, &mut cur);
+            *out.get_pixel_mut(x, y) = cur;
+        }
+    }
+    out
+}
+
+/// Jarak snapshot checkpoint (dalam frame) untuk animasi sepanjang
+/// `total` dengan biaya `frame_bytes` per frame: cukup rapat supaya
+/// decode-ulang dari checkpoint murah, cukup jarang supaya snapshotnya
+/// sendiri tidak menghabiskan anggaran frame.
+fn checkpoint_cadence(total: usize, frame_bytes: usize) -> usize {
+    if total == 0 || frame_bytes == 0 {
+        return 1;
+    }
+    let slots = (ANIM_BUDGET / frame_bytes).max(1);
+    let want = (slots / 3).clamp(1, 8);
+    total.div_ceil(want).max(1)
+}
+
+/// Aliran dekode GIF yang dibuka tepat di satu frame indeks dan
+/// menghasilkan gambar komposit (resolusi penuh) berurutan dari sana.
+struct GifPlayer {
+    dec: gif::Decoder<Cursor<Vec<u8>>>,
+    /// Kanvas post-disposal (keadaan untuk frame berikutnya).
+    canvas: RgbaImage,
+    buf: Vec<u8>,
+}
+
+impl GifPlayer {
+    fn open(bytes: &[u8], gi: &GifIndex, start: usize) -> Result<GifPlayer, String> {
+        let off = gi.frames[start].offset;
+        // Aliran = awalan berkas (header + palet global) + byte dari
+        // grup blok frame `start` sampai akhir berkas. Palet lokal dan
+        // GCE tiap frame ikut di dalam grup bloknya masing-masing.
+        let mut stream = Vec::with_capacity(bytes.len().saturating_sub(off) + gi.prefix_len);
+        stream.extend_from_slice(&bytes[..gi.prefix_len]);
+        stream.extend_from_slice(&bytes[off..]);
+        let mut opts = gif::DecodeOptions::new();
+        opts.set_color_output(gif::ColorOutput::RGBA);
+        opts.set_memory_limit(gif_memory_limit());
+        let dec = opts
+            .read_info(Cursor::new(stream))
+            .map_err(|_| "GIF rusak atau tidak lengkap".to_string())?;
+        Ok(GifPlayer {
+            dec,
+            canvas: RgbaImage::from_pixel(gi.canvas[0], gi.canvas[1], image::Rgba([0, 0, 0, 0])),
+            buf: Vec::new(),
+        })
+    }
+
+    /// Frame mentah berikutnya: piksel RGBA seukuran rect frame itu
+    /// sendiri (belum dikomposit), beserta posisi dan disposalnya.
+    /// `None` bila aliran habis.
+    fn next_raw(&mut self) -> Option<Result<(RgbaImage, u32, u32, Dispose), String>> {
+        let (left, top, fw, fh, dispose) = match self.dec.next_frame_info() {
+            Ok(Some(f)) => (
+                u32::from(f.left),
+                u32::from(f.top),
+                u32::from(f.width),
+                u32::from(f.height),
+                Dispose::from_gif(f.dispose),
+            ),
+            Ok(None) => return None,
+            Err(e) => return Some(Err(format!("Animasi rusak: {e}"))),
+        };
+        let need = self.dec.buffer_size();
+        let mut buf = std::mem::take(&mut self.buf);
+        if buf.len() != need {
+            buf = vec![0; need];
+        }
+        if let Err(e) = self.dec.read_into_buffer(&mut buf) {
+            return Some(Err(format!("Animasi rusak: {e}")));
+        }
+        match RgbaImage::from_raw(fw, fh, buf) {
+            Some(r) => Some(Ok((r, left, top, dispose))),
+            None => Some(Err("Animasi rusak: ukuran frame tidak cocok".into())),
+        }
+    }
+
+    /// Frame komposit berikutnya (resolusi penuh, sebelum shrink tier),
+    /// atau `None` bila aliran habis.
+    fn next_frame(&mut self) -> Option<Result<RgbaImage, String>> {
+        match self.next_raw() {
+            Some(Ok((raw, left, top, dispose))) => {
+                Some(Ok(composite_onto(&mut self.canvas, &raw, left, top, dispose)))
+            }
+            Some(Err(e)) => Some(Err(e)),
+            None => None,
+        }
+    }
+
+    /// Snapshot kanvas saat ini (post-disposal) pada resolusi tier:
+    /// inilah checkpoint yang disimpan app untuk stream lanjutan.
+    fn canvas_tier(&self, max_side: u32, max_pixels: usize) -> ColorImage {
+        to_color_image(shrink(
+            DynamicImage::ImageRgba8(self.canvas.clone()),
+            max_side,
+            max_pixels,
+        ))
+    }
+}
+
+/// Ubah `ColorImage` (egui, alfa premultiplied) menjadi `RgbaImage`
+/// beralfa lurus — kembaran helper di app.rs, untuk tugas worker yang
+/// menyimpan PNG dari snapshot checkpoint.
+fn color_image_to_rgba(img: &ColorImage) -> RgbaImage {
+    let w = img.width() as u32;
+    let h = img.height() as u32;
+    let mut raw = Vec::with_capacity(img.pixels.len() * 4);
+    for p in &img.pixels {
+        let [r, g, b, a] = p.to_array();
+        if a == 0 {
+            raw.extend_from_slice(&[0, 0, 0, 0]);
+        } else if a == 255 {
+            raw.extend_from_slice(&[r, g, b, 255]);
+        } else {
+            let un = |c: u8| ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8;
+            raw.extend_from_slice(&[un(r), un(g), un(b), a]);
+        }
+    }
+    RgbaImage::from_raw(w, h, raw).expect("jumlah piksel cocok dengan dimensi")
+}
+
+impl Worker {
+    /// Kirim satu pesan hasil dari tengah sebuah stream/tugas.
+    fn send_loaded(&self, index: usize, outcome: Outcome) {
+        let msg = Loaded {
+            session: self.session,
+            index,
+            outcome,
+        };
+        if self.tx.send(msg).is_ok() {
+            self.ctx.request_repaint();
+        }
+    }
+
+    /// Kuras perintah yang menunggu; kembalikan `true` bila stream yang
+    /// sedang berjalan untuk `index` harus berhenti sekarang (dibatalkan
+    /// app atau sesi berganti).
+    fn stream_aborted(&mut self, index: usize) -> bool {
+        self.drain_commands();
+        if self.abort_stream {
+            self.abort_stream = false;
+            self.stream_key = None;
+            let _ = index;
+            return true;
+        }
+        false
+    }
+
+    /// Gerbang streaming untuk permintaan utama: `true` = berkas ini GIF
+    /// animasi dan sudah tertangani penuh lewat pesan-pesan streaming
+    /// (termasuk galatnya); `false` = bukan ranah streaming, jalur
+    /// decode biasa yang melanjutkan.
+    fn stream_gif_initial(&mut self, job: &Job, bytes: &[u8]) -> bool {
+        if image::guess_format(bytes).ok() != Some(ImageFormat::Gif) {
+            return false;
+        }
+        match catch_unwind(AssertUnwindSafe(|| self.stream_gif_initial_inner(job, bytes))) {
+            Ok(h) => h,
+            Err(_) => {
+                self.stream_key = None;
+                self.send_loaded(
+                    job.index,
+                    Outcome::AnimFailed {
+                        from_frame: 0,
+                        message: "Dekoder gagal memproses berkas ini (data kemungkinan rusak)"
+                            .into(),
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    fn stream_gif_initial_inner(&mut self, job: &Job, bytes: &[u8]) -> bool {
+        let Some(gi) = scan_gif_index(bytes) else {
+            return false;
+        };
+        let max_side = job.max_side.clamp(1024, 16384) as u32;
+        let total = gi.frames.len();
+        let (tw, th) = fit_target(gi.canvas[0], gi.canvas[1], max_side, job.max_pixels);
+        let cadence = checkpoint_cadence(total, tw as usize * th as usize * 4);
+        let mut player = match GifPlayer::open(bytes, &gi, 0) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_loaded(job.index, Outcome::Failed(e));
+                return true;
+            }
+        };
+        self.stream_key = Some((self.session, job.index));
+        self.abort_stream = false;
+        let mut chunk: Vec<AnimFrame> = Vec::new();
+        let mut chunk_start = 1;
+        let mut cps: Vec<(usize, Arc<ColorImage>)> = Vec::new();
+        for i in 0..total {
+            match player.next_frame() {
+                Some(Ok(displayed)) => {
+                    let frame = AnimFrame {
+                        image: Arc::new(to_color_image(shrink(
+                            DynamicImage::ImageRgba8(displayed),
+                            max_side,
+                            job.max_pixels,
+                        ))),
+                        delay: gi.frames[i].delay,
+                    };
+                    if i == 0 {
+                        let meta = AnimMeta {
+                            total,
+                            delays: gi.frames.iter().map(|f| f.delay).collect(),
+                            disposes: gi.frames.iter().map(|f| f.dispose).collect(),
+                            cadence,
+                            truncated: gi.truncated,
+                        };
+                        let px = Pixels {
+                            image: frame.image.clone(),
+                            orig: gi.canvas,
+                            frames: Some(vec![frame]),
+                            truncated: false,
+                            format: format!(
+                                "{} (animasi, {} frame)",
+                                format_name(bytes),
+                                total
+                            ),
+                        };
+                        self.send_loaded(
+                            job.index,
+                            Outcome::Preview(
+                                Decoded {
+                                    pixels: px,
+                                    file_size: bytes.len() as u64,
+                                },
+                                meta,
+                            ),
+                        );
+                    } else {
+                        if chunk.is_empty() {
+                            chunk_start = i;
+                        }
+                        chunk.push(frame);
+                    }
+                    if i % cadence == 0 {
+                        cps.push((i, Arc::new(player.canvas_tier(max_side, job.max_pixels))));
+                    }
+                    let last = i + 1 == total;
+                    if !chunk.is_empty() && (chunk.len() >= 4 || last) {
+                        let frames = std::mem::take(&mut chunk);
+                        let checkpoints = std::mem::take(&mut cps);
+                        self.send_loaded(
+                            job.index,
+                            Outcome::AnimChunk {
+                                start: chunk_start,
+                                frames,
+                                checkpoints,
+                            },
+                        );
+                        if self.stream_aborted(job.index) {
+                            return true;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    self.stream_key = None;
+                    if i == 0 {
+                        self.send_loaded(job.index, Outcome::Failed(e));
+                    } else {
+                        self.send_loaded(
+                            job.index,
+                            Outcome::AnimFailed {
+                                from_frame: i,
+                                message: e,
+                            },
+                        );
+                    }
+                    return true;
+                }
+                None => {
+                    self.stream_key = None;
+                    let message =
+                        "Animasi rusak: aliran frame berhenti lebih awal".to_string();
+                    if i == 0 {
+                        self.send_loaded(job.index, Outcome::Failed(message));
+                    } else {
+                        self.send_loaded(
+                            job.index,
+                            Outcome::AnimFailed {
+                                from_frame: i,
+                                message,
+                            },
+                        );
+                    }
+                    return true;
+                }
+            }
+        }
+        if !cps.is_empty() {
+            self.send_loaded(
+                job.index,
+                Outcome::AnimChunk {
+                    start: total,
+                    frames: Vec::new(),
+                    checkpoints: std::mem::take(&mut cps),
+                },
+            );
+        }
+        self.stream_key = None;
+        self.send_loaded(job.index, Outcome::AnimDone { total });
+        true
+    }
+
+    /// Stream lanjutan (seek / putar ulang dari checkpoint): komposit
+    /// dilakukan di ruang tier di atas snapshot kanvas dari app.
+    fn stream_gif_seek(
+        &mut self,
+        index: usize,
+        start: usize,
+        base: Option<Arc<ColorImage>>,
+        max_side: usize,
+        max_pixels: usize,
+        bytes: &[u8],
+        gi: &GifIndex,
+    ) {
+        let max_side_c = max_side.clamp(1024, 16384) as u32;
+        let total = gi.frames.len();
+        if start >= total {
+            self.send_loaded(index, Outcome::AnimDone { total });
+            return;
+        }
+        let (tw, th) = fit_target(gi.canvas[0], gi.canvas[1], max_side_c, max_pixels);
+        let cadence = checkpoint_cadence(total, tw as usize * th as usize * 4);
+        let mut player = match GifPlayer::open(bytes, gi, start) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_loaded(
+                    index,
+                    Outcome::AnimFailed {
+                        from_frame: start,
+                        message: e,
+                    },
+                );
+                return;
+            }
+        };
+        if let Some(img) = &base {
+            // Komposit WAJIB di resolusi penuh: rect GIF teroptimasi
+            // penuh piksel transparan (penanda "tidak berubah"), dan
+            // mencampur rect yang sudah di-shrink merusak alfa piksel
+            // campuran (noise gelap di seluruh kanvas — terbukti di uji
+            // GUI). Jadi snapshot dasar tier di-upscale menjadi kanvas
+            // penuh; daerah yang dicat ulang frame sesudahnya eksak,
+            // daerah statis membawa snapshot tier (satu putaran
+            // resample, tak terlihat di skala tier).
+            let rgba = color_image_to_rgba(img);
+            player.canvas =
+                shrink_to(DynamicImage::ImageRgba8(rgba), gi.canvas[0], gi.canvas[1])
+                    .into_rgba8();
+        }
+        self.stream_key = Some((self.session, index));
+        self.abort_stream = false;
+        let mut chunk: Vec<AnimFrame> = Vec::new();
+        let mut chunk_start = start;
+        let mut cps: Vec<(usize, Arc<ColorImage>)> = Vec::new();
+        for i in start..total {
+            match player.next_frame() {
+                Some(Ok(displayed)) => {
+                    if chunk.is_empty() {
+                        chunk_start = i;
+                    }
+                    chunk.push(AnimFrame {
+                        image: Arc::new(to_color_image(shrink(
+                            DynamicImage::ImageRgba8(displayed),
+                            max_side_c,
+                            max_pixels,
+                        ))),
+                        delay: gi.frames[i].delay,
+                    });
+                    if i % cadence == 0 {
+                        cps.push((i, Arc::new(player.canvas_tier(max_side_c, max_pixels))));
+                    }
+                    if chunk.len() >= 4 || i + 1 == total {
+                        let frames = std::mem::take(&mut chunk);
+                        let checkpoints = std::mem::take(&mut cps);
+                        self.send_loaded(
+                            index,
+                            Outcome::AnimChunk {
+                                start: chunk_start,
+                                frames,
+                                checkpoints,
+                            },
+                        );
+                        if self.stream_aborted(index) {
+                            return;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    self.stream_key = None;
+                    self.send_loaded(
+                        index,
+                        Outcome::AnimFailed {
+                            from_frame: i,
+                            message: e,
+                        },
+                    );
+                    return;
+                }
+                None => {
+                    self.stream_key = None;
+                    self.send_loaded(
+                        index,
+                        Outcome::AnimFailed {
+                            from_frame: i,
+                            message: "Animasi rusak: aliran frame berhenti lebih awal".into(),
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        self.stream_key = None;
+        self.send_loaded(index, Outcome::AnimDone { total });
+    }
+
+    fn process_anim_task(&mut self, task: AnimTask) {
+        match task {
+            AnimTask::Stream {
+                index,
+                start_frame,
+                base,
+                max_side,
+                max_pixels,
+            } => {
+                let bytes = match self.read_listing_bytes(index) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.send_loaded(
+                            index,
+                            Outcome::AnimFailed {
+                                from_frame: start_frame,
+                                message: e,
+                            },
+                        );
+                        return;
+                    }
+                };
+                let Some(gi) = scan_gif_index(&bytes) else {
+                    self.send_loaded(
+                        index,
+                        Outcome::AnimFailed {
+                            from_frame: start_frame,
+                            message: "Bukan GIF animasi".into(),
+                        },
+                    );
+                    return;
+                };
+                let r = catch_unwind(AssertUnwindSafe(|| {
+                    self.stream_gif_seek(
+                        index,
+                        start_frame,
+                        base,
+                        max_side,
+                        max_pixels,
+                        &bytes,
+                        &gi,
+                    );
+                }));
+                if r.is_err() {
+                    self.stream_key = None;
+                    self.send_loaded(
+                        index,
+                        Outcome::AnimFailed {
+                            from_frame: start_frame,
+                            message:
+                                "Dekoder gagal memproses berkas ini (data kemungkinan rusak)"
+                                    .into(),
+                        },
+                    );
+                }
+            }
+            AnimTask::SaveFrame {
+                index,
+                frame,
+                dest,
+                max_side,
+                max_pixels,
+            } => {
+                let r = catch_unwind(AssertUnwindSafe(|| {
+                    self.anim_save_frame(index, frame, &dest, max_side, max_pixels);
+                }));
+                if r.is_err() {
+                    self.send_loaded(
+                        index,
+                        Outcome::AnimJobFailed {
+                            message:
+                                "Dekoder gagal memproses berkas ini (data kemungkinan rusak)"
+                                    .into(),
+                        },
+                    );
+                }
+            }
+            AnimTask::Export {
+                index,
+                dir,
+                stem,
+                max_side,
+                max_pixels,
+            } => {
+                let r = catch_unwind(AssertUnwindSafe(|| {
+                    self.anim_export(index, &dir, &stem, max_side, max_pixels);
+                }));
+                if r.is_err() {
+                    self.send_loaded(
+                        index,
+                        Outcome::AnimJobFailed {
+                            message:
+                                "Dekoder gagal memproses berkas ini (data kemungkinan rusak)"
+                                    .into(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Simpan satu frame GIF (komposit penuh dari frame 0, pikselnya
+    /// persis jalur decode biasa) sebagai PNG.
+    fn anim_save_frame(
+        &mut self,
+        index: usize,
+        frame: usize,
+        dest: &PathBuf,
+        max_side: usize,
+        max_pixels: usize,
+    ) {
+        let fail = |message: String| Outcome::AnimJobFailed { message };
+        let bytes = match self.read_listing_bytes(index) {
+            Ok(b) => b,
+            Err(e) => {
+                self.send_loaded(index, fail(e));
+                return;
+            }
+        };
+        let Some(gi) = scan_gif_index(&bytes) else {
+            self.send_loaded(index, fail("Bukan GIF animasi".into()));
+            return;
+        };
+        if frame >= gi.frames.len() {
+            self.send_loaded(index, fail("Frame di luar jangkauan animasi".into()));
+            return;
+        }
+        let mut player = match GifPlayer::open(&bytes, &gi, 0) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_loaded(index, fail(e));
+                return;
+            }
+        };
+        let mut shown: Option<RgbaImage> = None;
+        for _ in 0..=frame {
+            match player.next_frame() {
+                Some(Ok(d)) => shown = Some(d),
+                Some(Err(e)) => {
+                    self.send_loaded(index, fail(e));
+                    return;
+                }
+                None => {
+                    self.send_loaded(
+                        index,
+                        fail("Animasi rusak: aliran frame berhenti lebih awal".into()),
+                    );
+                    return;
+                }
+            }
+        }
+        let shown = shown.expect("loop di atas selalu mengisi");
+        let img = shrink(
+            DynamicImage::ImageRgba8(shown),
+            max_side.clamp(1024, 16384) as u32,
+            max_pixels,
+        );
+        let rgba = color_image_to_rgba(&to_color_image(img));
+        match crate::wallpaper::write_png(&rgba, dest) {
+            Ok(()) => self.send_loaded(
+                index,
+                Outcome::AnimSaved {
+                    dest: dest.clone(),
+                },
+            ),
+            Err(e) => self.send_loaded(index, fail(e)),
+        }
+    }
+
+    /// Ekspor semua frame GIF sebagai PNG: decode penuh berurutan,
+    /// satu frame ditulis lalu dilepas — memori tidak menumpuk walau
+    /// animasinya panjang.
+    fn anim_export(
+        &mut self,
+        index: usize,
+        dir: &PathBuf,
+        stem: &str,
+        max_side: usize,
+        max_pixels: usize,
+    ) {
+        let fail = |message: String| Outcome::AnimJobFailed { message };
+        let bytes = match self.read_listing_bytes(index) {
+            Ok(b) => b,
+            Err(e) => {
+                self.send_loaded(index, fail(e));
+                return;
+            }
+        };
+        let Some(gi) = scan_gif_index(&bytes) else {
+            self.send_loaded(index, fail("Bukan GIF animasi".into()));
+            return;
+        };
+        let total = gi.frames.len();
+        let mut player = match GifPlayer::open(&bytes, &gi, 0) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_loaded(index, fail(e));
+                return;
+            }
+        };
+        let max_side_c = max_side.clamp(1024, 16384) as u32;
+        let mut done = 0usize;
+        for i in 0..total {
+            match player.next_frame() {
+                Some(Ok(d)) => {
+                    let img = shrink(DynamicImage::ImageRgba8(d), max_side_c, max_pixels);
+                    let rgba = color_image_to_rgba(&to_color_image(img));
+                    let dest = dir.join(format!("{stem}_frame{:03}.png", i + 1));
+                    if crate::wallpaper::write_png(&rgba, &dest).is_err() {
+                        break;
+                    }
+                    done += 1;
+                }
+                Some(Err(e)) => {
+                    self.send_loaded(
+                        index,
+                        fail(format!("Ekspor berhenti di frame {}: {e}", i + 1)),
+                    );
+                    return;
+                }
+                None => {
+                    self.send_loaded(
+                        index,
+                        fail(format!(
+                            "Ekspor berhenti di frame {}: aliran frame berakhir",
+                            i + 1
+                        )),
+                    );
+                    return;
+                }
+            }
+        }
+        self.send_loaded(
+            index,
+            Outcome::AnimExported {
+                done,
+                total,
+                dir: dir.clone(),
+            },
+        );
     }
 }
 
@@ -1490,6 +2643,602 @@ mod tests {
         assert!(decode_rgba(b"sampah", 8192, 1000).is_err());
         let g = gif_bytes(&[([9, 9, 9, 255], 50), ([8, 8, 8, 255], 50)], 8, 8);
         assert_eq!(decode_rgba(&g, 8192, 1_000_000).unwrap().dimensions(), (8, 8));
+    }
+
+    // ------------------------------------------------ streaming GIF
+
+    #[test]
+    fn indeks_gif_menghitung_semua_frame_offset_dan_jeda() {
+        let data = gif_bytes(
+            &[([255, 0, 0, 255], 50), ([0, 255, 0, 255], 120), ([0, 0, 255, 255], 5)],
+            24,
+            16,
+        );
+        let gi = scan_gif_index(&data).expect("GIF 3 frame harus terindeks");
+        assert_eq!(gi.canvas, [24, 16]);
+        assert_eq!(gi.frames.len(), 3);
+        assert!(!gi.truncated);
+        assert_eq!(gi.prefix_len, gi.frames[0].offset);
+        // Jeda dinormalisasi seperti jalur lama (x10 ms; <20 ms -> 100 ms).
+        assert_eq!(gi.frames[0].delay, Duration::from_millis(50));
+        assert_eq!(gi.frames[1].delay, Duration::from_millis(120));
+        assert_eq!(gi.frames[2].delay, Duration::from_millis(100));
+        for (i, f) in gi.frames.iter().enumerate() {
+            // Tiap offset menunjuk awal grup blok: ekstensi (0x21) atau
+            // deskriptor gambar (0x2C), dan naik tegas.
+            assert!(
+                matches!(data[f.offset], 0x21 | 0x2C),
+                "offset frame {i} menunjuk {:#x}",
+                data[f.offset]
+            );
+            if i > 0 {
+                assert!(f.offset > gi.frames[i - 1].offset);
+            }
+            assert!(f.full_cover, "fixture ini frame penuh semua");
+            assert_eq!((f.left, f.top, f.width, f.height), (0, 0, 24, 16));
+        }
+    }
+
+    #[test]
+    fn indeks_gif_menolak_yang_bukan_animasi() {
+        // GIF 1 frame -> bukan animasi, jalur statis yang menangani.
+        let satu = gif_bytes(&[([10, 20, 30, 255], 100)], 8, 8);
+        assert!(scan_gif_index(&satu).is_none());
+        // Bukan GIF sama sekali.
+        assert!(scan_gif_index(&png_bytes(8, 8)).is_none());
+        assert!(scan_gif_index(b"bukan gambar").is_none());
+        assert!(scan_gif_index(&[]).is_none());
+    }
+
+    #[test]
+    fn kadens_checkpoint_tidak_menghabiskan_anggaran() {
+        // GIF uji 63 frame @8MB: 5 checkpoint, jarak 13.
+        assert_eq!(checkpoint_cadence(63, 8 << 20), 13);
+        // Animasi kecil: tiap frame checkpoint pun murah.
+        assert_eq!(checkpoint_cadence(3, 1024), 1);
+        // Animasi sangat panjang tetap terbatasi jumlah checkpoint-nya.
+        let c = checkpoint_cadence(1500, 8 << 20);
+        assert!(1500usize.div_ceil(c) <= 8, "cadence {c}");
+    }
+
+    /// GIF fixture disposal: A penuh merah (Keep), B sub-rect hijau
+    /// (Background), C sub-rect biru (Previous), D penuh dengan indeks
+    /// transparan kecuali satu blok hijau (Keep).
+    fn gif_disposal_fixture() -> Vec<u8> {
+        use std::borrow::Cow;
+        let palette: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0];
+        let mut out = Vec::new();
+        {
+            let mut enc = gif::Encoder::new(&mut out, 16, 16, palette).unwrap();
+            enc.set_repeat(gif::Repeat::Infinite).unwrap();
+            let mk = |w: u16,
+                      h: u16,
+                      left: u16,
+                      top: u16,
+                      dispose: gif::DisposalMethod,
+                      transparent: Option<u8>,
+                      px: Vec<u8>| gif::Frame {
+                left,
+                top,
+                width: w,
+                height: h,
+                delay: 10,
+                dispose,
+                transparent,
+                buffer: Cow::Owned(px),
+                ..gif::Frame::default()
+            };
+            enc.write_frame(&mk(16, 16, 0, 0, gif::DisposalMethod::Keep, None, vec![0u8; 256]))
+                .unwrap();
+            enc.write_frame(&mk(8, 8, 4, 4, gif::DisposalMethod::Background, None, vec![1u8; 64]))
+                .unwrap();
+            enc.write_frame(&mk(8, 8, 4, 4, gif::DisposalMethod::Previous, None, vec![2u8; 64]))
+                .unwrap();
+            let mut d = vec![3u8; 256];
+            for y in 8..12 {
+                for x in 8..12 {
+                    d[y * 16 + x] = 1;
+                }
+            }
+            enc.write_frame(&mk(16, 16, 0, 0, gif::DisposalMethod::Keep, Some(3), d))
+                .unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn komposit_streaming_identik_dengan_decoder_lama() {
+        let data = gif_disposal_fixture();
+        let gi = scan_gif_index(&data).expect("fixture harus terindeks");
+        assert_eq!(gi.frames.len(), 4);
+        assert_eq!(gi.frames[1].dispose, Dispose::Background);
+        assert_eq!(gi.frames[2].dispose, Dispose::Previous);
+        assert!(!gi.frames[1].full_cover);
+        assert_eq!(gi.frames[3].transparent, Some(3));
+
+        // Jalur lama (crate image) sebagai pembanding kebenaran.
+        let legacy = decode_animated(&data, 16384, 16_000_000)
+            .unwrap()
+            .expect("fixture animasi menurut jalur lama");
+        let legacy_frames = legacy.frames.expect("ada frames");
+        assert_eq!(legacy_frames.len(), 4);
+
+        let mut player = GifPlayer::open(&data, &gi, 0).unwrap();
+        let merah = [255, 0, 0, 255];
+        let hijau = [0, 255, 0, 255];
+        let biru = [0, 0, 255, 255];
+        let tembus = [0, 0, 0, 0];
+        for (i, legacy_frame) in legacy_frames.iter().enumerate() {
+            let got = player
+                .next_frame()
+                .expect("masih ada frame")
+                .expect("frame terbaca");
+            // Seluruh piksel harus sama persis dengan decoder lama.
+            for (x, y, px) in got.enumerate_pixels() {
+                let lp = legacy_frame.image.pixels[y as usize * 16 + x as usize].to_array();
+                assert_eq!(px.0, lp, "frame {i} piksel ({x},{y})");
+            }
+            // Dan sesuai harapan manual untuk titik-titik kunci.
+            let at = |x: u32, y: u32| got.get_pixel(x, y).0;
+            match i {
+                0 => assert_eq!(at(0, 0), merah),
+                1 => {
+                    assert_eq!(at(0, 0), merah);
+                    assert_eq!(at(6, 6), hijau);
+                }
+                2 => {
+                    assert_eq!(at(0, 0), merah);
+                    assert_eq!(at(6, 6), biru);
+                }
+                3 => {
+                    assert_eq!(at(0, 0), merah, "transparan -> kanvas merah");
+                    assert_eq!(at(6, 6), tembus, "sesudah Background+Previous: tembus");
+                    assert_eq!(at(9, 9), hijau);
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(player.next_frame().is_none(), "aliran habis sesudah 4 frame");
+    }
+
+    #[test]
+    fn player_dibuka_di_tengah_menghasilkan_frame_yang_benar() {
+        // Indeks dua fase: dekoder yang dibuka tepat di offset frame 2
+        // (dengan awalan berkas) harus menghasilkan frame yang sama
+        // seperti aliran dari awal — di sini untuk frame PENUH sehingga
+        // keadaan kanvas sebelumnya tidak berpengaruh.
+        let data = gif_bytes(
+            &[([255, 0, 0, 255], 50), ([0, 255, 0, 255], 50), ([0, 0, 255, 255], 50)],
+            10,
+            10,
+        );
+        let gi = scan_gif_index(&data).unwrap();
+        let mut p = GifPlayer::open(&data, &gi, 2).unwrap();
+        let f = p.next_frame().unwrap().unwrap();
+        assert_eq!(f.get_pixel(5, 5).0, [0, 0, 255, 255], "frame 2 = biru");
+        assert!(p.next_frame().is_none());
+    }
+
+    /// Tulis GIF animasi ke folder sementara dan muat lewat worker
+    /// sungguhan; kumpulkan semua pesan hasilnya.
+    fn kumpulkan_pesan_worker(data: &[u8], nama: &str) -> Vec<Loaded> {
+        use crate::source::Listing;
+        let dir = std::env::temp_dir().join(format!("rv-stream-test-{nama}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{nama}.gif")), data).unwrap();
+        let (listing, _) = Listing::open(&dir, true).unwrap();
+        let ctx = eframe::egui::Context::default();
+        let (main_tx, pref_tx, out_rx) = spawn(ctx).unwrap();
+        let listing = std::sync::Arc::new(listing);
+        main_tx
+            .send(Command::Open {
+                session: 7,
+                listing: listing.clone(),
+            })
+            .unwrap();
+        pref_tx
+            .send(Command::Open {
+                session: 7,
+                listing,
+            })
+            .unwrap();
+        main_tx
+            .send(Command::Load {
+                session: 7,
+                index: 0,
+                primary: true,
+                max_side: 16384,
+                max_pixels: 2_000_000,
+                focus: 0,
+                budget: 256 << 20,
+                held: 0,
+            })
+            .unwrap();
+        let mut msgs = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let m = out_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("worker harus menjawab");
+            let selesai = matches!(
+                m.outcome,
+                Outcome::AnimDone { .. }
+                    | Outcome::AnimFailed { .. }
+                    | Outcome::Failed(_)
+                    | Outcome::Ready(_)
+            );
+            msgs.push(m);
+            if selesai || std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        msgs
+    }
+
+    /// Jalankan SATU perintah `ExportAnimFrames` lewat worker sungguhan
+    /// untuk berkas `data`; kembalikan pesan-pesan hasilnya, folder tujuan
+    /// ekspor, dan folder sumber. Keduanya TIDAK dihapus di sini —
+    /// pemanggil memeriksa berkas hasil dulu, lalu membersihkan.
+    fn ekspor_lewat_worker(
+        data: &[u8],
+        nama: &str,
+    ) -> (Vec<Loaded>, std::path::PathBuf, std::path::PathBuf) {
+        use crate::source::Listing;
+        let dir = std::env::temp_dir().join(format!("rv-export-test-{nama}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{nama}.gif")), data).unwrap();
+        let tujuan = std::env::temp_dir().join(format!("rv-export-test-{nama}-hasil"));
+        std::fs::create_dir_all(&tujuan).unwrap();
+        let (listing, _) = Listing::open(&dir, true).unwrap();
+        let ctx = eframe::egui::Context::default();
+        let (main_tx, pref_tx, out_rx) = spawn(ctx).unwrap();
+        let listing = std::sync::Arc::new(listing);
+        for tx in [&main_tx, &pref_tx] {
+            tx.send(Command::Open {
+                session: 7,
+                listing: listing.clone(),
+            })
+            .unwrap();
+        }
+        main_tx
+            .send(Command::ExportAnimFrames {
+                session: 7,
+                index: 0,
+                dir: tujuan.clone(),
+                stem: nama.to_string(),
+                max_side: 16384,
+                max_pixels: 2_000_000,
+            })
+            .unwrap();
+        let mut msgs = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let m = out_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("worker harus menjawab perintah ekspor");
+            let selesai = matches!(
+                m.outcome,
+                Outcome::AnimExported { .. } | Outcome::AnimJobFailed { .. }
+            );
+            msgs.push(m);
+            if selesai || std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        (msgs, tujuan, dir)
+    }
+
+    #[test]
+    fn ekspor_gif_menghasilkan_semua_frame_sebagai_png() {
+        // Regresi vonis QA putaran streaming: "Ekspor semua frame" harus
+        // benar-benar menulis N berkas PNG untuk GIF N frame, dan worker
+        // melaporkannya sebagai AnimExported{done: N, total: N}.
+        let data = gif_bytes(
+            &[
+                ([255, 0, 0, 255], 50),
+                ([0, 255, 0, 255], 50),
+                ([0, 0, 255, 255], 50),
+            ],
+            24,
+            16,
+        );
+        let (msgs, tujuan, dir) = ekspor_lewat_worker(&data, "ekspor-ok");
+        let hasil = msgs.iter().find_map(|m| match &m.outcome {
+            Outcome::AnimExported { done, total, .. } => Some((*done, *total)),
+            _ => None,
+        });
+        assert_eq!(
+            hasil,
+            Some((3, 3)),
+            "ekspor harus melaporkan 3/3: {:?}",
+            msgs.iter().map(|m| outcome_name(&m.outcome)).collect::<Vec<_>>()
+        );
+        for (i, warna) in [[255, 0, 0], [0, 255, 0], [0, 0, 255]].iter().enumerate() {
+            let p = tujuan.join(format!("ekspor-ok_frame{:03}.png", i + 1));
+            let bytes = std::fs::read(&p)
+                .unwrap_or_else(|e| panic!("frame {} harus tertulis: {e}", i + 1));
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "frame {} harus PNG sah", i + 1);
+            let img = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert_eq!(img.dimensions(), (24, 16));
+            let px = img.get_pixel(12, 8).0;
+            assert_eq!(
+                [px[0], px[1], px[2]],
+                *warna,
+                "isi frame {} harus sesuai urutan GIF",
+                i + 1
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&tujuan).ok();
+    }
+
+    #[test]
+    fn ekspor_bukan_gif_melaporkan_gagal_bukan_diam() {
+        // Pasangan regresi: sumber BUKAN GIF animasi -> worker WAJIB
+        // menjawab AnimJobFailed (menjadi toast galat di UI); kegagalan
+        // ekspor tidak boleh hilang diam-diam, dan tidak boleh ada
+        // berkas hasil. PNG statis ditulis dengan nama .gif: yang
+        // menentukan adalah indeks GIF dari isinya, bukan ekstensi.
+        let mut data = Vec::new();
+        {
+            let img = RgbaImage::from_pixel(24, 16, Rgba([9, 9, 9, 255]));
+            let enc = image::codecs::png::PngEncoder::new(&mut data);
+            image::ImageEncoder::write_image(
+                enc,
+                img.as_raw(),
+                24,
+                16,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        }
+        let (msgs, tujuan, dir) = ekspor_lewat_worker(&data, "ekspor-gagal");
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.outcome, Outcome::AnimJobFailed { .. })),
+            "kegagalan ekspor harus dilaporkan: {:?}",
+            msgs.iter().map(|m| outcome_name(&m.outcome)).collect::<Vec<_>>()
+        );
+        assert!(
+            std::fs::read_dir(&tujuan).unwrap().next().is_none(),
+            "tidak boleh ada berkas hasil untuk ekspor yang gagal"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&tujuan).ok();
+    }
+
+    /// GIF fixture interior transparan (pola GIF teroptimasi asli):
+    /// frame penuh merah, lalu frame rect-penuh yang sebagian besar
+    /// indeks transparan dengan satu blok warna — piksel transparan di
+    /// DALAM rect berarti "tidak berubah".
+    fn gif_interior_transparan_fixture() -> Vec<u8> {
+        use std::borrow::Cow;
+        let palette: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0];
+        let mut out = Vec::new();
+        {
+            let mut enc = gif::Encoder::new(&mut out, 32, 32, palette).unwrap();
+            enc.set_repeat(gif::Repeat::Infinite).unwrap();
+            let mk = |transparent: Option<u8>, px: Vec<u8>| gif::Frame {
+                left: 0,
+                top: 0,
+                width: 32,
+                height: 32,
+                delay: 10,
+                dispose: gif::DisposalMethod::Keep,
+                transparent,
+                buffer: Cow::Owned(px),
+                ..gif::Frame::default()
+            };
+            enc.write_frame(&mk(None, vec![0u8; 1024])).unwrap();
+            let mut b = vec![3u8; 1024];
+            for y in 12..20 {
+                for x in 12..20 {
+                    b[y * 32 + x] = 1; // blok hijau di tengah
+                }
+            }
+            enc.write_frame(&mk(Some(3), b)).unwrap();
+            let mut c = vec![3u8; 1024];
+            for y in 2..8 {
+                for x in 24..30 {
+                    c[y * 32 + x] = 2; // blok biru di pojok kanan atas
+                }
+            }
+            enc.write_frame(&mk(Some(3), c)).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn stream_lanjutan_rect_interior_transparan_tidak_rusak() {
+        // Regresi uji GUI putaran ini: stream lanjutan yang mengomposit
+        // rect yang sudah di-shrink merusak GIF interior-transparan
+        // (resample mencampur alfa 0/255 menjadi semi-transparan gelap).
+        // Jalur yang benar mengomposit di resolusi penuh lalu shrink.
+        use crate::source::Listing;
+        let data = gif_interior_transparan_fixture();
+        let dir = std::env::temp_dir().join("rv-stream-test-interior");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("interior.gif"), &data).unwrap();
+        let (listing, _) = Listing::open(&dir, true).unwrap();
+        let ctx = eframe::egui::Context::default();
+        let (main_tx, _pref_tx, out_rx) = spawn(ctx).unwrap();
+        main_tx
+            .send(Command::Open {
+                session: 7,
+                listing: std::sync::Arc::new(listing),
+            })
+            .unwrap();
+        // Tier dipaksa 16x16 (dari kanvas 32x32) supaya resample aktif.
+        main_tx
+            .send(Command::AnimStream {
+                session: 7,
+                index: 0,
+                start_frame: 0,
+                base: None,
+                max_side: 16384,
+                max_pixels: 256,
+            })
+            .unwrap();
+        let mut frames = Vec::new();
+        loop {
+            let m = out_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("worker harus menjawab");
+            match m.outcome {
+                Outcome::AnimChunk {
+                    frames: fs,
+                    start,
+                    ..
+                } => {
+                    for (k, f) in fs.into_iter().enumerate() {
+                        frames.push((start + k, f));
+                    }
+                }
+                Outcome::AnimDone { .. } => break,
+                _other => panic!("hasil tak terduga selain AnimChunk/AnimDone"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        frames.sort_by_key(|(i, _)| *i);
+        assert_eq!(frames.len(), 3);
+        let px = |f: &AnimFrame, x: usize, y: usize| {
+            f.image.pixels[y * f.image.width() + x].to_array()
+        };
+        // Frame 1: pojok (daerah interior transparan) tetap merah opak
+        // dari kanvas, tengah hijau.
+        let f1 = &frames[1].1;
+        assert_eq!(f1.image.size, [16, 16]);
+        assert_eq!(px(f1, 1, 1), [255, 0, 0, 255], "pojok frame 1 harus merah opak");
+        assert_eq!(px(f1, 8, 8), [0, 255, 0, 255], "tengah frame 1 harus hijau");
+        // Frame 2: blok biru muncul, hijau dan merah tetap utuh.
+        let f2 = &frames[2].1;
+        assert_eq!(px(f2, 13, 2), [0, 0, 255, 255], "blok frame 2 harus biru");
+        assert_eq!(px(f2, 8, 8), [0, 255, 0, 255], "hijau frame 1 tetap ada");
+        assert_eq!(px(f2, 1, 14), [255, 0, 0, 255], "pojok bawah tetap merah opak");
+    }
+
+    #[test]
+    fn pekerja_mengirim_preview_potongan_lalu_selesai() {
+        let data = gif_bytes(
+            &[
+                ([255, 0, 0, 255], 50),
+                ([0, 255, 0, 255], 120),
+                ([0, 0, 255, 255], 80),
+                ([255, 255, 0, 255], 90),
+                ([0, 255, 255, 255], 60),
+            ],
+            24,
+            16,
+        );
+        let msgs = kumpulkan_pesan_worker(&data, "urutan");
+        // Pesan pertama: Preview dengan metadata indeks penuh.
+        let Outcome::Preview(d, meta) = &msgs[0].outcome else {
+            panic!("pesan pertama harus Preview");
+        };
+        assert_eq!(meta.total, 5);
+        assert_eq!(
+            meta.delays,
+            vec![
+                Duration::from_millis(50),
+                Duration::from_millis(120),
+                Duration::from_millis(80),
+                Duration::from_millis(90),
+                Duration::from_millis(60),
+            ]
+        );
+        assert_eq!(d.pixels.orig, [24, 16]);
+        assert_eq!(d.pixels.frames.as_ref().unwrap().len(), 1, "preview = frame 0 saja");
+        assert!(d.pixels.format.contains("5 frame"), "{}", d.pixels.format);
+        // Potongan-potongan menutupi frame 1..5 tepat sekali, berurutan.
+        let mut tertutup: Vec<usize> = Vec::new();
+        let mut checkpoints = Vec::new();
+        for m in &msgs[1..] {
+            match &m.outcome {
+                Outcome::AnimChunk {
+                    start,
+                    frames,
+                    checkpoints: cps,
+                } => {
+                    for k in 0..frames.len() {
+                        tertutup.push(start + k);
+                    }
+                    checkpoints.extend(cps.iter().map(|(i, _)| *i));
+                }
+                Outcome::AnimDone { total } => assert_eq!(*total, 5),
+                o => panic!("pesan tak terduga: {}", outcome_name(o)),
+            }
+        }
+        assert_eq!(tertutup, vec![1, 2, 3, 4]);
+        assert!(checkpoints.contains(&0), "checkpoint frame 0 harus ada");
+        assert!(
+            matches!(msgs.last().unwrap().outcome, Outcome::AnimDone { .. }),
+            "pesan terakhir harus AnimDone"
+        );
+    }
+
+    #[test]
+    fn pekerja_mengirim_preview_lalu_gagal_untuk_data_frame_rusak() {
+        // GIF 2 frame yang sehat, lalu data LZW frame kedua diobok-obok
+        // (strukturnya utuh, isinya sampah): indeks tetap terbaca, frame
+        // pertama tampil, lalu stream harus gagal secara jujur di frame 1.
+        let mut data = gif_bytes(
+            &[([255, 0, 0, 255], 50), ([0, 255, 0, 255], 50)],
+            16,
+            16,
+        );
+        let offsets = gif_block_offsets(&data).unwrap();
+        assert_eq!(offsets.len(), 2);
+        // Lompati GCE + deskriptor frame kedua menuju sub-blok datanya.
+        let mut pos = offsets[1];
+        if data[pos] == 0x21 {
+            // Ekstensi (GCE): label + sub-blok.
+            pos += 2;
+            loop {
+                let n = data[pos] as usize;
+                pos += 1 + n;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(data[pos], 0x2C, "harus tiba di deskriptor gambar");
+        let desc_packed = data[pos + 9];
+        pos += 10; // deskriptor
+        if desc_packed & 0x80 != 0 {
+            // Palet lokal ikut ditulis encoder untuk frame ini.
+            pos += 3usize << ((desc_packed & 0x07) + 1);
+        }
+        pos += 1; // LZW minimum code size
+        let n = data[pos] as usize;
+        assert!(n > 4, "sub-blok data harus cukup besar untuk dirusak");
+        for b in &mut data[pos + 1..pos + 1 + n] {
+            *b = 0xFF;
+        }
+        let msgs = kumpulkan_pesan_worker(&data, "rusak");
+        assert!(
+            matches!(msgs[0].outcome, Outcome::Preview(..)),
+            "frame pertama tetap tampil lebih dulu"
+        );
+        let gagal = msgs.iter().any(|m| {
+            matches!(m.outcome, Outcome::AnimFailed { from_frame: 1, .. })
+        });
+        assert!(gagal, "stream harus gagal jujur di frame 1: {:?}", msgs.iter().map(|m| outcome_name(&m.outcome)).collect::<Vec<_>>());
+    }
+
+    fn outcome_name(o: &Outcome) -> &'static str {
+        match o {
+            Outcome::Ready(_) => "Ready",
+            Outcome::Preview(..) => "Preview",
+            Outcome::AnimChunk { .. } => "AnimChunk",
+            Outcome::AnimDone { .. } => "AnimDone",
+            Outcome::AnimFailed { .. } => "AnimFailed",
+            Outcome::AnimExported { .. } => "AnimExported",
+            Outcome::AnimSaved { .. } => "AnimSaved",
+            Outcome::AnimJobFailed { .. } => "AnimJobFailed",
+            Outcome::Failed(_) => "Failed",
+            Outcome::Skipped => "Skipped",
+        }
     }
 }
 

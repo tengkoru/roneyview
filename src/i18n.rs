@@ -158,6 +158,20 @@ mod tests {
     }
 
     #[test]
+    fn label_wallpaper_terlokalisasi() {
+        // Label jendela wallpaper tidak boleh tampil Inggris di UI Indonesia.
+        assert_eq!(tr(Lang::Id, "wp_color"), "Warna");
+        assert_eq!(tr(Lang::Id, "wp_style"), "Gaya");
+        assert_eq!(tr(Lang::Id, "wp_apply"), "Terapkan");
+        assert_eq!(tr(Lang::Id, "wp_mode_transparent"), "Transparan");
+        assert_eq!(tr(Lang::En, "wp_color"), "Color");
+        assert_eq!(tr(Lang::En, "wp_style"), "Style");
+        assert_eq!(tr(Lang::En, "wp_apply"), "Apply");
+        assert_eq!(tr(Lang::En, "wp_mode_solid"), "Solid color");
+        assert_eq!(tr(Lang::En, "wp_style_zoomed"), "Zoomed");
+    }
+
+    #[test]
     fn tr_fmt_mengganti_urutan() {
         let s = tr_fmt(Lang::Id, "prop_dimensions", &[&2, &10]);
         assert_eq!(s, "2 x 10 piksel");

@@ -1,11 +1,11 @@
 //! Antarmuka Roneyview (egui/eframe): navigasi, zoom, geser, rotasi, layar penuh.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use crate::edit::{self, BasicToneParams, ToneParams};
 use crate::dialogs::{self, Modal, ModalResult, PropsDialog, WallpaperDialog};
 use crate::fileinfo::{self, PageFacts};
 use crate::i18n::{Lang, tr, tr_fmt, unescape};
-use crate::loader::{self, AnimFrame, Command, Loaded, Outcome};
+use crate::loader::{self, AnimFrame, AnimMeta, Command, Loaded, Outcome};
 use crate::positions::{PositionStore, key_for};
 use crate::settings::{FitMode, Store};
 use crate::source::Listing;
@@ -117,6 +117,20 @@ fn parse_page_number(input: &str, n: usize) -> Option<usize> {
     Some(v - 1)
 }
 
+/// Aksi global dari event mentah egui, untuk event yang tidak bisa ditangkap
+/// `consume_key`. egui-winit menerjemahkan Ctrl+C menjadi `Event::Copy` —
+/// BUKAN `Event::Key` — lalu berhenti di situ, jadi `consume_key(CTRL, Key::C)`
+/// tidak pernah cocok di backend tersebut. Gerbangnya sama seperti shortcut
+/// single-key: jangan mencuri Ctrl+C dari field teks (di sana `Event::Copy`
+/// dipakai TextEdit untuk menyalin teks yang dipilih) dan jangan aktif saat
+/// proyektor terbuka.
+fn raw_event_action(ev: &egui::Event, typing: bool, projector_open: bool) -> Option<Action> {
+    match ev {
+        egui::Event::Copy if !typing && !projector_open => Some(Action::CopyImage),
+        _ => None,
+    }
+}
+
 /// Catat folder/arsip ke daftar "terkini": paling baru di depan, tanpa
 /// duplikat, dibatasi `MAX_RECENT`.
 fn record_recent(recent: &mut Vec<String>, path: &str) {
@@ -142,6 +156,85 @@ fn is_multiframe(frame_count: usize) -> bool {
     frame_count > 1
 }
 
+/// Jam putar animasi: dari frame `cur` yang jadwal berakhirnya
+/// `deadline`, majukan mengikuti jeda tiap frame selama frame tujuannya
+/// TERSEDIA di penyimpanan. Frame yang sudah tersimpan tapi terlewati
+/// jadwalnya dilompati tampilannya (mengejar ketinggalan), bukan
+/// ditumpuk; begitu tujuan berikutnya belum tersedia, berhenti
+/// (`blocked = true`) — dekode tidak pernah dilompati, hanya tampilan.
+/// Mengembalikan (frame baru, deadline baru, blocked).
+fn catch_up(
+    total: usize,
+    delays: &[Duration],
+    cur: usize,
+    has: &dyn Fn(usize) -> bool,
+    deadline: Instant,
+    now: Instant,
+) -> (usize, Instant, bool) {
+    let mut f = cur;
+    let mut t = deadline;
+    let mut blocked = false;
+    while now >= t {
+        let nf = if f + 1 >= total { 0 } else { f + 1 };
+        if nf == f {
+            break; // animasi 1 frame: tidak ada yang dimajukan
+        }
+        if !has(nf) {
+            blocked = true;
+            break;
+        }
+        f = nf;
+        t += delays.get(f).copied().unwrap_or(Duration::from_millis(100));
+        if f == cur {
+            break; // satu putaran penuh terselesaikan
+        }
+    }
+    (f, t, blocked)
+}
+
+/// Selama sesi edit, pintasan utama dimatikan di `update()` (navigasi dsb.
+/// milik sesi edit) — KECUALI salin: Ctrl+C harus tetap hidup supaya buffer
+/// kerja bisa disalin tanpa menyimpan/menutup sesi dulu.
+fn action_allowed_while_editing(a: &Action) -> bool {
+    matches!(a, Action::CopyImage)
+}
+
+/// Path hasil dialog simpan untuk format tetap (PNG/PDF): dialog GTK (rfd)
+/// tidak menambahkan ekstensi otomatis dan API-nya tidak menyediakan opsi
+/// ekstensi bawaan, jadi nama yang diketik pengguna kembali apa adanya.
+/// Bila nama belum punya ekstensi apa pun, tambahkan ekstensi formatnya;
+/// nama yang sudah berekstensi (apa pun ekstensinya) tidak pernah diubah.
+fn ensure_save_ext(path: &Path, ext: &str) -> PathBuf {
+    match path.extension() {
+        Some(e) if !e.is_empty() => path.to_path_buf(),
+        _ => path.with_extension(ext),
+    }
+}
+
+/// Lebar separator vertikal pada tampilan edit: bawaan widget egui
+/// (`Separator::default()` memakai spacing 6).
+const EDIT_SEP_W: f32 = 6.0;
+
+/// Lebar handle seret pemisah panel edit.
+const EDIT_HANDLE_W: f32 = 6.0;
+
+/// Total lebar yang terpakai di kanan area gambar pada tampilan edit:
+/// tiga celah `item_spacing.x` antaranak layout horizontal (gambar |
+/// separator | handle | panel) ditambah lebar separator dan handle.
+/// (Angka lama di draw_edit_view adalah tebak 12, padahal overhead
+/// nyatanya 36 pada spacing 8 — panel meluber ±24px keluar jendela.)
+fn edit_side_overhead(spacing_x: f32) -> f32 {
+    3.0 * spacing_x + EDIT_SEP_W + EDIT_HANDLE_W
+}
+
+/// Lebar area gambar pada tampilan edit: sisa lebar sesudah panel dan
+/// overhead layout dihitung PENUH, supaya tepi kanan panel tepat di tepi
+/// area yang tersedia (di dalam jendela). Lantai 120 menjaga area gambar
+/// tetap ada pada jendela yang sangat sempit.
+fn edit_image_width(avail_w: f32, panel_w: f32, spacing_x: f32) -> f32 {
+    (avail_w - panel_w - edit_side_overhead(spacing_x)).max(120.0)
+}
+
 /// Ubah `ColorImage` (egui) menjadi `RgbaImage` (crate image) untuk disimpan.
 /// `ColorImage` menyimpan alpha premultiplied; PNG butuh straight alpha,
 /// jadi di sini dikembalikan dulu (piksel opak/transparan penuh tidak berubah).
@@ -163,13 +256,274 @@ fn colorimage_to_rgba(img: &ColorImage) -> RgbaImage {
     RgbaImage::from_raw(w, h, raw).expect("jumlah piksel cocok dengan dimensi")
 }
 
-/// Animasi (GIF/WebP/APNG/TIFF): semua frame disimpan di sisi CPU dan diunggah
-/// satu per satu ke SATU tekstur, jadi memori GPU tidak berlipat ganda.
+/// Penyimpanan frame satu animasi di sisi app.
+///
+/// Untuk animasi warisan (WebP/APNG/TIFF, dan GIF dari prefetch) semua
+/// frame hasil decode disimpan di sini sekaligus dan tidak pernah
+/// dibuang (`budget` tak terbatas — worker sudah memotongnya di sumber).
+/// Untuk GIF streaming, `total`/jeda/disposal diketahui penuh dari
+/// indeks dua fase tetapi frame tersimpan hanya SEBAGIAN (jendela geser
+/// + snapshot checkpoint), ditegakkan terhadap `budget`
+/// (`loader::ANIM_BUDGET`, diperkecil di mode hemat memori). Frame yang
+/// terbuang tidak hilang: worker bisa membuatnya lagi dari checkpoint
+/// terdekat + offset indeks.
+struct FrameStore {
+    /// Jumlah frame animasi (dari indeks, atau = banyak frame warisan).
+    total: usize,
+    delays: Vec<Duration>,
+    disposes: Vec<loader::Dispose>,
+    frames: BTreeMap<usize, Arc<ColorImage>>,
+    /// Snapshot kanvas SESUDAH frame berindeks itu diterapkan
+    /// disposalnya — dasar stream lanjutan untuk frame sesudahnya.
+    checkpoints: BTreeMap<usize, Arc<ColorImage>>,
+    /// Biaya satu frame tersimpan (semua frame satu animasi seukuran).
+    frame_bytes: usize,
+    budget: usize,
+}
+
+impl FrameStore {
+    fn legacy(frames: Vec<AnimFrame>) -> Self {
+        let total = frames.len();
+        let delays: Vec<Duration> = frames.iter().map(|f| f.delay).collect();
+        let frame_bytes = frames
+            .first()
+            .map_or(0, |f| f.image.size[0] * f.image.size[1] * 4);
+        let frames = frames
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.image))
+            .collect();
+        Self {
+            total,
+            delays,
+            disposes: vec![loader::Dispose::Keep; total],
+            frames,
+            checkpoints: BTreeMap::new(),
+            frame_bytes,
+            budget: usize::MAX,
+        }
+    }
+
+    fn streamed(meta: &AnimMeta, frame0: AnimFrame, budget: usize) -> Self {
+        let frame_bytes = frame0.image.size[0] * frame0.image.size[1] * 4;
+        let mut store = Self {
+            total: meta.total,
+            delays: meta.delays.clone(),
+            disposes: meta.disposes.clone(),
+            frames: BTreeMap::new(),
+            checkpoints: BTreeMap::new(),
+            frame_bytes,
+            budget,
+        };
+        store.frames.insert(0, frame0.image);
+        store
+    }
+
+    fn has(&self, i: usize) -> bool {
+        self.frames.contains_key(&i)
+    }
+
+    fn get(&self, i: usize) -> Option<Arc<ColorImage>> {
+        self.frames.get(&i).cloned()
+    }
+
+    fn delay(&self, i: usize) -> Duration {
+        self.delays
+            .get(i)
+            .copied()
+            .unwrap_or(Duration::from_millis(100))
+    }
+
+    fn bytes(&self) -> usize {
+        (self.frames.len() + self.checkpoints.len()) * self.frame_bytes
+    }
+
+    fn insert_frame(
+        &mut self,
+        i: usize,
+        img: Arc<ColorImage>,
+        focus: usize,
+        uploaded: usize,
+        anchor: usize,
+    ) {
+        self.frames.insert(i, img);
+        self.evict(focus, uploaded, Some(i), anchor);
+    }
+
+    fn insert_checkpoint(
+        &mut self,
+        i: usize,
+        img: Arc<ColorImage>,
+        focus: usize,
+        uploaded: usize,
+        anchor: usize,
+    ) {
+        self.checkpoints.insert(i, img);
+        self.evict(focus, uploaded, None, anchor);
+    }
+
+    /// Buang frame/checkpoint sampai di bawah anggaran. Yang dilindungi
+    /// paling kuat: frame fokus (playhead), frame yang sedang ada di
+    /// tekstur, frame tepat sesudah fokus, dan frame yang baru saja
+    /// dimasukkan. Jendela [anchor, anchor+kapasitas) — anchor adalah
+    /// frame yang sedang ditunggu pemutaran — dilindungi selama masih
+    /// ada korban lain; bila terpaksa, frame jendela yang paling jauh
+    /// dari anchor dikorbankan lebih dulu (yang ditunggu sendiri selalu
+    /// terakhir). Jangkar ini vital saat loop membungkus: fokus masih
+    /// di frame terakhir, stream lanjutan mengalir dari frame 0; tanpa
+    /// jangkar, frame 0 yang ditunggu justru terbuang oleh pemasukan
+    /// frame berikutnya, playhead tak pernah maju, dan stream diminta
+    /// ulang tanpa henti.
+    /// Urutan buang: frame di belakang fokus (paling lama dulu), lalu
+    /// frame jauh di depan fokus, lalu checkpoint lama (kecuali
+    /// checkpoint terdekat di belakang fokus — pijakan stream lanjutan
+    /// untuk sekitar posisi putar — dan checkpoint di jendela anchor).
+    fn evict(&mut self, focus: usize, uploaded: usize, just: Option<usize>, anchor: usize) {
+        let capacity = if self.frame_bytes > 0 {
+            (self.budget / self.frame_bytes).max(1)
+        } else {
+            usize::MAX
+        };
+        let in_window = |i: usize| i >= anchor && i < anchor.saturating_add(capacity);
+        while self.bytes() > self.budget {
+            // Tingkat 1: korban di luar jendela anchor.
+            let victim = self
+                .frames
+                .keys()
+                .copied()
+                .filter(|&i| {
+                    i != focus
+                        && i != uploaded
+                        && i != focus + 1
+                        && Some(i) != just
+                        && !in_window(i)
+                })
+                .min_by_key(|&i| {
+                    if i < focus {
+                        (0, i, 0)
+                    } else {
+                        (1, 0, usize::MAX - i)
+                    }
+                });
+            if let Some(v) = victim {
+                self.frames.remove(&v);
+                continue;
+            }
+            // Tingkat 2: hanya frame jendela yang tersisa — korbankan
+            // yang paling jauh dari anchor (frame yang ditunggu sendiri,
+            // berjarak 0, selalu yang terakhir dikorbankan).
+            let victim = self
+                .frames
+                .keys()
+                .copied()
+                .filter(|&i| {
+                    i != focus && i != uploaded && i != focus + 1 && Some(i) != just
+                })
+                .max_by_key(|&i| i.abs_diff(anchor));
+            if let Some(v) = victim {
+                self.frames.remove(&v);
+                continue;
+            }
+            // Frame yang boleh dibuang habis: korbankan checkpoint lama,
+            // kecuali checkpoint terbesar yang <= fokus.
+            let keep_cp = self.checkpoints.keys().copied().filter(|&c| c <= focus).max();
+            let victim_cp = self
+                .checkpoints
+                .keys()
+                .copied()
+                .filter(|&c| Some(c) != keep_cp && !in_window(c))
+                .min();
+            match victim_cp {
+                Some(v) => {
+                    self.checkpoints.remove(&v);
+                }
+                None => break, // sisanya terlindungi; terima lewat anggaran
+            }
+        }
+    }
+
+    /// Titik mulai stream lanjutan untuk menampilkan `target`:
+    /// (frame pertama yang harus didekode, snapshot kanvas dasarnya).
+    /// Memakai jalan pintas gambar frame sebelumnya bila disposalnya
+    /// Keep/Any (gambar tampil == kanvas sesudahnya), kalau tidak
+    /// checkpoint terbesar di bawah target, kalau tidak dari awal.
+    fn seek_base(&self, target: usize) -> (usize, Option<Arc<ColorImage>>) {
+        if target == 0 {
+            return (0, None);
+        }
+        if self
+            .disposes
+            .get(target - 1)
+            .is_some_and(|d| d.keeps_canvas())
+        {
+            if let Some(img) = self.frames.get(&(target - 1)) {
+                return (target, Some(img.clone()));
+            }
+        }
+        if let Some((&cp, img)) = self.checkpoints.range(..target).next_back() {
+            return (cp + 1, Some(img.clone()));
+        }
+        (0, None)
+    }
+}
+
+/// Keadaan animasi satu halaman. Frame diunggah satu per satu ke SATU
+/// tekstur halaman, jadi memori GPU tidak berlipat ganda.
 struct Anim {
-    frames: Vec<AnimFrame>,
+    state: Mutex<AnimState>,
     /// Indeks frame yang saat ini ada di tekstur.
     uploaded: AtomicUsize,
+}
+
+struct AnimState {
+    store: FrameStore,
+    /// True bila animasi ini GIF streaming (indeks dua fase); false
+    /// untuk animasi warisan yang seluruh frame-nya datang sekaligus.
+    streamed: bool,
+    /// True bila ada stream yang sedang mengalir ke halaman ini.
+    streaming: bool,
+    /// Frame pertama yang dicakup stream berjalan.
+    stream_from: usize,
+    /// Frame berikutnya yang ditunggu dari stream berjalan
+    /// (= jumlah frame yang sudah diterima stream ini dari awalnya).
+    stream_upto: usize,
+    /// Stream pernah putus di frame ini; frame >= ini tidak termuat.
+    failed_from: Option<usize>,
+    /// Animasi dipotong di sumber (warisan: anggaran worker;
+    /// streaming: melebihi batas jumlah frame).
     truncated: bool,
+    /// Frame yang sedang ditunggu pemutaran (playhead tertahan di
+    /// depannya). Dipakai sebagai jangkar jendela eviction supaya
+    /// frame yang ditunggu tidak terbuang sebelum sempat ditampilkan.
+    want: Option<usize>,
+}
+
+impl AnimState {
+    fn legacy(frames: Vec<AnimFrame>, truncated: bool) -> Self {
+        Self {
+            store: FrameStore::legacy(frames),
+            streamed: false,
+            streaming: false,
+            stream_from: 0,
+            stream_upto: 0,
+            failed_from: None,
+            truncated,
+            want: None,
+        }
+    }
+
+    fn streamed(meta: &AnimMeta, frame0: AnimFrame, budget: usize) -> Self {
+        Self {
+            store: FrameStore::streamed(meta, frame0, budget),
+            streamed: true,
+            streaming: true,
+            stream_from: 0,
+            stream_upto: 1,
+            failed_from: None,
+            truncated: meta.truncated,
+            want: None,
+        }
+    }
 }
 
 struct Page {
@@ -182,6 +536,18 @@ struct Page {
     bytes: usize,
     anim: Option<Anim>,
     format: String,
+}
+
+impl Page {
+    /// Biaya memori halaman saat ini. Untuk halaman animasi nilainya
+    /// hidup mengikuti isi penyimpanan frame (frame streaming datang
+    /// dan dibuang), bukan angka beku saat halaman dipasang.
+    fn total_bytes(&self) -> usize {
+        match &self.anim {
+            Some(a) => a.state.lock().unwrap().store.bytes(),
+            None => self.bytes,
+        }
+    }
 }
 
 /// Isi yang sedang tampil: satu halaman, atau dua halaman berdampingan (urutan baca).
@@ -217,7 +583,7 @@ enum SettingsTab {
     View,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Action {
     Next,
     Prev,
@@ -357,6 +723,20 @@ struct EditSession {
     dirty: bool,
 }
 
+/// Petakan koordinat piksel buffer ke koordinat pratinjau tone.
+/// Pratinjau adalah susutan proporsional dari buffer yang sama, jadi
+/// koordinat diskalakan linear per sumbu dan dijepit ke batas pratinjau.
+/// Bila ukurannya sama dengan buffer, pemetaannya identitas — perilaku
+/// mode Bandingkan untuk gambar kecil tidak berubah.
+fn preview_coord(x: u32, y: u32, bw: u32, bh: u32, pw: u32, ph: u32) -> (u32, u32) {
+    if bw == 0 || bh == 0 || pw == 0 || ph == 0 {
+        return (0, 0);
+    }
+    let sx = ((x as u64 * pw as u64) / bw as u64) as u32;
+    let sy = ((y as u64 * ph as u64) / bh as u64) as u32;
+    (sx.min(pw - 1), sy.min(ph - 1))
+}
+
 impl EditSession {
     fn new(name: String, buffer: RgbaImage, float: Option<Vec<f32>>, tool: EditTool) -> Self {
         let (w, h) = (buffer.width(), buffer.height());
@@ -417,12 +797,22 @@ impl EditSession {
                         let px = if x < split_x {
                             self.buffer.get_pixel(x, y)
                         } else {
-                            // Preview mungkin beda ukuran (draft kecil); pakai buffer bila begitu.
-                            if preview.width() == w && preview.height() == h {
-                                preview.get_pixel(x, y)
-                            } else {
-                                self.buffer.get_pixel(x, y)
-                            }
+                            // Pratinjau adalah susutan proporsional dari buffer
+                            // yang sama (sisi maks TONE_PREVIEW_MAX_SIDE), jadi
+                            // piksel belahan kanan diambil dari pratinjau lewat
+                            // pemetaan koordinat — BUKAN dari buffer. Dulu kode
+                            // ini jatuh ke buffer bila ukuran pratinjau beda,
+                            // sehingga gambar >960px diam-diam membandingkan
+                            // asli-vs-asli.
+                            let (sx, sy) = preview_coord(
+                                x,
+                                y,
+                                w,
+                                h,
+                                preview.width(),
+                                preview.height(),
+                            );
+                            preview.get_pixel(sx, sy)
                         };
                         img.put_pixel(x, y, *px);
                     }
@@ -933,6 +1323,10 @@ impl RoneyApp {
     fn start_dialog(&mut self, ctx: &Context, kind: DialogKind) {
         let lang = self.lang;
         if self.dialog_busy {
+            // Penolakan tidak boleh diam: tanpa pesan ini, klik menu saat
+            // dialog lain (atau thread dialog yang macet) masih berjalan
+            // terlihat persis seperti aplikasi mengabaikan perintah.
+            self.notify(tr(lang, "notify_dialog_busy"));
             return;
         }
         self.dialog_busy = true;
@@ -1045,21 +1439,24 @@ impl RoneyApp {
                 }
                 Some(DialogKind::SaveFrame { index, frame, .. }) => {
                     if let Some(p) = result {
-                        self.save_frame(index, frame, &p);
+                        let p = ensure_save_ext(&p, "png");
+                        self.save_frame(ctx, index, frame, &p);
                     }
                 }
                 Some(DialogKind::ExportFrames { index }) => {
                     if let Some(dir) = result {
-                        self.export_frames(index, &dir);
+                        self.export_frames(ctx, index, &dir);
                     }
                 }
                 Some(DialogKind::SaveEdit { .. }) => {
                     if let Some(p) = result {
+                        let p = ensure_save_ext(&p, "png");
                         self.save_edit_buffer(&p);
                     }
                 }
                 Some(DialogKind::SavePdf { .. }) => {
                     if let Some(p) = result {
+                        let p = ensure_save_ext(&p, "pdf");
                         self.build_and_save_pdf(ctx, &p);
                     }
                 }
@@ -1141,8 +1538,11 @@ impl RoneyApp {
         self.start_dialog(ctx, DialogKind::SaveFrame { index, frame, file_name });
     }
 
-    /// Simpan satu frame animasi sebagai PNG.
-    fn save_frame(&mut self, index: usize, frame: usize, dest: &Path) {
+    /// Simpan satu frame animasi sebagai PNG. Frame yang masih ada di
+    /// penyimpanan disimpan langsung; frame GIF streaming yang sudah
+    /// terbuang didekode ulang di worker (UI tidak membeku) dan
+    /// hasilnya dilaporkan lewat `Outcome::AnimSaved`.
+    fn save_frame(&mut self, ctx: &Context, index: usize, frame: usize, dest: &Path) {
         let lang = self.lang;
         let Some(page) = self.page_for(index) else {
             return;
@@ -1150,37 +1550,84 @@ impl RoneyApp {
         let Some(anim) = &page.anim else {
             return;
         };
-        let Some(f) = anim.frames.get(frame) else {
-            return;
+        let (img, streamed) = {
+            let st = anim.state.lock().unwrap();
+            (st.store.get(frame), st.streamed)
         };
-        let rgba = colorimage_to_rgba(&f.image);
-        match crate::wallpaper::write_png(&rgba, dest) {
-            Ok(_) => self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()])),
-            Err(e) => self.notify(e),
+        if let Some(img) = img {
+            let rgba = colorimage_to_rgba(&img);
+            match crate::wallpaper::write_png(&rgba, dest) {
+                Ok(_) => self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()])),
+                Err(e) => self.notify(e),
+            }
+            return;
+        }
+        if streamed {
+            let cmd = Command::SaveAnimFrame {
+                session: self.session,
+                index,
+                frame,
+                dest: dest.to_path_buf(),
+                max_side: Self::max_side(ctx),
+                max_pixels: tier_pixels(self.display_scale).min(loader::max_pixels()),
+            };
+            if self.cmd_tx_main.send(cmd).is_err() {
+                self.notify(tr(lang, "notify_save_failed"));
+            }
         }
     }
 
     /// Ekspor SEMUA frame animasi halaman `index` sebagai PNG ke `dir`.
-    fn export_frames(&mut self, index: usize, dir: &Path) {
+    /// Animasi warisan diekspor dari frame tersimpan; GIF streaming
+    /// didekode penuh berurutan di worker supaya frame yang sudah
+    /// terbuang dari jendela geser ikut terekspor.
+    fn export_frames(&mut self, ctx: &Context, index: usize, dir: &Path) {
         let lang = self.lang;
+        // Gagal TIDAK boleh diam: halaman bisa terbuang dari cache selama
+        // dialog folder terbuka — user harus tahu ekspornya tidak jalan.
         let Some(page) = self.page_for(index) else {
+            self.notify(tr(lang, "notify_save_failed"));
             return;
         };
         let Some(anim) = &page.anim else {
+            self.notify(tr(lang, "notify_save_failed"));
             return;
         };
-        let total = anim.frames.len();
+        let (streamed, stored) = {
+            let st = anim.state.lock().unwrap();
+            let stored: Vec<Arc<ColorImage>> = if st.streamed {
+                Vec::new()
+            } else {
+                (0..st.store.total).filter_map(|i| st.store.get(i)).collect()
+            };
+            (st.streamed, stored)
+        };
+        if streamed {
+            let cmd = Command::ExportAnimFrames {
+                session: self.session,
+                index,
+                dir: dir.to_path_buf(),
+                stem: self.frame_stem(index),
+                max_side: Self::max_side(ctx),
+                max_pixels: tier_pixels(self.display_scale).min(loader::max_pixels()),
+            };
+            if self.cmd_tx_main.send(cmd).is_err() {
+                self.notify(tr(lang, "notify_save_failed"));
+            }
+            return;
+        }
+        let total = stored.len();
         let stem = self.frame_stem(index);
         let mut done = 0;
-        for (i, f) in anim.frames.iter().enumerate() {
+        for (i, img) in stored.iter().enumerate() {
             let dest = dir.join(format!("{stem}_frame{:03}.png", i + 1));
-            let rgba = colorimage_to_rgba(&f.image);
+            let rgba = colorimage_to_rgba(img);
             if crate::wallpaper::write_png(&rgba, &dest).is_err() {
                 break;
             }
             done += 1;
         }
-        if done == total {
+        if total > 0 && done == total {
             self.notify(tr_fmt(lang, "notify_frames_exported", &[&done, &dir.display()]));
         } else {
             self.notify(tr(lang, "notify_save_failed"));
@@ -1200,7 +1647,11 @@ impl RoneyApp {
         };
         let frame_count = single
             .as_ref()
-            .and_then(|(_, p)| p.anim.as_ref().map(|a| a.frames.len()))
+            .and_then(|(_, p)| {
+                p.anim
+                    .as_ref()
+                    .map(|a| a.state.lock().unwrap().store.total)
+            })
             .unwrap_or(0);
         if !is_multiframe(frame_count) {
             if self.count() == 0 {
@@ -1218,7 +1669,18 @@ impl RoneyApp {
         let n = frame_count;
         self.anim_playing = false;
         self.anim_frame = step_index(self.anim_frame, n, dir);
-        self.upload_frame(&page, self.anim_frame);
+        let has = page
+            .anim
+            .as_ref()
+            .is_some_and(|a| a.state.lock().unwrap().store.has(self.anim_frame));
+        if has {
+            self.upload_frame(&page, self.anim_frame);
+        } else {
+            // Frame tujuan sudah terbuang dari jendela geser: minta
+            // stream lanjutan dari checkpoint terdekat; tekstur menyusul
+            // begitu frame-nya tiba (tick menyelaraskan).
+            self.request_anim_for(ctx, shown_index, self.anim_frame);
+        }
         // Selaraskan kunci animasi supaya saat diputar lagi lanjut dari sini.
         self.anim_key = Some((self.session, shown_index));
         ctx.request_repaint();
@@ -1334,7 +1796,15 @@ impl RoneyApp {
                 // berbeda 1-2 px pada rasio tidak bulat.
                 let (nw, nh) = edit::resize_result_size(bw, bh, e.resize_w, e.resize_h);
                 let mp = (nw as f64 * nh as f64) / 1_000_000.0;
-                ui.label(format!("{}: {} × {} px ({:.2} MP)", tr(lang, "edit_new_size"), nw, nh, mp));
+                // Dua baris terpisah secara deterministik: string gabungan
+                // "… px (X.XX MP)" berukuran ±276px — nyaris selebar panel
+                // bawaan (280px) — sehingga ekornya rawan terpotong di tepi
+                // panel/jendela (wrap tidak menolong: teksnya memang muat
+                // di lebar panel, jadi tidak pernah membungkus). Dipisah,
+                // kedua baris jauh lebih pendek dari lebar panel dan selalu
+                // tampil utuh, termasuk angka ekstrem (268.44 MP).
+                ui.label(format!("{}: {} × {} px", tr(lang, "edit_new_size"), nw, nh));
+                ui.colored_label(ui.visuals().weak_text_color(), format!("({:.2} MP)", mp));
                 if ui.button(tr(lang, "edit_apply_resize")).clicked() {
                     action = Some(EditPanelAction::ApplyResize);
                 }
@@ -1415,11 +1885,22 @@ impl RoneyApp {
             }
             EditTool::Tone => {
                 // Panel sempit (280px): kecilkan slider agar label tidak kepotong.
-                ui.spacing_mut().slider_width = 110.0;
+                // 80px (seperti slider sudut di Rotate) memberi ruang cukup bagi
+                // label terpanjang ("Kompr. highlight" / "Compr. highlight",
+                // ±139px) untuk tampil PENUH sampai tepi panel — pada 110px
+                // label itu terpotong ±2 huruf di jendela sempit.
+                ui.spacing_mut().slider_width = 80.0;
                 // Switch mode: Dasar (sederhana) vs Lanjutan (HDR tone mapping).
+                // Perpindahan mode WAJIB memicu hitung ulang pratinjau: tanpa
+                // itu pratinjau (dan belahan Bandingkan) tetap menampilkan
+                // hasil mode sebelumnya sampai ada slider yang digeser.
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut e.tone_advanced, false, tr(lang, "edit_tone_basic"));
-                    ui.radio_value(&mut e.tone_advanced, true, tr(lang, "edit_tone_advanced"));
+                    tone_changed |= ui
+                        .radio_value(&mut e.tone_advanced, false, tr(lang, "edit_tone_basic"))
+                        .changed();
+                    tone_changed |= ui
+                        .radio_value(&mut e.tone_advanced, true, tr(lang, "edit_tone_advanced"))
+                        .changed();
                 });
                 // Toggle banding before/after.
                 ui.horizontal(|ui| {
@@ -1594,7 +2075,8 @@ impl RoneyApp {
         // Tangkap area panel pusat SEBELUM layout horizontal: available_height()
         // di dalam layout horizontal hanya mengembalikan tinggi satu baris.
         let avail = ui.available_rect_before_wrap();
-        let img_size = vec2((avail.width() - self.store.state.panel_width - 12.0).max(120.0), avail.height());
+        let img_w = edit_image_width(avail.width(), self.store.state.panel_width, ui.spacing().item_spacing.x);
+        let img_size = vec2(img_w, avail.height());
         ui.horizontal(|ui| {
             let (img_rect, img_resp) =
                 ui.allocate_exact_size(img_size, Sense::click_and_drag());
@@ -1621,7 +2103,7 @@ impl RoneyApp {
             }
             ui.separator();
             // Handle drag untuk resize panel.
-            let (sep_rect, sep_resp) = ui.allocate_exact_size(egui::vec2(6.0, avail.height()), egui::Sense::drag());
+            let (sep_rect, sep_resp) = ui.allocate_exact_size(egui::vec2(EDIT_HANDLE_W, avail.height()), egui::Sense::drag());
             if sep_resp.dragged() {
                 let delta = sep_resp.drag_delta().x;
                 // Geser kiri = panel lebih lebar (nilai negatif).
@@ -2132,9 +2614,52 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         }
     }
 
+    /// Tulis gambar RGBA ke clipboard + toast hasil (dipakai jalur salin
+    /// mode lihat).
+    fn set_clipboard_image(&mut self, img: RgbaImage) {
+        let lang = self.lang;
+        let data = arboard::ImageData {
+            width: img.width() as usize,
+            height: img.height() as usize,
+            bytes: std::borrow::Cow::Owned(img.into_raw()),
+        };
+        match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
+            Ok(_) => self.notify(tr(lang, "edit_copied")),
+            Err(e) => self.notify(format!("{}: {e}", tr(lang, "notify_save_failed"))),
+        }
+    }
+
+    /// Frame animasi yang sedang tampil di halaman saat ini (mode satu
+    /// halaman), siap disalin. Mengikuti cara `tick_animation` mengenali
+    /// halaman animasi aktif: isi yang tampil harus satu slot dan kunci
+    /// animasi harus menunjuk halaman itu. Yang diambil adalah frame
+    /// yang BENAR-BENAR ada di tekstur (`uploaded`) — termasuk saat
+    /// animasi dijeda, dilangkahi manual, atau playhead sedang menunggu
+    /// frame yang belum tiba — jadi yang tersalin selalu yang terlihat.
+    /// None = bukan animasi yang sedang diputar -> jalur salin biasa.
+    fn displayed_anim_frame(&mut self) -> Option<RgbaImage> {
+        let sh = self.current_content()?;
+        let [(index, page)] = sh.slots.as_slice() else {
+            return None;
+        };
+        let anim = page.anim.as_ref()?;
+        if self.anim_key != Some((self.session, *index)) {
+            return None;
+        }
+        let uploaded = anim.uploaded.load(Ordering::Relaxed);
+        let img = anim.state.lock().unwrap().store.get(uploaded);
+        img.map(|img| colorimage_to_rgba(&img))
+    }
+
     /// Salin gambar yang sedang ditampilkan ke clipboard (mode lihat).
     fn copy_current_image(&mut self) {
-        let lang = self.lang;
+        // Animasi: salin frame yang SEDANG TAMPIL. Jalur dekode ulang dari
+        // sumber di bawah selalu menghasilkan frame pertama, jadi untuk
+        // animasi yang sedang diputar ambil buffer frame aktif.
+        if let Some(img) = self.displayed_anim_frame() {
+            self.set_clipboard_image(img);
+            return;
+        }
         let Some(listing) = self.listing.clone() else {
             return;
         };
@@ -2154,17 +2679,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             }
         };
         match Self::decode_edit_source(&bytes) {
-            Ok((img, _)) => {
-                let data = arboard::ImageData {
-                    width: img.width() as usize,
-                    height: img.height() as usize,
-                    bytes: std::borrow::Cow::Owned(img.into_raw()),
-                };
-                match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
-                    Ok(_) => self.notify(tr(lang, "edit_copied")),
-                    Err(e) => self.notify(format!("{}: {e}", tr(lang, "notify_save_failed"))),
-                }
-            }
+            Ok((img, _)) => self.set_clipboard_image(img),
             Err(e) => self.notify(e),
         }
     }
@@ -2223,7 +2738,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 continue;
             }
             self.pending.insert(i, false);
-            let held: usize = self.cache.values().map(|p| p.bytes).sum();
+            let held: usize = self.cache.values().map(|p| p.total_bytes()).sum();
             let cmd = Command::Load {
                 session: self.session,
                 index: i,
@@ -2581,7 +3096,13 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         let pixels: Option<ColorImage> = if need_pixels {
             self.page_for(index).and_then(|page| {
                 if let Some(anim) = &page.anim {
-                    anim.frames.get(self.anim_frame).map(|f| (*f.image).clone())
+                    let st = anim.state.lock().unwrap();
+                    st.store
+                        .get(self.anim_frame)
+                        .or_else(|| {
+                            st.store.get(anim.uploaded.load(Ordering::Relaxed))
+                        })
+                        .map(|img| (*img).clone())
                 } else {
                     self.decode_projector_pixels(index)
                 }
@@ -2836,7 +3357,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     /// dalam anggaran. Gambar yang sedang dilihat tidak pernah dibuang.
     fn enforce_budget(&mut self) {
         loop {
-            let total: usize = self.cache.values().map(|p| p.bytes).sum();
+            let total: usize = self.cache.values().map(|p| p.total_bytes()).sum();
             if total <= self.budget {
                 return;
             }
@@ -2913,7 +3434,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             self.pending.insert(i, primary);
             // Worker memakai anggaran untuk melewatkan prefetch yang hasilnya
             // pasti dibuang (decode-nya bisa makan 8 detik CPU dengan sia-sia).
-            let held: usize = self.cache.values().map(|p| p.bytes).sum();
+            let held: usize = self.cache.values().map(|p| p.total_bytes()).sum();
             let cmd = Command::Load {
                 session: self.session,
                 index: i,
@@ -2954,6 +3475,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     }
 
     fn poll_loader(&mut self, ctx: &Context) {
+        let lang = self.lang;
         let mut got_current = false;
         while let Ok(msg) = self.out_rx.try_recv() {
             if msg.session != self.session {
@@ -2962,56 +3484,115 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             self.pending.remove(&msg.index);
             match msg.outcome {
                 Outcome::Ready(d) => {
-                    let (lo, hi) = keep_window(self.index, self.low_memory_mode, self.two_page_mode);
-                    if !(lo..=hi).contains(&msg.index) {
-                        // Buang juga pratinjaunya kalau sempat masuk: kalau tidak,
-                        // gambar blur basi bisa tampil selamanya tanpa versi tajam.
-                        self.cache.remove(&msg.index);
-                        continue; // sudah terlalu jauh, buang
+                    if self.install_page(ctx, msg.session, msg.index, d, None)
+                        && msg.index == self.index
+                    {
+                        got_current = true;
                     }
-                    let px = d.pixels;
-                    self.dims.insert(msg.index, px.orig);
-                    let format = px.format.clone();
-                    let animated = px.frames.is_some();
-                    // Mipmap menambah ~1/3 memori GPU.
-                    let mip_factor = |b: usize| if self.mipmaps && !animated { b * 4 / 3 } else { b };
-                    let mut bytes = mip_factor(px.image.size[0] * px.image.size[1] * 4);
-                    let anim = px.frames.map(|frames| {
-                        // frames[0] berbagi data dengan `image`; hitung sisanya.
-                        bytes = frames
-                            .iter()
-                            .map(|f| f.image.size[0] * f.image.size[1] * 4)
-                            .sum();
-                        Anim {
-                            frames,
-                            uploaded: AtomicUsize::new(0),
-                            truncated: px.truncated,
-                        }
-                    });
-                    if msg.index != self.index {
-                        let held: usize = self.cache.values().map(|p| p.bytes).sum();
-                        if held + bytes > self.budget {
-                            continue; // prefetch tidak muat: jangan alokasikan tekstur GPU
+                }
+                Outcome::Preview(d, meta) => {
+                    // Frame pertama GIF streaming: pasang halamannya
+                    // sekarang, frame sisanya menyusul sebagai AnimChunk.
+                    // Permintaan aslinya tetap ditandai pending (menahan
+                    // refine & permintaan ganda) sampai stream selesai.
+                    let idx = msg.index;
+                    if self.install_page(ctx, msg.session, idx, d, Some(&meta))
+                        && idx == self.index
+                    {
+                        got_current = true;
+                    }
+                    if idx == self.index {
+                        self.pending.insert(idx, true);
+                    }
+                }
+                Outcome::AnimChunk {
+                    start,
+                    frames,
+                    checkpoints,
+                } => {
+                    let n = frames.len();
+                    if let Some(page) = self.cache.get(&msg.index).cloned() {
+                        if let Some(anim) = &page.anim {
+                            let focus = if msg.index == self.index {
+                                self.anim_frame
+                            } else {
+                                0
+                            };
+                            let uploaded = anim.uploaded.load(Ordering::Relaxed);
+                            let mut st = anim.state.lock().unwrap();
+                            if st.streamed {
+                                // Jangkar eviction: frame yang ditunggu
+                                // playhead (atau playhead itu sendiri).
+                                let anchor = st.want.unwrap_or(focus);
+                                for (k, f) in frames.into_iter().enumerate() {
+                                    st.store
+                                        .insert_frame(start + k, f.image, focus, uploaded, anchor);
+                                }
+                                for (ci, img) in checkpoints {
+                                    st.store.insert_checkpoint(ci, img, focus, uploaded, anchor);
+                                }
+                                st.stream_upto = st.stream_upto.max(start + n);
+                                if st.streaming {
+                                    drop(st);
+                                    // Stream belum selesai: permintaan
+                                    // tetap dianggap berjalan.
+                                    self.pending.insert(msg.index, true);
+                                }
+                            }
                         }
                     }
-                    let decoded = [px.image.size[0] as u32, px.image.size[1] as u32];
-                    let tex = ctx.load_texture(
-                        format!("pg{}-{}", msg.session, msg.index),
-                        px.image,
-                        self.texture_options(animated),
-                    );
-                    let page = Arc::new(Page {
-                        tex,
-                        orig: px.orig,
-                        decoded,
-                        file_size: d.file_size,
-                        bytes,
-                        anim,
-                        format,
-                    });
+                    if msg.index == self.index {
+                        got_current = true;
+                        self.enforce_budget();
+                    }
+                }
+                Outcome::AnimDone { .. } => {
+                    if let Some(anim) = self
+                        .cache
+                        .get(&msg.index)
+                        .and_then(|p| p.anim.as_ref())
+                    {
+                        let mut st = anim.state.lock().unwrap();
+                        st.streaming = false;
+                        st.want = None;
+                    }
                     got_current |= msg.index == self.index;
-                    self.cache.insert(msg.index, page);
-                    self.enforce_budget();
+                }
+                Outcome::AnimFailed {
+                    from_frame,
+                    message,
+                } => {
+                    // Stream putus: frame yang sudah tampil TETAP tampil;
+                    // galatnya dicatat supaya status jujur.
+                    if let Some(anim) = self
+                        .cache
+                        .get(&msg.index)
+                        .and_then(|p| p.anim.as_ref())
+                    {
+                        let mut st = anim.state.lock().unwrap();
+                        st.streaming = false;
+                        st.failed_from = Some(from_frame);
+                        st.want = None;
+                    }
+                    self.errors.insert(msg.index, message);
+                    got_current |= msg.index == self.index;
+                }
+                Outcome::AnimExported { done, total, dir } => {
+                    if done == total {
+                        self.notify(tr_fmt(
+                            lang,
+                            "notify_frames_exported",
+                            &[&done, &dir.display()],
+                        ));
+                    } else {
+                        self.notify(tr(lang, "notify_save_failed"));
+                    }
+                }
+                Outcome::AnimSaved { dest } => {
+                    self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()]));
+                }
+                Outcome::AnimJobFailed { message } => {
+                    self.notify(message);
                 }
                 Outcome::Failed(e) => {
                     self.errors.insert(msg.index, e);
@@ -3022,6 +3603,147 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         }
         if got_current {
             ctx.request_repaint();
+        }
+    }
+
+    /// Pasang hasil decode sebagai `Page` di cache (tekstur + metadata).
+    /// `meta` terisi hanya untuk Preview streaming GIF: animasinya
+    /// dibangun sebagai penyimpanan streaming, bukan warisan.
+    /// Mengembalikan `true` bila halaman benar-benar terpasang; `false`
+    /// bila dibuang (di luar jendela simpan, atau prefetch yang tidak
+    /// muat anggaran cache).
+    fn install_page(
+        &mut self,
+        ctx: &Context,
+        session: u64,
+        index: usize,
+        d: loader::Decoded,
+        meta: Option<&AnimMeta>,
+    ) -> bool {
+        let (lo, hi) = keep_window(self.index, self.low_memory_mode, self.two_page_mode);
+        if !(lo..=hi).contains(&index) {
+            // Buang juga pratinjaunya kalau sempat masuk: kalau tidak,
+            // gambar blur basi bisa tampil selamanya tanpa versi tajam.
+            self.cache.remove(&index);
+            return false; // sudah terlalu jauh, buang
+        }
+        let px = d.pixels;
+        self.dims.insert(index, px.orig);
+        let format = px.format.clone();
+        let animated = px.frames.is_some();
+        // Mipmap menambah ~1/3 memori GPU.
+        let mip_factor = |b: usize| if self.mipmaps && !animated { b * 4 / 3 } else { b };
+        let mut bytes = mip_factor(px.image.size[0] * px.image.size[1] * 4);
+        let anim = px.frames.map(|frames| {
+            let state = match meta {
+                Some(m) => {
+                    // Streaming: frames di sini tepat berisi frame 0.
+                    let mut frames = frames;
+                    let frame0 = frames.pop().expect("preview membawa frame pertama");
+                    let budget = if self.low_memory_mode {
+                        loader::ANIM_BUDGET / 4
+                    } else {
+                        loader::ANIM_BUDGET
+                    };
+                    AnimState::streamed(m, frame0, budget)
+                }
+                None => {
+                    // frames[0] berbagi data dengan `image`; hitung sisanya.
+                    bytes = frames
+                        .iter()
+                        .map(|f| f.image.size[0] * f.image.size[1] * 4)
+                        .sum();
+                    AnimState::legacy(frames, px.truncated)
+                }
+            };
+            Anim {
+                state: Mutex::new(state),
+                uploaded: AtomicUsize::new(0),
+            }
+        });
+        if index != self.index {
+            let held: usize = self.cache.values().map(|p| p.total_bytes()).sum();
+            if held + bytes > self.budget {
+                return false; // prefetch tidak muat: jangan alokasikan tekstur GPU
+            }
+        }
+        let decoded = [px.image.size[0] as u32, px.image.size[1] as u32];
+        let tex = ctx.load_texture(
+            format!("pg{session}-{index}"),
+            px.image,
+            self.texture_options(animated),
+        );
+        let page = Arc::new(Page {
+            tex,
+            orig: px.orig,
+            decoded,
+            file_size: d.file_size,
+            bytes,
+            anim,
+            format,
+        });
+        self.cache.insert(index, page);
+        self.enforce_budget();
+        true
+    }
+
+    /// Minta worker mengalirkan frame GIF halaman `page_index` sampai
+    /// `target` tersedia (dan sesudahnya, supaya putaran bisa lanjut).
+    /// Titik mulai dipilih dari penyimpanan halaman: jalan pintas frame
+    /// sebelumnya, checkpoint terdekat, atau dari awal. Stream yang
+    /// sedang berjalan dan akan melewati target dibiarkan; yang sudah
+    /// melewatinya dibatalkan dan diganti.
+    fn request_anim_for(&mut self, ctx: &Context, page_index: usize, target: usize) {
+        let Some(page) = self.cache.get(&page_index).cloned() else {
+            return;
+        };
+        let Some(anim) = &page.anim else {
+            return;
+        };
+        let (start, base) = {
+            let mut st = anim.state.lock().unwrap();
+            if !st.streamed || st.store.has(target) {
+                return;
+            }
+            if let Some(f) = st.failed_from {
+                if target >= f {
+                    return; // stream pernah putus sebelum target ini
+                }
+            }
+            // Catat target sebagai jangkar eviction SEBELUM kemungkinan
+            // kembali awal di bawah: selama stream berjalan menuju
+            // target, frame target (dan jendela sesudahnya) tidak boleh
+            // terbuang sebelum playhead sempat menampilkannya.
+            st.want = Some(target);
+            if st.streaming {
+                if st.stream_from <= target && target >= st.stream_upto {
+                    return; // stream berjalan sedang menuju target ini
+                }
+                // Sudah lewat / arahnya salah: batalkan, mulai dari
+                // checkpoint. App selalu memasangkan CancelAnim dengan
+                // permintaan baru di bawah, jadi stream_key di worker
+                // tidak menggantung.
+                let _ = self.cmd_tx_main.send(Command::CancelAnim {
+                    session: self.session,
+                    index: page_index,
+                });
+            }
+            let (start, base) = st.store.seek_base(target);
+            st.streaming = true;
+            st.stream_from = start;
+            st.stream_upto = start;
+            (start, base)
+        };
+        let cmd = Command::AnimStream {
+            session: self.session,
+            index: page_index,
+            start_frame: start,
+            base,
+            max_side: Self::max_side(ctx),
+            max_pixels: tier_pixels(self.display_scale).min(loader::max_pixels()),
+        };
+        if self.cmd_tx_main.send(cmd).is_err() {
+            anim.state.lock().unwrap().streaming = false;
         }
     }
 
@@ -3322,7 +4044,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         }
         let max_side = Self::max_side(ctx);
         let max_pixels = tier_px.min(loader::max_pixels());
-        let held: usize = self.cache.values().map(|p| p.bytes).sum();
+        let held: usize = self.cache.values().map(|p| p.total_bytes()).sum();
         self.pending.insert(s, true);
         let cmd = Command::Load {
             session: self.session,
@@ -3415,7 +4137,16 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     self.thumb_pending.clear();
                 }
             }
-            Action::CopyImage => self.copy_current_image(),
+            Action::CopyImage => {
+                // Selama sesi edit, yang disalin adalah buffer kerja (hasil
+                // edit sejauh ini, lewat jalur salin panel edit), bukan
+                // berkas sumber.
+                if self.edit.is_some() {
+                    self.copy_crop();
+                } else {
+                    self.copy_current_image();
+                }
+            }
             Action::ToggleSlideshow => {
                 self.slideshow = !self.slideshow;
                 if self.slideshow {
@@ -3531,6 +4262,9 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 take(ctrl, Key::O, Action::OpenFile, i);
                 take(ctrl, Key::Q, Action::Quit, i);
                 take(ctrl, Key::Comma, Action::Settings, i);
+                // Fallback untuk backend yang tetap mengirim Ctrl+C sebagai
+                // Event::Key; di egui-winit chord ini tiba sebagai Event::Copy
+                // dan ditangani raw_event_action (keduanya tak pernah bersamaan).
                 take(ctrl, Key::C, Action::CopyImage, i);
                 take(ctrl, Key::G, Action::GoToPage, i);
                 take(shift, Key::R, Action::RotateCcw, i);
@@ -3579,6 +4313,12 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             }
 
             for ev in &i.events {
+                // Ctrl+C tiba sebagai Event::Copy (lihat raw_event_action);
+                // event-nya hanya dibaca, tidak dicabut, supaya widget lain
+                // tetap bisa memprosesnya.
+                if let Some(a) = raw_event_action(ev, typing, projector_open) {
+                    out.actions.push(a);
+                }
                 if let egui::Event::MouseWheel {
                     unit,
                     delta,
@@ -4138,13 +4878,28 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     ui.label(format!("{:.0}%", scale * 100.0));
                     ui.separator();
                     if let Some(a) = &page.anim {
-                        let state = if self.anim_playing { "" } else { ", jeda" };
-                        let cut = if a.truncated { ", dipotong" } else { "" };
-                        ui.label(format!(
-                            "animasi {}/{}{state}{cut}",
-                            self.anim_frame + 1,
-                            a.frames.len()
-                        ));
+                        let st = a.state.lock().unwrap();
+                        // Angka frame = yang benar-benar ada di tekstur;
+                        // totalnya dari indeks (diketahui penuh sejak
+                        // awal untuk GIF streaming).
+                        let shown = a.uploaded.load(Ordering::Relaxed) + 1;
+                        let mut txt = format!("animasi {}/{}", shown, st.store.total);
+                        if !self.anim_playing {
+                            txt.push_str(", jeda");
+                        }
+                        if st.streaming {
+                            // Fase memuat dibedakan dari selesai: tampilkan
+                            // kemajuan stream, BUKAN label "dipotong".
+                            txt.push_str(", ");
+                            txt.push_str(&tr_fmt(
+                                lang,
+                                "status_anim_loading",
+                                &[&st.stream_upto.min(st.store.total), &st.store.total],
+                            ));
+                        } else if st.truncated || st.failed_from.is_some() {
+                            txt.push_str(", dipotong");
+                        }
+                        ui.label(txt);
                         ui.separator();
                     }
                 }
@@ -4658,25 +5413,65 @@ impl RoneyApp {
         };
         let now = Instant::now();
         let key = Some((self.session, shown_index));
-        let first_delay = anim.frames[0].delay;
+        let (total, delay0) = {
+            let st = anim.state.lock().unwrap();
+            (st.store.total, st.store.delay(0))
+        };
+        if total == 0 {
+            self.anim_key = None;
+            return;
+        }
         if self.anim_key != key {
             // Halaman animasi baru (atau kembali ke halaman lama): mulai dari frame 0.
             self.anim_key = key;
             self.anim_frame = 0;
-            self.anim_next = now + first_delay;
-            if anim.uploaded.load(Ordering::Relaxed) != 0 {
+            self.anim_next = now + delay0;
+            let has0 = anim.state.lock().unwrap().store.has(0);
+            if anim.uploaded.load(Ordering::Relaxed) != 0 && has0 {
                 self.upload_frame(&page, 0);
             }
-        } else if self.anim_playing && now >= self.anim_next {
-            self.anim_frame = (self.anim_frame + 1) % anim.frames.len();
-            self.upload_frame(&page, self.anim_frame);
-            let delay = anim.frames[self.anim_frame].delay;
-            // Setelah stall panjang, jangan mengejar ketinggalan frame.
-            self.anim_next = if now.saturating_duration_since(self.anim_next) > delay {
-                now + delay
-            } else {
-                self.anim_next + delay
-            };
+            if !has0 {
+                self.request_anim_for(ctx, shown_index, 0);
+            }
+        } else {
+            // Selaraskan tekstur dengan playhead bila frame tujuannya
+            // sudah tiba (mis. sesudah stream lanjutan menyusul).
+            if self.anim_frame < total {
+                let has = anim.state.lock().unwrap().store.has(self.anim_frame);
+                if has && anim.uploaded.load(Ordering::Relaxed) != self.anim_frame {
+                    self.upload_frame(&page, self.anim_frame);
+                }
+            }
+            if self.anim_playing && now >= self.anim_next {
+                let (new_f, new_t, blocked) = {
+                    let st = anim.state.lock().unwrap();
+                    catch_up(
+                        total,
+                        &st.store.delays,
+                        self.anim_frame,
+                        &|i| st.store.has(i),
+                        self.anim_next,
+                        now,
+                    )
+                };
+                if new_f != self.anim_frame {
+                    self.anim_frame = new_f;
+                    self.upload_frame(&page, new_f);
+                }
+                self.anim_next = new_t;
+                if blocked {
+                    // Dekode tertinggal dari jam putar: tahan di frame
+                    // terakhir yang tersedia, minta stream menyusul,
+                    // coba lagi sebentar lagi (potongan yang tiba juga
+                    // memicu repaint dari worker).
+                    let target = (self.anim_frame + 1) % total;
+                    self.request_anim_for(ctx, shown_index, target);
+                    self.anim_next = now + Duration::from_millis(30);
+                } else {
+                    // Putaran sehat: tak ada lagi frame yang ditunggu.
+                    anim.state.lock().unwrap().want = None;
+                }
+            }
         }
         if self.anim_playing {
             ctx.request_repaint_after(self.anim_next.saturating_duration_since(Instant::now()));
@@ -4687,11 +5482,12 @@ impl RoneyApp {
         let Some(anim) = &page.anim else {
             return;
         };
-        let Some(f) = anim.frames.get(frame) else {
+        let img = anim.state.lock().unwrap().store.get(frame);
+        let Some(img) = img else {
             return;
         };
         let mut tex = page.tex.clone();
-        tex.set(f.image.clone(), self.texture_options(true));
+        tex.set(img, self.texture_options(true));
         anim.uploaded.store(frame, Ordering::Relaxed);
     }
 
@@ -4726,9 +5522,14 @@ impl eframe::App for RoneyApp {
         }
         // Saat kotak konfirmasi/modal atau jendela "Lompat ke halaman" terbuka,
         // pintasan keyboard utama tidak berlaku. Saat mengedit gambar,
-        // pintasan navigasi utama juga dimatikan (Esc menutup sesi edit).
-        if self.modal.is_none() && !self.goto_open && self.edit.is_none() {
+        // pintasan navigasi utama juga dimatikan (Esc menutup sesi edit);
+        // satu-satunya pengecualian adalah salin, supaya Ctrl+C tetap bisa
+        // menyalin buffer kerja selama edit (lihat action_allowed_while_editing).
+        if self.modal.is_none() && !self.goto_open {
             for a in &inp.actions {
+                if self.edit.is_some() && !action_allowed_while_editing(a) {
+                    continue;
+                }
                 self.perform(ctx, *a);
             }
         }
@@ -6275,6 +7076,297 @@ mod tests {
         assert_eq!(parse_page_number("abc", 10), None);
         assert_eq!(parse_page_number("", 10), None);
         assert_eq!(parse_page_number("1", 0), None, "daftar kosong -> tidak ada halaman valid");
+    }
+
+    #[test]
+    fn preview_coord_identitas_bila_ukuran_sama() {
+        // Gambar <=960px: pratinjau seukuran buffer, pemetaan harus identitas
+        // persis (perilaku mode Bandingkan lama yang sudah benar).
+        for (x, y) in [(0, 0), (1, 1), (479, 319), (959, 639), (640, 480)] {
+            assert_eq!(preview_coord(x, y, 960, 640, 960, 640), (x, y));
+        }
+        assert_eq!(preview_coord(799, 599, 800, 600, 800, 600), (799, 599));
+    }
+
+    #[test]
+    fn preview_coord_susut_proporsional() {
+        // Buffer 1920x1280 -> pratinjau 960x640 (faktor 0.5): belahan kanan
+        // mode Bandingkan harus membaca pratinjau, bukan buffer.
+        assert_eq!(preview_coord(0, 0, 1920, 1280, 960, 640), (0, 0));
+        assert_eq!(preview_coord(1000, 640, 1920, 1280, 960, 640), (500, 320));
+        // Sudut kanan-bawah mendarat di piksel terakhir pratinjau, tidak
+        // pernah keluar batas.
+        assert_eq!(preview_coord(1919, 1279, 1920, 1280, 960, 640), (959, 639));
+        assert_eq!(preview_coord(1918, 1278, 1920, 1280, 960, 640), (959, 639));
+    }
+
+    #[test]
+    fn preview_coord_pembulatan_susut_ganjil_aman() {
+        // Susutan dengan pembulatan per sumbu (1000x333 -> 960x320):
+        // semua koordinat buffer tetap di dalam pratinjau.
+        let (sx, sy) = preview_coord(999, 332, 1000, 333, 960, 320);
+        assert!(sx < 960 && sy < 320, "keluar batas: ({sx}, {sy})");
+        assert_eq!(preview_coord(500, 166, 1000, 333, 960, 320), (480, 159));
+        // Ukuran nol tidak panik.
+        assert_eq!(preview_coord(5, 5, 0, 0, 960, 640), (0, 0));
+        assert_eq!(preview_coord(5, 5, 100, 100, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn simpan_tanpa_ekstensi_ditambah_ekstensi_format() {
+        // Dialog GTK/rfd mengembalikan nama persis seperti diketik; format
+        // tetap (PNG/PDF) harus tetap tercermin di nama berkas hasil.
+        assert_eq!(
+            ensure_save_ext(Path::new("/tmp/hasil-edit"), "png"),
+            PathBuf::from("/tmp/hasil-edit.png")
+        );
+        assert_eq!(
+            ensure_save_ext(Path::new("dokumen"), "pdf"),
+            PathBuf::from("dokumen.pdf")
+        );
+        // Titik menggantung di ujung nama dianggap belum berekstensi.
+        assert_eq!(
+            ensure_save_ext(Path::new("hasil."), "png"),
+            PathBuf::from("hasil.png")
+        );
+    }
+
+    #[test]
+    fn simpan_berekstensi_tidak_pernah_diubah() {
+        // Ekstensi yang diketik pengguna dihormati apa adanya — bahkan bila
+        // tidak cocok dengan format dialog (bukan urusan penolong ini).
+        assert_eq!(
+            ensure_save_ext(Path::new("/tmp/foto.png"), "png"),
+            PathBuf::from("/tmp/foto.png")
+        );
+        assert_eq!(
+            ensure_save_ext(Path::new("/tmp/foto.jpg"), "png"),
+            PathBuf::from("/tmp/foto.jpg")
+        );
+        assert_eq!(
+            ensure_save_ext(Path::new("/tmp/cetak.final.pdf"), "pdf"),
+            PathBuf::from("/tmp/cetak.final.pdf")
+        );
+    }
+
+    #[test]
+    fn event_copy_menjadi_aksi_salin_saat_gerbang_terbuka() {
+        // Jalur nyata Ctrl+C di egui-winit: Event::Copy, bukan Event::Key.
+        assert_eq!(
+            raw_event_action(&egui::Event::Copy, false, false),
+            Some(Action::CopyImage)
+        );
+    }
+
+    #[test]
+    fn event_copy_diabaikan_saat_mengetik_atau_proyektor_terbuka() {
+        // Saat mengetik, Event::Copy milik TextEdit (salin teks terpilih).
+        assert_eq!(raw_event_action(&egui::Event::Copy, true, false), None);
+        assert_eq!(raw_event_action(&egui::Event::Copy, false, true), None);
+        // Event clipboard lain tidak dipetakan ke aksi apa pun.
+        assert_eq!(raw_event_action(&egui::Event::Cut, false, false), None);
+        assert_eq!(
+            raw_event_action(&egui::Event::Paste("x".to_owned()), false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn salin_animasi_memilih_frame_yang_sedang_tampil() {
+        let mk = |c: Color32| AnimFrame {
+            image: Arc::new(ColorImage::from_rgba_unmultiplied([1, 1], &c.to_array())),
+            delay: Duration::from_millis(100),
+        };
+        let frames = vec![mk(Color32::RED), mk(Color32::GREEN), mk(Color32::BLUE)];
+        let store = FrameStore::legacy(frames);
+        // Yang dipilih adalah frame tampil (indeks 1), BUKAN frame pertama —
+        // inilah bug lapangan 0.8.17 (salin selalu berisi frame pertama).
+        let picked = store.get(1).expect("indeks valid");
+        assert_eq!(picked.pixels[0], Color32::GREEN);
+        assert_eq!(store.get(0).map(|f| f.pixels[0]), Some(Color32::RED));
+        assert_eq!(store.get(2).map(|f| f.pixels[0]), Some(Color32::BLUE));
+        // Indeks di luar rentang: jangan menebak frame lain.
+        assert!(store.get(3).is_none());
+        assert_eq!(store.total, 3);
+    }
+
+    #[test]
+    fn frame_store_streaming_ditegakkan_anggarannya() {
+        let img = || Arc::new(ColorImage::new([2, 2], vec![Color32::RED; 4]));
+        let meta = AnimMeta {
+            total: 40,
+            delays: vec![Duration::from_millis(50); 40],
+            disposes: vec![loader::Dispose::Keep; 40],
+            cadence: 8,
+            truncated: false,
+        };
+        let frame0 = AnimFrame {
+            image: img(),
+            delay: Duration::from_millis(50),
+        };
+        // Anggaran 5 frame (frame 2x2 = 16 byte -> anggaran 80 byte).
+        let mut store = FrameStore::streamed(&meta, frame0, 80);
+        assert_eq!(store.total, 40);
+        assert!(store.has(0));
+        // Masukkan checkpoint di 0, 8 dan frame 1..=12 dengan fokus di 0.
+        store.insert_checkpoint(0, img(), 0, 0, 0);
+        for i in 1..=12usize {
+            store.insert_frame(i, img(), 0, 0, 0);
+            assert!(store.bytes() <= 80, "anggaran jebol di frame {i}: {}", store.bytes());
+        }
+        // Frame fokus dan tetangganya tidak pernah jadi korban.
+        assert!(store.has(0), "frame fokus harus tetap ada");
+        assert!(store.has(1), "frame sesudah fokus harus tetap ada");
+        // Checkpoint terdekat di belakang fokus (0) juga dipertahankan.
+        assert!(store.checkpoints.contains_key(&0));
+    }
+
+    #[test]
+    fn frame_store_jangkar_menyelamatkan_frame_yang_ditunggu() {
+        // Regresi dari uji GUI putaran ini: loop membungkus ke frame 0
+        // sementara fokus playhead masih di frame terakhir. Stream
+        // lanjutan memasukkan frame 0,1,2,... dengan fokus di ujung;
+        // tanpa jangkar di 0, frame 0 (yang ditunggu playhead) terbuang
+        // oleh pemasukan frame berikutnya, playhead tak pernah maju,
+        // dan stream diminta ulang tanpa henti.
+        let img = || Arc::new(ColorImage::new([2, 2], vec![Color32::RED; 4]));
+        let meta = AnimMeta {
+            total: 30,
+            delays: vec![Duration::from_millis(50); 30],
+            disposes: vec![loader::Dispose::Keep; 30],
+            cadence: 8,
+            truncated: false,
+        };
+        let frame0 = AnimFrame {
+            image: img(),
+            delay: Duration::from_millis(50),
+        };
+        // Anggaran 6 frame (frame 16 byte -> 96 byte).
+        let mut store = FrameStore::streamed(&meta, frame0, 96);
+        // Keadaan akhir putaran pertama: jendela di ekor (24..=29),
+        // frame 0 sudah terbuang.
+        for i in 24..=29usize {
+            store.insert_frame(i, img(), 29, 29, 29);
+        }
+        assert!(store.has(29));
+        assert!(!store.has(0), "persiapan: frame 0 harus sudah terbuang");
+        // Stream lanjutan dari 0, jangkar di frame yang ditunggu (0).
+        for i in 0..=3usize {
+            store.insert_frame(i, img(), 29, 29, 0);
+            assert!(
+                store.has(0),
+                "frame yang ditunggu terbuang saat memasukkan frame {i}"
+            );
+            assert!(store.bytes() <= 96, "anggaran jebol: {}", store.bytes());
+        }
+        assert!(store.has(29), "frame fokus tidak boleh ikut terbuang");
+    }
+
+    #[test]
+    fn frame_store_seek_base_memakai_checkpoint_dan_jalan_pintas() {
+        let img = || Arc::new(ColorImage::new([2, 2], vec![Color32::RED; 4]));
+        let meta = AnimMeta {
+            total: 30,
+            delays: vec![Duration::from_millis(50); 30],
+            disposes: vec![loader::Dispose::Keep; 30],
+            cadence: 10,
+            truncated: false,
+        };
+        let frame0 = AnimFrame {
+            image: img(),
+            delay: Duration::from_millis(50),
+        };
+        let mut store = FrameStore::streamed(&meta, frame0, usize::MAX);
+        store.insert_checkpoint(9, img(), 0, 0, 0);
+        store.insert_checkpoint(19, img(), 0, 0, 0);
+        // Target 0: selalu dari awal tanpa dasar.
+        let (start, base) = store.seek_base(0);
+        assert_eq!(start, 0);
+        assert!(base.is_none());
+        // Target 25: checkpoint terbesar di bawahnya 19 -> mulai 20.
+        let (start, base) = store.seek_base(25);
+        assert_eq!(start, 20);
+        assert!(base.is_some());
+        // Jalan pintas: frame 24 tersimpan dan disposal frame 24 = Keep
+        // -> mulai tepat di 25 dengan dasar gambar frame 24.
+        store.insert_frame(24, img(), 0, 0, 0);
+        let (start, base) = store.seek_base(25);
+        assert_eq!(start, 25);
+        assert!(base.is_some());
+        // Disposal Background memutus jalan pintas: kembali ke checkpoint.
+        store.disposes[24] = loader::Dispose::Background;
+        let (start, _) = store.seek_base(25);
+        assert_eq!(start, 20);
+    }
+
+    #[test]
+    fn catch_up_melompati_tampilan_tapi_berhenti_di_frame_kosong() {
+        let total = 6;
+        let delays = vec![Duration::from_millis(100); total];
+        let t0 = Instant::now();
+        let all = |_: usize| true;
+        // Setengah jeda sesudah deadline: maju tepat satu frame.
+        let (f, t, blocked) = catch_up(total, &delays, 0, &all, t0, t0 + Duration::from_millis(50));
+        assert_eq!(f, 1);
+        assert_eq!(t, t0 + Duration::from_millis(100));
+        assert!(!blocked);
+        // Stall panjang: tampilan frame antara dilompati (langsung ke
+        // frame yang jadwalnya mencakup sekarang), bukan diantrekan.
+        // Frame k mencakup [k*100, (k+1)*100) relatif terhadap deadline.
+        let (f, _, blocked) = catch_up(total, &delays, 0, &all, t0, t0 + Duration::from_millis(350));
+        assert_eq!(f, 4);
+        assert!(!blocked);
+        // Frame tujuan belum tersedia: berhenti di frame terakhir yang
+        // ada dan laporkan blocked (dekode tidak dilompati).
+        let sebagian = |i: usize| i <= 2;
+        let (f, _, blocked) = catch_up(total, &delays, 0, &sebagian, t0, t0 + Duration::from_millis(900));
+        assert_eq!(f, 2);
+        assert!(blocked);
+        // Melingkar: dari frame terakhir kembali ke 0.
+        let (f, _, blocked) = catch_up(total, &delays, 5, &all, t0, t0 + Duration::from_millis(50));
+        assert_eq!(f, 0);
+        assert!(!blocked);
+        // Belum waktunya: tidak bergerak.
+        let (f, _, blocked) = catch_up(total, &delays, 2, &all, t0 + Duration::from_millis(500), t0);
+        assert_eq!(f, 2);
+        assert!(!blocked);
+    }
+
+    #[test]
+    fn saat_edit_hanya_salin_yang_boleh_jalan() {
+        // Ctrl+C selama edit menyalin buffer kerja; pintasan lihat lain
+        // tetap dimatikan selama sesi edit.
+        assert!(action_allowed_while_editing(&Action::CopyImage));
+        assert!(!action_allowed_while_editing(&Action::Next));
+        assert!(!action_allowed_while_editing(&Action::Prev));
+        assert!(!action_allowed_while_editing(&Action::FrameNext));
+        assert!(!action_allowed_while_editing(&Action::ToggleSlideshow));
+        assert!(!action_allowed_while_editing(&Action::Trash));
+    }
+
+    #[test]
+    fn overhead_panel_edit_dihitung_dari_konstanta_layout() {
+        // Spacing aplikasi 8: 3 celah antaranak (gambar|separator|handle|
+        // panel) = 24, + separator 6 + handle 6 = 36.
+        assert_eq!(edit_side_overhead(8.0), 36.0);
+        assert_eq!(edit_side_overhead(0.0), EDIT_SEP_W + EDIT_HANDLE_W);
+    }
+
+    #[test]
+    fn lebar_area_gambar_edit_menempatkan_panel_di_dalam_jendela() {
+        // Kasus lapangan 0.8.17: jendela 1100 + panel 280 -> area gambar
+        // 784, dan 784 + 36 + 280 = 1100 persis (panel tidak meluber).
+        assert_eq!(edit_image_width(1100.0, 280.0, 8.0), 784.0);
+        for (avail, panel) in [(1100.0_f32, 280.0_f32), (1920.0, 280.0), (900.0, 200.0), (1280.0, 500.0)] {
+            let w = edit_image_width(avail, panel, 8.0);
+            assert_eq!(
+                w + edit_side_overhead(8.0) + panel,
+                avail,
+                "tepi kanan panel harus tepat di tepi area (jendela {avail})"
+            );
+        }
+        // Jendela sangat sempit: lantai 120 tetap berlaku.
+        assert_eq!(edit_image_width(300.0, 280.0, 8.0), 120.0);
     }
 
     #[test]
