@@ -1,6 +1,6 @@
 [package]
 name = "roneyview"
-version = "0.8.20"
+version = "0.8.24"
 edition = "2021"
 rust-version = "1.88"
 description = "Image viewer; not only for picture, you can see a folder with pictures, archive with pictures, and comic files like CBZ"
@@ -42,6 +42,14 @@ trash = { version = "5", default-features = false }
 libc = "0.2"
 # Baca metadata EXIF (kamera, tanggal, aperture, dll) — murni Rust.
 kamadak-exif = "0.6"
+# S3 (putaran statis): paksa backend inflate `zlib-rs` untuk flate2 yang
+# dipakai `png`/`zip` (unifikasi fitur cargo; prioritas backend flate2:
+# C-zlib > zlib-rs > miniz_oxide). Murni Rust, tanpa pustaka sistem.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# S4 (putaran statis): decode WebP statis lewat libwebp yang DIKOMPILE dari
+# sumber oleh crate ini (ter-vendor, tanpa pustaka sistem). Dependensi C
+# pertama di jalur decode gambar — tercatat untuk checklist audit.
+webp = "0.3"
 x11rb = { version = "0.13", default-features = false, features = ["randr"] }
 
 [profile.release]

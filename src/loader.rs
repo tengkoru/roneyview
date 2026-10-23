@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -150,7 +150,8 @@ pub enum Command {
     /// di ruang tier di atas snapshot kanvas `base` (kanvas SESUDAH frame
     /// `start_frame - 1` diterapkan disposalnya; `None` = kanvas kosong,
     /// hanya sah untuk `start_frame == 0`). Hasil dikirim sebagai
-    /// `Outcome::AnimChunk`/`AnimDone`/`AnimFailed` seperti stream awal.
+    /// `Outcome::AnimChunk`/`AnimDone`/`AnimFailed`/`AnimStopped`
+    /// seperti stream awal.
     AnimStream {
         session: u64,
         index: usize,
@@ -295,6 +296,13 @@ pub enum Outcome {
     /// supaya langsung tampil selagi frame sisanya mengalir. Disusul
     /// `AnimChunk`* lalu tepat satu `AnimDone`/`AnimFailed`.
     Preview(Decoded, AnimMeta),
+    /// Pratinjau JPEG statis dari thumbnail EXIF tertanam (S1 putaran
+    /// statis), dikirim pada jalur muatan utama SEBELUM decode penuhnya —
+    /// pola yang sama seperti `Preview` GIF: app memasangnya segera,
+    /// lalu tepat satu `Ready` (atau `Failed`) untuk indeks yang sama
+    /// menggantikannya. Isinya halaman statis biasa (`frames: None`)
+    /// beresolusi thumbnail, tetapi `orig`-nya dimensi gambar penuh.
+    StaticPreview(Decoded),
     /// Potongan frame komposit hasil streaming (frame `start` ..
     /// `start + frames.len()`), ditambahkan app ke halaman yang tampil.
     /// `checkpoints` berisi snapshot kanvas (resolusi tier) SESUDAH
@@ -309,6 +317,13 @@ pub enum Outcome {
     /// Stream GIF putus di tengah: frame sebelum `from_frame` tetap
     /// tampil, sisanya tidak termuat.
     AnimFailed { from_frame: usize, message: String },
+    /// Stream GIF berhenti lebih awal TANPA gagal: memberi jalan bagi
+    /// muatan utama halaman lain, atau tugasnya sudah basi karena
+    /// pengguna berpindah. Frame sebelum `upto` sudah dikirim; app
+    /// menandai stream berhenti (bukan gagal — `failed_from` tidak
+    /// disetel) dan boleh memintanya lagi kapan pun halaman ini
+    /// ditampilkan lagi.
+    AnimStopped { upto: usize },
     /// Ekspor frame selesai (atau berhenti lebih awal: `done < total`).
     AnimExported { done: usize, total: usize, dir: PathBuf },
     /// Satu frame animasi tersimpan sebagai PNG lewat worker.
@@ -676,6 +691,13 @@ impl Worker {
         if job.primary && self.stream_gif_initial(job, &bytes) {
             return Outcome::Skipped;
         }
+        // S1 putaran statis: JPEG statis pada muatan utama — kirim
+        // pratinjau thumbnail EXIF (bila ada) lebih dulu supaya piksel
+        // pertama tampil segera; decode penuhnya tetap berjalan sebagai
+        // `Ready` di jalur biasa tepat di bawah ini.
+        if job.primary {
+            self.try_static_preview(job, &bytes);
+        }
         match catch_unwind(AssertUnwindSafe(|| {
             decode_progressive(&bytes, job.max_side, job.max_pixels)
         })) {
@@ -1018,6 +1040,51 @@ fn color_image_to_rgba(img: &ColorImage) -> RgbaImage {
     RgbaImage::from_raw(w, h, raw).expect("jumlah piksel cocok dengan dimensi")
 }
 
+/// Keputusan alur sebuah stream GIF saat mencapai titik periksa
+/// antar-frame (stream diperiksa TIAP frame, bukan hanya per potongan,
+/// supaya jeda menyela tetap di kisaran satu frame).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StreamFlow {
+    /// Lanjutkan produksi frame.
+    Continue,
+    /// Berhenti baik-baik dan laporkan `AnimStopped`: halaman ini
+    /// sudah bukan fokus tampilan, atau muatan utama halaman LAIN
+    /// sedang mengantre. Stream halaman yang ditinggalkan tidak
+    /// boleh membuang CPU maupun menahan muatan utama.
+    Yield,
+    /// Berhenti diam-diam: app sendiri yang membatalkan (CancelAnim)
+    /// atau sesi berganti (Open). App sudah tahu — tak perlu laporan,
+    /// dan BUKAN `AnimStopped` (app bisa saja baru saja memasang
+    /// stream pengganti untuk halaman yang sama).
+    Cancel,
+}
+
+/// Keputusan murni alur stream dari keadaan sesudah kanal perintah
+/// dikuras. `queued_primary` = indeks muatan utama yang sedang
+/// mengantre di worker ini (kalau ada). Dipisah sebagai fungsi murni
+/// supaya bisa diuji unit tanpa worker sungguhan.
+fn stream_flow_decision(
+    abort: bool,
+    focus: usize,
+    queued_primary: Option<usize>,
+    stream_index: usize,
+) -> StreamFlow {
+    if abort {
+        StreamFlow::Cancel
+    } else if focus != stream_index || matches!(queued_primary, Some(i) if i != stream_index) {
+        StreamFlow::Yield
+    } else {
+        StreamFlow::Continue
+    }
+}
+
+/// Stream lanjutan yang masih mengantre untuk halaman yang sudah
+/// bukan fokus tampilan adalah pekerjaan basi: penggunanya sudah
+/// berpindah dan potongannya hanya akan dibuang app.
+fn stream_task_stale(task_index: usize, focus: usize) -> bool {
+    task_index != focus
+}
+
 impl Worker {
     /// Kirim satu pesan hasil dari tengah sebuah stream/tugas.
     fn send_loaded(&self, index: usize, outcome: Outcome) {
@@ -1031,24 +1098,47 @@ impl Worker {
         }
     }
 
-    /// Kuras perintah yang menunggu; kembalikan `true` bila stream yang
-    /// sedang berjalan untuk `index` harus berhenti sekarang (dibatalkan
-    /// app atau sesi berganti).
-    fn stream_aborted(&mut self, index: usize) -> bool {
+    /// Kuras perintah yang menunggu dan putuskan alur stream yang
+    /// sedang berjalan untuk `index` (lihat `stream_flow_decision`).
+    /// Pada keputusan selain `Continue`, kunci stream dibersihkan.
+    fn stream_flow(&mut self, index: usize) -> StreamFlow {
         self.drain_commands();
-        if self.abort_stream {
-            self.abort_stream = false;
+        let abort = std::mem::take(&mut self.abort_stream);
+        let queued_primary = self.queue.iter().find(|j| j.primary).map(|j| j.index);
+        let flow = stream_flow_decision(abort, self.focus, queued_primary, index);
+        if flow != StreamFlow::Continue {
             self.stream_key = None;
-            let _ = index;
-            return true;
         }
-        false
+        flow
     }
 
     /// Gerbang streaming untuk permintaan utama: `true` = berkas ini GIF
     /// animasi dan sudah tertangani penuh lewat pesan-pesan streaming
     /// (termasuk galatnya); `false` = bukan ranah streaming, jalur
     /// decode biasa yang melanjutkan.
+    /// Pratinjau statis S1: kirim `Outcome::StaticPreview` bila berkas ini
+    /// JPEG ber-thumbnail EXIF yang layak. Kegagalan di sini BUKAN galat
+    /// muatan — berkas cukup dilayani jalur decode biasa tanpa pratinjau,
+    /// jadi semua kegagalan ditelan diam-diam (termasuk panic dekoder
+    /// thumbnail, ditangkap seperti jalur lain).
+    fn try_static_preview(&mut self, job: &Job, bytes: &[u8]) {
+        let preview = match catch_unwind(AssertUnwindSafe(|| {
+            jpeg_exif_preview(bytes, job.max_side, job.max_pixels)
+        })) {
+            Ok(p) => p,
+            Err(_) => None,
+        };
+        if let Some(pixels) = preview {
+            self.send_loaded(
+                job.index,
+                Outcome::StaticPreview(Decoded {
+                    pixels,
+                    file_size: bytes.len() as u64,
+                }),
+            );
+        }
+    }
+
     fn stream_gif_initial(&mut self, job: &Job, bytes: &[u8]) -> bool {
         if image::guess_format(bytes).ok() != Some(ImageFormat::Gif) {
             return false;
@@ -1151,8 +1241,44 @@ impl Worker {
                                 checkpoints,
                             },
                         );
-                        if self.stream_aborted(job.index) {
-                            return true;
+                    }
+                    // Titik periksa TIAP frame: muatan utama halaman
+                    // yang baru dipilih pengguna tidak boleh menunggu
+                    // sisa stream ini (dulu: hanya diperiksa per
+                    // siraman potongan dan hanya untuk batal eksplisit,
+                    // jadi berkas kecil mengantre belasan detik di
+                    // belakang stream halaman yang sudah ditinggalkan).
+                    if !last {
+                        match self.stream_flow(job.index) {
+                            StreamFlow::Continue => {}
+                            StreamFlow::Cancel => return true,
+                            StreamFlow::Yield => {
+                                // Sisa potongan yang belum terkirim
+                                // tetap dikirim — frame-nya sudah
+                                // terdekode, app berhak menerimanya.
+                                if !chunk.is_empty() || !cps.is_empty() {
+                                    let start = if chunk.is_empty() {
+                                        i + 1
+                                    } else {
+                                        chunk_start
+                                    };
+                                    let frames = std::mem::take(&mut chunk);
+                                    let checkpoints = std::mem::take(&mut cps);
+                                    self.send_loaded(
+                                        job.index,
+                                        Outcome::AnimChunk {
+                                            start,
+                                            frames,
+                                            checkpoints,
+                                        },
+                                    );
+                                }
+                                self.send_loaded(
+                                    job.index,
+                                    Outcome::AnimStopped { upto: i + 1 },
+                                );
+                                return true;
+                            }
                         }
                     }
                 }
@@ -1274,7 +1400,8 @@ impl Worker {
                     if i % cadence == 0 {
                         cps.push((i, Arc::new(player.canvas_tier(max_side_c, max_pixels))));
                     }
-                    if chunk.len() >= 4 || i + 1 == total {
+                    let last = i + 1 == total;
+                    if chunk.len() >= 4 || last {
                         let frames = std::mem::take(&mut chunk);
                         let checkpoints = std::mem::take(&mut cps);
                         self.send_loaded(
@@ -1285,8 +1412,38 @@ impl Worker {
                                 checkpoints,
                             },
                         );
-                        if self.stream_aborted(index) {
-                            return;
+                    }
+                    // Titik periksa TIAP frame, sama seperti stream
+                    // awal: stream lanjutan tidak boleh menahan
+                    // muatan utama halaman lain.
+                    if !last {
+                        match self.stream_flow(index) {
+                            StreamFlow::Continue => {}
+                            StreamFlow::Cancel => return,
+                            StreamFlow::Yield => {
+                                if !chunk.is_empty() || !cps.is_empty() {
+                                    let start = if chunk.is_empty() {
+                                        i + 1
+                                    } else {
+                                        chunk_start
+                                    };
+                                    let frames = std::mem::take(&mut chunk);
+                                    let checkpoints = std::mem::take(&mut cps);
+                                    self.send_loaded(
+                                        index,
+                                        Outcome::AnimChunk {
+                                            start,
+                                            frames,
+                                            checkpoints,
+                                        },
+                                    );
+                                }
+                                self.send_loaded(
+                                    index,
+                                    Outcome::AnimStopped { upto: i + 1 },
+                                );
+                                return;
+                            }
                         }
                     }
                 }
@@ -1327,6 +1484,20 @@ impl Worker {
                 max_side,
                 max_pixels,
             } => {
+                // Jangan mulai stream yang sudah basi: muatan utama
+                // sedang mengantre (dia yang lebih dulu — walau loop
+                // utama biasanya mendahulukannya, perintah bisa tiba
+                // persis saat tugas ini terambil), atau halamannya
+                // sudah bukan fokus tampilan (pengguna berpindah;
+                // potongannya hanya akan dibuang app). Laporkan
+                // AnimStopped supaya app tidak menunggu stream ini
+                // selamanya.
+                self.drain_commands();
+                let queued_primary = self.queue.iter().any(|j| j.primary);
+                if queued_primary || stream_task_stale(index, self.focus) {
+                    self.send_loaded(index, Outcome::AnimStopped { upto: start_frame });
+                    return;
+                }
                 let bytes = match self.read_listing_bytes(index) {
                     Ok(b) => b,
                     Err(e) => {
@@ -1599,6 +1770,17 @@ fn decode_progressive_inner(
     if let Some(p) = decode_animated(bytes, max_side_c, max_pixels)? {
         return Ok(p);
     }
+    // S4 putaran statis: WebP statis lewat libwebp ter-vendor (terukur
+    // riset ±2x lebih cepat daripada image-webp murni Rust). WebP animasi
+    // tidak pernah sampai sini — sudah ditangani `decode_animated`, dan
+    // `decode_webp_libwebp` sendiri menolak berkas animasi. Kegagalan apa
+    // pun di jalur ini jatuh ke jalur lama di bawah tanpa mengubah hasil
+    // maupun pesan galatnya.
+    if image::guess_format(bytes).ok() == Some(ImageFormat::WebP) {
+        if let Some(p) = decode_webp_libwebp(bytes, max_side_c, max_pixels) {
+            return Ok(p);
+        }
+    }
     // Jalur statis (JPEG/PNG/...): satu decode penuh.
     let raw = load_raw(bytes)?;
     finish_raw(raw, max_side_c, max_pixels)
@@ -1693,6 +1875,157 @@ fn oriented_dims(w: u32, h: u32, o: Orientation) -> (u32, u32) {
     } else {
         (w, h)
     }
+}
+
+/// Lantai sisi thumbnail EXIF supaya layak tampil sebagai pratinjau (S1):
+/// di bawah ini thumbnail dianggap dekoratif (mis. 16x9 bawaan sebagian
+/// editor) dan jalur biasa yang dipakai.
+const EXIF_THUMB_MIN_SIDE: u32 = 32;
+
+/// S1 putaran statis: bangun pratinjau JPEG statis dari thumbnail EXIF
+/// tertanamnya. Mengembalikan `Pixels` beresolusi thumbnail (di-upscale GPU
+/// saat tampil) dengan `orig` = dimensi GAMBAR PENUH terorientasi, supaya
+/// geometri tampilan, status, dan zoom jujur sejak piksel pertama dan
+/// penggantiannya oleh `Ready` tidak menggeser apa pun.
+///
+/// `None` (jatuh ke jalur biasa, tanpa penalti berarti) bila: bukan JPEG,
+/// tidak ada thumbnail tertanam, thumbnail rusak/bukan JPEG, thumbnail di
+/// bawah lantai ukuran, atau thumbnail tidak lebih kecil dari gambarnya.
+/// Penjaga bom dimensi/alokasi sama seperti jalur penuh (`check_canvas`/
+/// `check_bytes` dari header dekoder yang sama).
+fn jpeg_exif_preview(bytes: &[u8], max_side: usize, max_pixels: usize) -> Option<Pixels> {
+    if image::guess_format(bytes).ok() != Some(ImageFormat::Jpeg) {
+        return None;
+    }
+    let max_side_c = max_side.clamp(1024, 16384) as u32;
+    // Dimensi + orientasi dari header dekoder yang sama seperti jalur
+    // penuh (`load_raw`), tanpa mendekode piksel gambar utama.
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits());
+    let mut decoder = reader.into_decoder().ok()?;
+    let (dw, dh) = decoder.dimensions();
+    check_canvas(dw, dh).ok()?;
+    check_bytes(decoder.total_bytes()).ok()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    drop(decoder);
+
+    let thumb_bytes = extract_exif_thumbnail(bytes)?;
+    let thumb = image::load_from_memory_with_format(thumb_bytes, ImageFormat::Jpeg).ok()?;
+    let (tw, th) = (thumb.width(), thumb.height());
+    if tw < EXIF_THUMB_MIN_SIDE || th < EXIF_THUMB_MIN_SIDE {
+        return None;
+    }
+    if u64::from(tw) * u64::from(th) >= u64::from(dw) * u64::from(dh) {
+        return None; // "thumbnail" sebesar gambarnya: bukan pratinjau
+    }
+    // Orientasi EXIF yang sama seperti gambar penuh diterapkan ke
+    // thumbnail (piksel thumbnail tersimpan searah piksel utama), lewat
+    // jalur penyelesaian yang sama persis (`finish_raw`).
+    let mut px = finish_raw(
+        RawImage {
+            img: thumb,
+            orientation,
+        },
+        max_side_c,
+        max_pixels,
+    )
+    .ok()?;
+    // `finish_raw` mencatat orig dari gambar yang diberikan (thumbnail);
+    // yang benar adalah dimensi gambar penuh terorientasi.
+    let (ow, oh) = oriented_dims(dw, dh, orientation);
+    px.orig = [ow, oh];
+    px.format = format_name(bytes);
+    Some(px)
+}
+
+/// Potong byte thumbnail EXIF (JPEG tertanam di IFD1) dari berkas JPEG.
+/// Offset tag kamadak-exif (0x0201/0x0202) relatif ke awal header TIFF,
+/// yang dimulai tepat sesudah penanda `Exif\0\0` di segmen APP1.
+fn extract_exif_thumbnail(bytes: &[u8]) -> Option<&[u8]> {
+    let tiff0 = find_exif_tiff_start(bytes)?;
+    let exif = exif::Reader::new()
+        .read_from_container(&mut Cursor::new(bytes))
+        .ok()?;
+    let off = exif
+        .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
+        .value
+        .get_uint(0)? as usize;
+    let len = exif
+        .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)?
+        .value
+        .get_uint(0)? as usize;
+    if len == 0 {
+        return None;
+    }
+    let start = tiff0.checked_add(off)?;
+    bytes.get(start..start.checked_add(len)?)
+}
+
+/// Posisi awal header TIFF di dalam berkas JPEG: pindai segmen dari SOI
+/// sampai SOS/EOI, cari APP1 yang muatannya diawali `Exif\0\0`.
+fn find_exif_tiff_start(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut pos = 2usize;
+    while pos + 4 <= bytes.len() {
+        if bytes[pos] != 0xFF {
+            return None;
+        }
+        let marker = bytes[pos + 1];
+        if marker == 0xDA || marker == 0xD9 {
+            return None; // SOS / EOI: segmen metadata sudah lewat
+        }
+        let seg_len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if seg_len < 2 {
+            return None;
+        }
+        if marker == 0xE1 {
+            let payload = bytes.get(pos + 4..pos + 2 + seg_len)?;
+            if payload.starts_with(b"Exif\0\0") {
+                return Some(pos + 4 + 6);
+            }
+        }
+        pos = pos.checked_add(2 + seg_len)?;
+    }
+    None
+}
+
+/// S4 putaran statis: dekode WebP statis lewat libwebp (crate `webp`,
+/// pustaka C ter-vendor yang dikompilasi crate itu sendiri — dependensi C
+/// pertama di jalur decode gambar, tercatat untuk checklist audit).
+///
+/// `None` (pemanggil jatuh ke jalur image-webp lama) bila: header tidak
+/// terbaca, berkasnya ANIMASI (semantik animasi tetap milik jalur lama;
+/// `webp::Decoder::decode` juga menolak animasi), dimensi melanggar
+/// penjaga yang sama seperti `load_raw`, atau libwebp gagal mendekode.
+/// Orientasi diambil dari metadata dekoder `image` yang sama seperti
+/// jalur lama supaya semantik EXIF tidak berubah; hanya pikselnya yang
+/// berasal dari libwebp, lalu diselesaikan lewat `finish_raw` yang sama.
+fn decode_webp_libwebp(bytes: &[u8], max_side: u32, max_pixels: usize) -> Option<Pixels> {
+    let features = webp::BitstreamFeatures::new(bytes)?;
+    if features.has_animation() {
+        return None;
+    }
+    let (w, h) = (features.width(), features.height());
+    check_canvas(w, h).ok()?;
+    check_bytes(u64::from(w) * u64::from(h) * 4).ok()?;
+    let orientation = {
+        let mut reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        reader.limits(limits());
+        let mut decoder = reader.into_decoder().ok()?;
+        decoder.orientation().unwrap_or(Orientation::NoTransforms)
+    };
+    let decoded = webp::Decoder::new(bytes).decode()?;
+    let img = decoded.to_image();
+    if (img.width(), img.height()) != (w, h) {
+        return None;
+    }
+    finish_raw(RawImage { img, orientation }, max_side, max_pixels).ok()
 }
 
 /// Dekode penuh (dengan batas memori). Orientasi EXIF TIDAK diterapkan di sini:
@@ -1791,7 +2124,111 @@ enum ResizeBackend {
 static RESIZE_BACKEND: OnceLock<ResizeBackend> = OnceLock::new();
 
 fn resize_backend() -> ResizeBackend {
-    *RESIZE_BACKEND.get_or_init(calibrate_resize_backend)
+    *RESIZE_BACKEND.get_or_init(init_resize_backend)
+}
+
+/// S2 putaran statis: hasil kalibrasi adalah SIFAT MESIN (fitur CPU), bukan
+/// sifat sesi — simpan di direktori konfigurasi dan pakai ulang pada
+/// peluncuran berikutnya, supaya pajak kalibrasi (terukur riset 38–121 ms
+/// per proses) tidak lagi dibayar di depan gambar pertama. Kalibrasi ulang
+/// hanya bila simpanan tidak ada, rusak, atau sidik jarinya tidak cocok.
+fn init_resize_backend() -> ResizeBackend {
+    let path = crate::settings::config_path(RESIZE_CACHE_FILE);
+    let fingerprint = resize_fingerprint();
+    if let Some(p) = &path {
+        if let Some(b) = load_cached_backend(p, &fingerprint) {
+            return b;
+        }
+    }
+    let backend = calibrate_resize_backend();
+    if let Some(p) = &path {
+        save_cached_backend(p, backend, &fingerprint);
+    }
+    backend
+}
+
+/// Nama berkas simpanan kalibrasi di direktori konfigurasi aplikasi.
+const RESIZE_CACHE_FILE: &str = "resize-backend.txt";
+
+/// Sidik jari lingkungan kalibrasi: arsitektur, OS, fitur CPU yang
+/// menentukan jalur SIMD, jumlah CPU, dan versi aplikasi (kode
+/// kalibrasinya sendiri). Beda satu saja -> simpanan tidak dipercaya.
+fn resize_fingerprint() -> String {
+    let cpu = cpu_feature_summary();
+    let cpus = std::thread::available_parallelism().map_or(0, |n| n.get());
+    format!(
+        "v1|{}|{}|{}|cpus={}|app={}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        cpu,
+        cpus,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn cpu_feature_summary() -> String {
+    format!(
+        "avx2={} sse41={} ssse3={}",
+        std::arch::is_x86_feature_detected!("avx2"),
+        std::arch::is_x86_feature_detected!("sse4.1"),
+        std::arch::is_x86_feature_detected!("ssse3")
+    )
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn cpu_feature_summary() -> String {
+    "cpu=?".to_string()
+}
+
+fn backend_token(b: ResizeBackend) -> &'static str {
+    match b {
+        ResizeBackend::FastImageResize => "fir",
+        ResizeBackend::ImageCrate => "image",
+    }
+}
+
+fn backend_from_token(s: &str) -> Option<ResizeBackend> {
+    match s {
+        "fir" => Some(ResizeBackend::FastImageResize),
+        "image" => Some(ResizeBackend::ImageCrate),
+        _ => None,
+    }
+}
+
+/// Baca simpanan kalibrasi. Format tiga baris: penanda, token backend,
+/// sidik jari. Isi apa pun yang menyimpang dianggap rusak -> `None`
+/// (pemanggil mengkalibrasi ulang), tidak pernah panik.
+fn load_cached_backend(path: &Path, fingerprint: &str) -> Option<ResizeBackend> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut lines = raw.lines();
+    if lines.next()? != "roneyview-resize-backend" {
+        return None;
+    }
+    let backend = backend_from_token(lines.next()?)?;
+    if lines.next()? != fingerprint {
+        return None;
+    }
+    Some(backend)
+}
+
+/// Tulis simpanan kalibrasi (best-effort: kegagalan tulis tidak boleh
+/// mengganggu aplikasi; tulis ke berkas sementara lalu rename supaya
+/// simpanan tidak pernah terpotong di tengah).
+fn save_cached_backend(path: &Path, backend: ResizeBackend, fingerprint: &str) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(parent);
+    let body = format!(
+        "roneyview-resize-backend\n{}\n{}\n",
+        backend_token(backend),
+        fingerprint
+    );
+    let tmp = path.with_extension("txt.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 fn calibrate_resize_backend() -> ResizeBackend {
@@ -2228,6 +2665,96 @@ mod tests {
             .write_to(&mut out, ImageFormat::Jpeg)
             .unwrap();
         out.into_inner()
+    }
+
+    fn jpeg_bytes_warna(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+        let img = RgbImage::from_pixel(w, h, Rgb(rgb));
+        let mut out = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, ImageFormat::Jpeg)
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// Bangun byte JPEG ber-EXIF buatan tangan persis seperti foto kamera:
+    /// segmen APP1 berisi TIFF (little-endian) dengan IFD0 (Orientation)
+    /// dan IFD1 (thumbnail JPEG tertanam, tag 0x0201/0x0202). `thumb`
+    /// adalah byte yang ditanam apa adanya (bisa sampah, untuk uji jatuh
+    /// ke jalur biasa).
+    fn jpeg_berthumbnail(
+        w: u32,
+        h: u32,
+        orientation: u16,
+        thumb: Option<(u32, u32, [u8; 3])>,
+        thumb_override: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let thumb_data: Vec<u8> = match (&thumb, &thumb_override) {
+            (_, Some(o)) => o.clone(),
+            (Some((tw, th, c)), None) => jpeg_bytes_warna(*tw, *th, *c),
+            (None, None) => Vec::new(),
+        };
+        // Tata letak TIFF (offset relatif ke awal header TIFF):
+        //   0  header (8)
+        //   8  IFD0: 1 entri (18)             -> 26
+        //  26  IFD1: 6 entri (78)             -> 104
+        // 104  dua rasional resolusi IFD1 (16) -> 120
+        // 120  byte thumbnail
+        let ifd0_off: u32 = 8;
+        let ifd1_off: u32 = ifd0_off + 2 + 12 + 4;
+        let res_off: u32 = ifd1_off + 2 + 6 * 12 + 4;
+        let thumb_off: u32 = res_off + 16;
+        let mut t = Vec::new();
+        let mut entri = |t: &mut Vec<u8>, tag: u16, typ: u16, count: u32, val: [u8; 4]| {
+            t.extend_from_slice(&tag.to_le_bytes());
+            t.extend_from_slice(&typ.to_le_bytes());
+            t.extend_from_slice(&count.to_le_bytes());
+            t.extend_from_slice(&val);
+        };
+        let pendek = |v: u16| {
+            let mut b = [0u8; 4];
+            b[..2].copy_from_slice(&v.to_le_bytes());
+            b
+        };
+        t.extend_from_slice(b"II");
+        t.extend_from_slice(&42u16.to_le_bytes());
+        t.extend_from_slice(&ifd0_off.to_le_bytes());
+        // IFD0: Orientation saja.
+        t.extend_from_slice(&1u16.to_le_bytes());
+        entri(&mut t, 0x0112, 3, 1, pendek(orientation));
+        t.extend_from_slice(&ifd1_off.to_le_bytes());
+        // IFD1: kompresi JPEG + resolusi + penunjuk thumbnail.
+        t.extend_from_slice(&6u16.to_le_bytes());
+        entri(&mut t, 0x0103, 3, 1, pendek(6));
+        entri(&mut t, 0x011A, 5, 1, res_off.to_le_bytes());
+        entri(&mut t, 0x011B, 5, 1, (res_off + 8).to_le_bytes());
+        entri(&mut t, 0x0128, 3, 1, pendek(2));
+        if thumb.is_some() || thumb_override.is_some() {
+            entri(&mut t, 0x0201, 4, 1, thumb_off.to_le_bytes());
+            entri(&mut t, 0x0202, 4, 1, (thumb_data.len() as u32).to_le_bytes());
+        } else {
+            // Tanpa thumbnail: dua entri pengisi tak berarti.
+            entri(&mut t, 0x0201, 4, 1, 0u32.to_le_bytes());
+            entri(&mut t, 0x0202, 4, 1, 0u32.to_le_bytes());
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        // Rasional resolusi (72/1) untuk X dan Y.
+        t.extend_from_slice(&72u32.to_le_bytes());
+        t.extend_from_slice(&1u32.to_le_bytes());
+        t.extend_from_slice(&72u32.to_le_bytes());
+        t.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(t.len() as u32, thumb_off);
+        t.extend_from_slice(&thumb_data);
+
+        let main = jpeg_bytes(w, h);
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&t);
+        let mut out = Vec::new();
+        out.extend_from_slice(&main[..2]); // SOI
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&main[2..]);
+        out
     }
 
     #[test]
@@ -3226,13 +3753,465 @@ mod tests {
         assert!(gagal, "stream harus gagal jujur di frame 1: {:?}", msgs.iter().map(|m| outcome_name(&m.outcome)).collect::<Vec<_>>());
     }
 
+    #[test]
+    fn keputusan_alur_stream_memprioritaskan_muatan_utama() {
+        // Batal eksplisit (CancelAnim/Open) selalu menang, diam-diam.
+        assert_eq!(stream_flow_decision(true, 0, None, 0), StreamFlow::Cancel);
+        assert_eq!(stream_flow_decision(true, 3, Some(3), 0), StreamFlow::Cancel);
+        // Fokus sudah berpindah ke halaman lain -> stream mengalah.
+        assert_eq!(stream_flow_decision(false, 4, None, 0), StreamFlow::Yield);
+        // Muatan utama halaman LAIN mengantre -> mengalah juga, walau
+        // fokus tercatat belum sempat berpindah.
+        assert_eq!(stream_flow_decision(false, 0, Some(2), 0), StreamFlow::Yield);
+        // Muatan utama untuk halaman stream itu sendiri -> lanjut
+        // (stream memang sedang melayaninya).
+        assert_eq!(stream_flow_decision(false, 0, Some(0), 0), StreamFlow::Continue);
+        // Tenang: fokus di halaman stream, tidak ada antrean -> lanjut.
+        assert_eq!(stream_flow_decision(false, 0, None, 0), StreamFlow::Continue);
+        // Kebasian tugas stream mengikuti fokus.
+        assert!(stream_task_stale(0, 3));
+        assert!(!stream_task_stale(3, 3));
+    }
+
+    /// Siapkan worker sungguhan di atas folder dua berkas: GIF animasi
+    /// (indeks 0) + JPG kecil (indeks 1). Mengembalikan folder dan
+    /// ujung-ujung kanalnya (worker prefetch ditutup sesudah `Open`).
+    fn siapkan_worker_dua_berkas(
+        nama: &str,
+        gif: &[u8],
+    ) -> (std::path::PathBuf, Sender<Command>, Receiver<Loaded>) {
+        use crate::source::Listing;
+        let dir = std::env::temp_dir().join(format!("rv-stream-test-{nama}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a-anim.gif"), gif).unwrap();
+        std::fs::write(dir.join("b-foto.jpg"), jpeg_bytes(64, 48)).unwrap();
+        let (listing, _) = Listing::open(&dir, true).unwrap();
+        let listing = std::sync::Arc::new(listing);
+        assert_eq!(listing.names.len(), 2, "{:?}", listing.names);
+        assert!(listing.names[0].ends_with(".gif"), "{:?}", listing.names);
+        let ctx = eframe::egui::Context::default();
+        let (main_tx, pref_tx, out_rx) = spawn(ctx).unwrap();
+        for tx in [&main_tx, &pref_tx] {
+            tx.send(Command::Open {
+                session: 7,
+                listing: listing.clone(),
+            })
+            .unwrap();
+        }
+        (dir, main_tx, out_rx)
+    }
+
+    #[test]
+    fn pekerja_stream_mengalah_pada_muatan_utama_baru() {
+        // Regresi temuan lapangan 0.8.20: berkas kecil menunggu belasan
+        // detik karena stream GIF halaman yang ditinggalkan tidak
+        // pernah menyela. Sekarang: begitu muatan utama baru tiba di
+        // tengah stream, stream berhenti dengan AnimStopped SEBELUM
+        // muatan itu dilayani — bukan menunggu AnimDone.
+        let frames: Vec<([u8; 4], u32)> = (0..60u16)
+            .map(|k| ([(k * 4) as u8, (200 - k * 3) as u8, 90, 255], 50))
+            .collect();
+        let data = gif_bytes(&frames, 320, 240);
+        let (dir, main_tx, out_rx) = siapkan_worker_dua_berkas("mengalah", &data);
+        main_tx
+            .send(Command::Load {
+                session: 7,
+                index: 0,
+                primary: true,
+                max_side: 16384,
+                max_pixels: 2_000_000,
+                focus: 0,
+                budget: 256 << 20,
+                held: 0,
+            })
+            .unwrap();
+        // Tunggu Preview: bukti stream indeks 0 sudah berjalan.
+        loop {
+            let m = out_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("worker harus menjawab");
+            if m.index == 0 && matches!(m.outcome, Outcome::Preview(..)) {
+                break;
+            }
+        }
+        // Pengguna berpindah ke JPG kecil: muatan utama baru.
+        main_tx
+            .send(Command::Load {
+                session: 7,
+                index: 1,
+                primary: true,
+                max_side: 16384,
+                max_pixels: 2_000_000,
+                focus: 1,
+                budget: 256 << 20,
+                held: 0,
+            })
+            .unwrap();
+        // Kumpulkan sampai Ready indeks 1 tiba; catat urutannya.
+        let mut urutan: Vec<(usize, &'static str)> = Vec::new();
+        loop {
+            let m = out_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("worker harus menjawab");
+            let nama = outcome_name(&m.outcome);
+            let selesai = m.index == 1 && nama == "Ready";
+            urutan.push((m.index, nama));
+            if selesai {
+                break;
+            }
+        }
+        let pos_stop = urutan
+            .iter()
+            .position(|&(i, n)| i == 0 && n == "AnimStopped")
+            .expect("stream harus berhenti dengan AnimStopped");
+        assert!(
+            pos_stop < urutan.len() - 1,
+            "AnimStopped harus mendahului Ready: {urutan:?}"
+        );
+        assert!(
+            !urutan.iter().any(|&(i, n)| i == 0 && n == "AnimDone"),
+            "stream yang mengalah tidak boleh tamat (AnimDone): {urutan:?}"
+        );
+        // Sesudah mengalah, stream benar-benar mati: tidak ada lagi
+        // potongan/penutup untuk indeks 0.
+        let mut susulan = Vec::new();
+        while let Ok(m) = out_rx.recv_timeout(Duration::from_millis(700)) {
+            if m.index == 0 {
+                susulan.push(outcome_name(&m.outcome));
+            }
+        }
+        assert!(susulan.is_empty(), "masih ada pesan stream susulan: {susulan:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pekerja_melempar_tugas_stream_yang_sudah_basi() {
+        // Tugas AnimStream yang mengantre untuk halaman yang sudah
+        // bukan fokus (pengguna berpindah sebelum tugasnya mulai)
+        // harus dilempar sebagai AnimStopped tanpa satu potongan pun,
+        // supaya CPU tidak dibuang untuk halaman yang ditinggalkan.
+        let data = gif_bytes(
+            &[
+                ([255, 0, 0, 255], 50),
+                ([0, 255, 0, 255], 50),
+                ([0, 0, 255, 255], 50),
+            ],
+            24,
+            16,
+        );
+        let (dir, main_tx, out_rx) = siapkan_worker_dua_berkas("basi", &data);
+        // Fokus worker pindah ke indeks 1 lewat muatan utama JPG-nya.
+        main_tx
+            .send(Command::Load {
+                session: 7,
+                index: 1,
+                primary: true,
+                max_side: 16384,
+                max_pixels: 2_000_000,
+                focus: 1,
+                budget: 256 << 20,
+                held: 0,
+            })
+            .unwrap();
+        loop {
+            let m = out_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("worker harus menjawab");
+            if m.index == 1 && matches!(m.outcome, Outcome::Ready(_)) {
+                break;
+            }
+        }
+        main_tx
+            .send(Command::AnimStream {
+                session: 7,
+                index: 0,
+                start_frame: 2,
+                base: None,
+                max_side: 16384,
+                max_pixels: 2_000_000,
+            })
+            .unwrap();
+        let m = out_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("worker harus menjawab");
+        assert_eq!(m.index, 0);
+        assert!(
+            matches!(m.outcome, Outcome::AnimStopped { upto: 2 }),
+            "tugas basi harus jadi AnimStopped{{upto: 2}}, bukan {}",
+            outcome_name(&m.outcome)
+        );
+        // Dan tidak ada potongan apa pun menyusul.
+        assert!(
+            out_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "tidak boleh ada pesan susulan untuk tugas basi"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------ S1 (EXIF)
+
+    #[test]
+    fn pratinjau_exif_dari_thumbnail_tertanem() {
+        // Foto 400x300 dengan thumbnail tertanam 160x120 berwarna lain.
+        let data = jpeg_berthumbnail(400, 300, 1, Some((160, 120, [20, 90, 160])), None);
+        let p = jpeg_exif_preview(&data, 16384, 2_000_000).expect("harus ada pratinjau");
+        assert_eq!(p.orig, [400, 300], "orig = dimensi gambar PENUH");
+        assert_eq!(p.image.size, [160, 120], "piksel = resolusi thumbnail");
+        assert!(p.frames.is_none(), "pratinjau adalah halaman statis");
+        assert_eq!(p.format, "JPEG");
+        // Warna thumbnail (biru-ish), bukan warna gambar utama (merah-ish):
+        // toleransi lebar karena JPEG lossy + konversi warna.
+        let [r, g, b, _] = p.image.pixels[0].to_array();
+        assert!(b > r + 40, "piksel harus dari thumbnail: ({r},{g},{b})");
+    }
+
+    #[test]
+    fn pratinjau_exif_menghormati_orientasi_penuh() {
+        // Orientation 6 = putar 90 searah jarum jam saat tampil: dimensi
+        // tampil (gambar penuh MAUPUN thumbnailnya) bertukar sumbu.
+        let data = jpeg_berthumbnail(400, 300, 6, Some((160, 120, [20, 90, 160])), None);
+        let p = jpeg_exif_preview(&data, 16384, 2_000_000).expect("harus ada pratinjau");
+        assert_eq!(p.orig, [300, 400], "orig terorientasi = tertukar");
+        assert_eq!(p.image.size, [120, 160], "thumbnail ikut terorientasi");
+    }
+
+    #[test]
+    fn pratinjau_exif_tidak_ada_bila_tak_berthumbnail() {
+        // JPEG polos keluaran encoder (tanpa EXIF sama sekali).
+        assert!(jpeg_exif_preview(&jpeg_bytes(400, 300), 16384, 2_000_000).is_none());
+        // EXIF ada (orientasi) tetapi IFD1 tanpa thumbnail.
+        let data = jpeg_berthumbnail(400, 300, 1, None, Some(Vec::new()));
+        assert!(jpeg_exif_preview(&data, 16384, 2_000_000).is_none());
+        // Bukan JPEG.
+        assert!(jpeg_exif_preview(&png_bytes(40, 30), 16384, 2_000_000).is_none());
+    }
+
+    #[test]
+    fn pratinjau_exif_thumbnail_rusak_atau_kecil_dilewati() {
+        // Byte thumbnail bukan JPEG -> jatuh ke jalur biasa dengan aman.
+        let data = jpeg_berthumbnail(
+            400,
+            300,
+            1,
+            Some((160, 120, [0, 0, 0])),
+            Some(b"\x00\x11\x22bukan-jpeg".repeat(30)),
+        );
+        assert!(jpeg_exif_preview(&data, 16384, 2_000_000).is_none());
+        // Thumbnail di bawah lantai 32px -> dianggap dekoratif, dilewati.
+        let data = jpeg_berthumbnail(400, 300, 1, Some((16, 9, [20, 90, 160])), None);
+        assert!(jpeg_exif_preview(&data, 16384, 2_000_000).is_none());
+    }
+
+    #[test]
+    fn pekerja_mengirim_pratinjau_statis_sebelum_ready() {
+        // Ujung-ke-ujung di worker: muatan utama JPEG ber-thumbnail harus
+        // menghasilkan StaticPreview DULU, baru Ready — dan Ready membawa
+        // resolusi penuh bertier, pratinjau membawa resolusi thumbnail;
+        // orig keduanya dimensi gambar penuh.
+        let data = jpeg_berthumbnail(400, 300, 1, Some((160, 120, [20, 90, 160])), None);
+        let msgs = kumpulkan_pesan_worker_berkas(&data, "pratinjau", "jpg");
+        assert_eq!(msgs.len(), 2, "tepat dua pesan: {:?}", msgs.iter().map(|m| outcome_name(&m.outcome)).collect::<Vec<_>>());
+        let Outcome::StaticPreview(prev) = &msgs[0].outcome else {
+            panic!("pesan pertama harus StaticPreview, dapat {}", outcome_name(&msgs[0].outcome));
+        };
+        assert_eq!(prev.pixels.image.size, [160, 120]);
+        assert_eq!(prev.pixels.orig, [400, 300]);
+        let Outcome::Ready(full) = &msgs[1].outcome else {
+            panic!("pesan kedua harus Ready, dapat {}", outcome_name(&msgs[1].outcome));
+        };
+        assert_eq!(full.pixels.image.size, [400, 300]);
+        assert_eq!(full.pixels.orig, [400, 300]);
+    }
+
+    #[test]
+    fn pekerja_tanpa_thumbnail_tidak_mengirim_pratinjau() {
+        let msgs = kumpulkan_pesan_worker_berkas(&jpeg_bytes(120, 90), "polos", "jpg");
+        assert_eq!(msgs.len(), 1, "hanya Ready: {:?}", msgs.iter().map(|m| outcome_name(&m.outcome)).collect::<Vec<_>>());
+        assert!(matches!(msgs[0].outcome, Outcome::Ready(_)));
+    }
+
+    /// Varian `kumpulkan_pesan_worker` untuk satu berkas bernama bebas:
+    /// tulis `data` sebagai `{nama}.{ext}`, muat sebagai utama, kumpulkan
+    /// semua pesan sampai Ready/Failed tiba.
+    fn kumpulkan_pesan_worker_berkas(data: &[u8], nama: &str, ext: &str) -> Vec<Loaded> {
+        use crate::source::Listing;
+        let dir = std::env::temp_dir().join(format!("rv-statis-test-{nama}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{nama}.{ext}")), data).unwrap();
+        let (listing, _) = Listing::open(&dir, true).unwrap();
+        let ctx = eframe::egui::Context::default();
+        let (main_tx, pref_tx, out_rx) = spawn(ctx).unwrap();
+        let listing = std::sync::Arc::new(listing);
+        main_tx
+            .send(Command::Open { session: 7, listing: listing.clone() })
+            .unwrap();
+        pref_tx.send(Command::Open { session: 7, listing }).unwrap();
+        main_tx
+            .send(Command::Load {
+                session: 7,
+                index: 0,
+                primary: true,
+                max_side: 16384,
+                max_pixels: 2_000_000,
+                focus: 0,
+                budget: 256 << 20,
+                held: 0,
+            })
+            .unwrap();
+        let mut msgs = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let m = out_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("worker harus menjawab");
+            let selesai = matches!(m.outcome, Outcome::Ready(_) | Outcome::Failed(_));
+            msgs.push(m);
+            if selesai || std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        msgs
+    }
+
+    // ------------------------------------------------------------ S2 (kalibrasi)
+
+    #[test]
+    fn simpanan_kalibrasi_bolak_balik_dan_validasinya() {
+        let dir = std::env::temp_dir().join(format!("rv-kalibrasi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resize-backend.txt");
+        // Belum ada simpanan sama sekali.
+        assert!(load_cached_backend(&path, "sidik-a").is_none());
+        save_cached_backend(&path, ResizeBackend::FastImageResize, "sidik-a");
+        assert_eq!(
+            load_cached_backend(&path, "sidik-a"),
+            Some(ResizeBackend::FastImageResize)
+        );
+        // Sidik jari berbeda (mesin/CPU berubah) -> simpanan tidak dipercaya.
+        assert!(load_cached_backend(&path, "sidik-b").is_none());
+        // Token backend lain tersimpan dan terbaca kembali.
+        save_cached_backend(&path, ResizeBackend::ImageCrate, "sidik-a");
+        assert_eq!(
+            load_cached_backend(&path, "sidik-a"),
+            Some(ResizeBackend::ImageCrate)
+        );
+        // Isi rusak/tak dikenal -> None tanpa panik (kalibrasi ulang).
+        std::fs::write(&path, "sampah\n").unwrap();
+        assert!(load_cached_backend(&path, "sidik-a").is_none());
+        std::fs::write(&path, "roneyview-resize-backend\nasing\nsidik-a\n").unwrap();
+        assert!(load_cached_backend(&path, "sidik-a").is_none());
+        std::fs::write(&path, "").unwrap();
+        assert!(load_cached_backend(&path, "sidik-a").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidik_jari_kalibrasi_stabil_dalam_satu_proses() {
+        let a = resize_fingerprint();
+        assert_eq!(a, resize_fingerprint());
+        assert!(a.starts_with("v1|"), "{a}");
+        assert!(a.contains("app="), "{a}");
+    }
+
+    // ------------------------------------------------------------ S3 (PNG)
+
+    #[test]
+    fn dekode_png_pola_tepat_lewat_backend_inflate_aktif() {
+        // PNG dari pola deterministik: dekode jalur produksi harus
+        // mengembalikan piksel PERSIS pola — membuktikan jalur inflate
+        // flate2 (backend zlib-rs sejak putaran ini) utuh ujung-ke-ujung.
+        let (w, h) = (97u32, 61u32);
+        let mut img = RgbaImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(
+                    x,
+                    y,
+                    Rgba([
+                        (x * 3 % 256) as u8,
+                        (y * 5 % 256) as u8,
+                        ((x + y) % 256) as u8,
+                        255,
+                    ]),
+                );
+            }
+        }
+        let mut out = Cursor::new(Vec::new());
+        img.write_to(&mut out, ImageFormat::Png).unwrap();
+        let p = decode_sharp(&out.into_inner(), 4096, max_pixels()).unwrap();
+        assert_eq!(p.orig, [w, h]);
+        let px = |x: u32, y: u32| p.image.pixels[(y * w + x) as usize].to_array();
+        assert_eq!(px(0, 0), [0, 0, 0, 255]);
+        assert_eq!(px(10, 20), [30, 100, 30, 255]);
+        assert_eq!(px(96, 60), [32, 44, 156, 255]);
+    }
+
+    // ------------------------------------------------------------ S4 (WebP)
+
+    /// WebP lossless berpola deterministik (encoder `image` menulis
+    /// lossless; dekode kedua jalur harus piksel-tepat).
+    fn webp_pola_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        (x * 4 % 256) as u8,
+                        (y * 6 % 256) as u8,
+                        ((x ^ y) % 256) as u8,
+                    ]),
+                );
+            }
+        }
+        let mut out = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, ImageFormat::WebP)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn webp_statis_lewat_libwebp_piksel_tepat() {
+        let data = webp_pola_bytes(64, 48);
+        let p = decode_webp_libwebp(&data, 16384, 2_000_000)
+            .expect("libwebp harus berhasil mendekode WebP statis");
+        assert_eq!(p.orig, [64, 48]);
+        assert_eq!(p.image.size, [64, 48]);
+        let px = |x: u32, y: u32| p.image.pixels[(y * 64 + x) as usize].to_array();
+        assert_eq!(px(0, 0), [0, 0, 0, 255]);
+        assert_eq!(px(10, 20), [40, 120, 30, 255]);
+        assert_eq!(px(63, 47), [252, 26, 16, 255]);
+        // Jalur produksi penuh menghasilkan piksel yang sama persis.
+        let q = decode_sharp(&data, 16384, 2_000_000).unwrap();
+        assert_eq!(p.image.pixels, q.image.pixels);
+        assert_eq!(q.format, "WebP");
+    }
+
+    #[test]
+    fn webp_libwebp_menolak_yang_bukan_webp_statis() {
+        // Bukan WebP sama sekali.
+        assert!(decode_webp_libwebp(&png_bytes(8, 8), 16384, 2_000_000).is_none());
+        assert!(decode_webp_libwebp(&jpeg_bytes(8, 8), 16384, 2_000_000).is_none());
+        // Potongan sampah berawalan RIFF/WEBP tetapi isinya rusak.
+        let mut sampah = b"RIFF\x24\x00\x00\x00WEBPVP8 ".to_vec();
+        sampah.extend_from_slice(&[0xAA; 64]);
+        assert!(decode_webp_libwebp(&sampah, 16384, 2_000_000).is_none());
+    }
+
     fn outcome_name(o: &Outcome) -> &'static str {
         match o {
             Outcome::Ready(_) => "Ready",
             Outcome::Preview(..) => "Preview",
+            Outcome::StaticPreview(_) => "StaticPreview",
             Outcome::AnimChunk { .. } => "AnimChunk",
             Outcome::AnimDone { .. } => "AnimDone",
             Outcome::AnimFailed { .. } => "AnimFailed",
+            Outcome::AnimStopped { .. } => "AnimStopped",
             Outcome::AnimExported { .. } => "AnimExported",
             Outcome::AnimSaved { .. } => "AnimSaved",
             Outcome::AnimJobFailed { .. } => "AnimJobFailed",
