@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "roneyview"
-version = "0.8.26"
+version = "0.8.31"
 dependencies = [
  "arboard",
  "eframe",
@@ -2323,6 +2323,7 @@ dependencies = [
  "kamadak-exif",
  "libc",
  "libheif-rs",
+ "png",
  "rfd",
  "serde",
  "serde_json",

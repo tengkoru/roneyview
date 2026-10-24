@@ -2061,6 +2061,260 @@ pub fn decode_guarded(bytes: &[u8]) -> Result<DynamicImage, String> {
     }
 }
 
+/// Lebar kerja jalur streaming PNG: thumbnail akhir hanya 96px, tapi susut
+/// dua tahap (streaming -> 256px -> 96px) menjaga kualitasnya.
+const THUMB_WORK_SIDE: u32 = 256;
+/// Batas sisi thumbnail EXIF yang dipakai langsung: thumbnail EXIF normalnya
+/// jauh di bawah ini; yang lebih besar jatuh ke jalur beranggaran biasa.
+const EXIF_THUMB_MAX_SIDE: u32 = 2048;
+/// Batas piksel thumbnail EXIF yang dipakai langsung.
+const EXIF_THUMB_MAX_PIXELS: u64 = 4_000_000;
+
+/// Dekode thumbnail 96px untuk strip — BERANGGARAN, tidak seperti
+/// `decode_guarded` yang mendekode resolusi penuh dulu baru mengecilkan.
+/// Berkas raksasa (mis. 10000x6000) gagal di jalur lama karena penjaga
+/// memori (perkiraan RGBA 240 MB), padahal thumbnail 96px tidak pernah
+/// membutuhkannya. Jalur ini tidak pernah memegang buffer RGBA resolusi
+/// penuh:
+/// - JPEG: thumbnail EXIF tertanam bila ada (kecil); bila tidak ada,
+///   dekode RGB (3 byte/px, bukan perkiraan RGBA 4 byte/px) yang
+///   diperiksa terhadap `alloc_limit` SEBELUM dekode.
+/// - PNG: susut streaming per-baris (baca baris -> rata-rata kotak ->
+///   gambar kerja 256px), tanpa buffer penuh sama sekali.
+/// - Format lain: dekode beranggaran (perkiraan konservatif 4 byte/px
+///   diperiksa terhadap `alloc_limit`); yang melebihi batas gagal jujur
+///   dan diingat pemanggil (negative cache di app.rs), bukan diulang
+///   tiap frame.
+/// Orientasi EXIF DITERAPKAN (berbeda dari `decode_guarded` yang sengaja
+/// tidak menerapkannya): thumbnail harus seorientasi dengan tampilan
+/// utama yang juga menerapkan orientasi. Jalur utama/batch TIDAK berubah
+/// — mereka tetap memakai `decode_guarded`/`decode_progressive` dan
+/// penjaga OOM-nya utuh. Satu pengecualian yang dicatat: HEIF tidak
+/// ditangani dekoder `image` (jalur libheif mendekode RGBA penuh dulu),
+/// jadi thumbnail HEIF tetap seperti sebelumnya — di luar mandat ini.
+pub fn decode_thumb(bytes: &[u8]) -> Result<RgbaImage, String> {
+    match catch_unwind(AssertUnwindSafe(|| decode_thumb_inner(bytes))) {
+        Ok(r) => r,
+        Err(_) => Err("Dekoder gagal memproses berkas ini (data kemungkinan rusak)".into()),
+    }
+}
+
+fn decode_thumb_inner(bytes: &[u8]) -> Result<RgbaImage, String> {
+    match image::guess_format(bytes) {
+        Ok(ImageFormat::Jpeg) => {
+            if let Some(t) = decode_thumb_jpeg_exif(bytes) {
+                return Ok(t);
+            }
+            decode_thumb_budgeted(bytes, 3)
+        }
+        Ok(ImageFormat::Png) => match decode_thumb_png_stream(bytes) {
+            Ok(t) => Ok(t),
+            Err(_) => decode_thumb_budgeted(bytes, 4),
+        },
+        Ok(_) => decode_thumb_budgeted(bytes, 4),
+        Err(_) => Err("Format tidak dikenali atau berkas rusak".into()),
+    }
+}
+
+/// Orientasi EXIF dari header saja (tanpa decode piksel); NoTransforms
+/// bila tidak ada / tidak terbaca. Dipakai jalur thumbnail supaya
+/// thumbnail seorientasi dengan tampilan utama.
+fn thumb_orientation(bytes: &[u8]) -> Orientation {
+    let mut reader = match ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
+        Ok(r) => r,
+        Err(_) => return Orientation::NoTransforms,
+    };
+    reader.limits(limits());
+    match reader.into_decoder() {
+        Ok(mut d) => d.orientation().unwrap_or(Orientation::NoTransforms),
+        Err(_) => Orientation::NoTransforms,
+    }
+}
+
+/// Thumbnail EXIF tertanam (IFD1) untuk JPEG: tanpa decode gambar utama
+/// sama sekali. Orientasi header utama diterapkan (piksel thumbnail
+/// tersimpan searah piksel utama — sama seperti `jpeg_exif_preview`).
+/// `None` bila tidak ada thumbnail, thumbnail rusak, thumbnail lebih
+/// kecil dari target (naik-skala memberi hasil buram — lebih baik jalur
+/// beranggaran yang tajam), atau thumbnailnya sendiri terlalu besar
+/// (jatuh ke jalur beranggaran).
+fn decode_thumb_jpeg_exif(bytes: &[u8]) -> Option<RgbaImage> {
+    // Orientasi dari header saja (tanpa piksel, tanpa penjaga kanvas
+    // utama: yang didekode hanya thumbnail kecilnya).
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
+    reader.limits(limits());
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    drop(decoder);
+    let thumb_bytes = extract_exif_thumbnail(bytes)?;
+    // Jaga-jaga: thumbnail EXIF yang abnormal besar tidak didekode penuh.
+    let mut treader =
+        ImageReader::new(Cursor::new(thumb_bytes)).with_guessed_format().ok()?;
+    treader.limits(limits());
+    let tdecoder = treader.into_decoder().ok()?;
+    let (tw, th) = tdecoder.dimensions();
+    drop(tdecoder);
+    if tw == 0
+        || th == 0
+        || tw > EXIF_THUMB_MAX_SIDE
+        || th > EXIF_THUMB_MAX_SIDE
+        || u64::from(tw) * u64::from(th) > EXIF_THUMB_MAX_PIXELS
+        || tw.max(th) < 96
+    {
+        return None;
+    }
+    let thumb = image::load_from_memory_with_format(thumb_bytes, ImageFormat::Jpeg).ok()?;
+    let mut small = thumb.thumbnail(96, 96);
+    small.apply_orientation(orientation);
+    Some(small.to_rgba8())
+}
+
+/// Dekode beranggaran umum: dimensi dibaca dari header (tanpa piksel),
+/// perkiraan byte diperiksa terhadap `alloc_limit` SEBELUM dekode, lalu
+/// dekode lewat dekoder `image` dengan `limits()` yang sama. Orientasi
+/// diterapkan pada gambar KECIL hasil susut (rotasi/flip komutatif dengan
+/// susut, jadi hasilnya seorientasi dengan tampilan utama).
+fn decode_thumb_budgeted(bytes: &[u8], bytes_per_pixel: u64) -> Result<RgbaImage, String> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("Gagal membaca berkas: {e}"))?;
+    reader.limits(limits());
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| describe(&e, "Format tidak dikenali atau berkas rusak"))?;
+    let (w, h) = decoder.dimensions();
+    if w == 0 || h == 0 {
+        return Err("Gambar berukuran nol".into());
+    }
+    let est = u64::from(w) * u64::from(h) * bytes_per_pixel;
+    if est > alloc_limit() {
+        return Err(format!(
+            "Gambar terlalu besar untuk memori yang tersedia ({} MB saat didekode)",
+            est >> 20
+        ));
+    }
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let img = DynamicImage::from_decoder(decoder)
+        .map_err(|e| describe(&e, "Gambar rusak atau tidak lengkap"))?;
+    let mut thumb = img.thumbnail(96, 96);
+    thumb.apply_orientation(orientation);
+    Ok(thumb.to_rgba8())
+}
+
+/// Susut streaming PNG: baca baris demi baris dari dekoder `png`,
+/// rata-rata kotak (box average) ke gambar kerja sisi-maks 256px.
+/// Tidak pernah memegang buffer resolusi penuh: yang dipegang hanya satu
+/// baris sumber + satu baris akumulator output. Gagal (tipe warna tak
+/// terduga, data rusak) -> Err, pemanggil jatuh ke jalur beranggaran.
+fn decode_thumb_png_stream(bytes: &[u8]) -> Result<RgbaImage, String> {
+    use png::{ColorType, Transformations};
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(Transformations::normalize_to_color8());
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("Gagal membaca PNG: {e}"))?;
+    let info = reader.info();
+    let (w, h) = (info.width, info.height);
+    if w == 0 || h == 0 {
+        return Err("Gambar berukuran nol".into());
+    }
+    let (out_ct, out_depth) = reader.output_color_type();
+    if out_depth != png::BitDepth::Eight {
+        return Err("PNG bukan 8-bit sesudah normalisasi".into());
+    }
+    let channels: usize = match out_ct {
+        ColorType::Grayscale => 1,
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
+        _ => return Err("Tipe warna PNG tak terduga".into()),
+    };
+    let scale = (THUMB_WORK_SIDE as f64 / w.max(h) as f64).min(1.0);
+    let (tw, th) = (
+        ((w as f64 * scale).round() as u32).max(1),
+        ((h as f64 * scale).round() as u32).max(1),
+    );
+    // Batas kolom sumber tiap kolom output (rata-rata kotak).
+    let col_range = |ox: u32| -> (u32, u32) {
+        let x0 = (u64::from(ox) * u64::from(w) / u64::from(tw)) as u32;
+        let x1 = (u64::from(ox + 1) * u64::from(w) / u64::from(tw)) as u32;
+        (x0, x1.max(x0 + 1))
+    };
+    let row_band_end = |oy: u32| -> u32 {
+        ((u64::from(oy + 1) * u64::from(h) / u64::from(th)) as u32).max(1)
+    };
+    let mut out = RgbaImage::new(tw, th);
+    let mut acc = vec![[0u64; 4]; tw as usize];
+    let mut acc_rows: u64 = 0;
+    let mut oy: u32 = 0;
+    let mut y: u32 = 0;
+    while let Some(row) = reader
+        .next_row()
+        .map_err(|e| format!("Gagal membaca PNG: {e}"))?
+    {
+        let data = row.data();
+        if data.len() < (w as usize) * channels {
+            return Err("Baris PNG lebih pendek dari lebar gambar".into());
+        }
+        for ox in 0..tw {
+            let (x0, x1) = col_range(ox);
+            let mut sum = [0u64; 4];
+            for x in x0..x1 {
+                let base = (x as usize) * channels;
+                match channels {
+                    1 => {
+                        let v = u64::from(data[base]);
+                        sum[0] += v;
+                        sum[1] += v;
+                        sum[2] += v;
+                        sum[3] += 255;
+                    }
+                    3 => {
+                        sum[0] += u64::from(data[base]);
+                        sum[1] += u64::from(data[base + 1]);
+                        sum[2] += u64::from(data[base + 2]);
+                        sum[3] += 255;
+                    }
+                    _ => {
+                        sum[0] += u64::from(data[base]);
+                        sum[1] += u64::from(data[base + 1]);
+                        sum[2] += u64::from(data[base + 2]);
+                        sum[3] += u64::from(data[base + 3]);
+                    }
+                }
+            }
+            for c in 0..4 {
+                acc[ox as usize][c] += sum[c];
+            }
+        }
+        acc_rows += 1;
+        y += 1;
+        if y >= row_band_end(oy) && oy < th {
+            for ox in 0..tw {
+                let (x0, x1) = col_range(ox);
+                let n = acc_rows * u64::from(x1 - x0);
+                let px = image::Rgba([
+                    (acc[ox as usize][0] / n) as u8,
+                    (acc[ox as usize][1] / n) as u8,
+                    (acc[ox as usize][2] / n) as u8,
+                    (acc[ox as usize][3] / n) as u8,
+                ]);
+                out.put_pixel(ox, oy, px);
+            }
+            acc.iter_mut().for_each(|a| *a = [0; 4]);
+            acc_rows = 0;
+            oy += 1;
+        }
+    }
+    if oy != th {
+        return Err("PNG terpotong: baris kurang".into());
+    }
+    // Orientasi dari header eXIf (bila ada), sama seperti tampilan utama.
+    let orientation = thumb_orientation(bytes);
+    let mut work = DynamicImage::ImageRgba8(out);
+    work.apply_orientation(orientation);
+    Ok(work.thumbnail(96, 96).to_rgba8())
+}
+
 fn finish_raw(raw: RawImage, max_side: u32, max_pixels: usize) -> Result<Pixels, String> {
     let (w, h) = (raw.img.width(), raw.img.height());
     if w == 0 || h == 0 {
@@ -4000,6 +4254,68 @@ mod tests {
         // Thumbnail di bawah lantai 32px -> dianggap dekoratif, dilewati.
         let data = jpeg_berthumbnail(400, 300, 1, Some((16, 9, [20, 90, 160])), None);
         assert!(jpeg_exif_preview(&data, 16384, 2_000_000).is_none());
+    }
+
+    // ------------------------------------------------------------ M3 (thumbnail)
+
+    #[test]
+    fn thumbnail_jpeg_dan_png_kecil_sesuai_aspek() {
+        let t = decode_thumb(&jpeg_bytes(400, 300)).expect("jpeg kecil harus jadi thumbnail");
+        assert_eq!((t.width(), t.height()), (96, 72));
+        let t = decode_thumb(&png_bytes(400, 300)).expect("png kecil harus jadi thumbnail");
+        assert_eq!((t.width(), t.height()), (96, 72));
+        // Potret tanpa EXIF tetap potret.
+        let t = decode_thumb(&jpeg_bytes(300, 400)).expect("jpeg potret harus jadi thumbnail");
+        assert_eq!((t.width(), t.height()), (72, 96));
+    }
+
+    #[test]
+    fn thumbnail_jpeg_menghormati_orientasi_exif() {
+        // Foto potret 300x400 dengan Orientation 6 (putar 90 CW saat tampil):
+        // tampilan utama menampilkannya 400x300, thumbnail harus ikut.
+        let data = jpeg_berthumbnail(300, 400, 6, None, None);
+        let t = decode_thumb(&data).expect("jpeg berorientasi harus jadi thumbnail");
+        assert_eq!((t.width(), t.height()), (96, 72), "thumbnail ikut terorientasi");
+    }
+
+    #[test]
+    fn thumbnail_jpeg_pakai_thumbnail_exif_bila_ada() {
+        // Thumbnail tertanam 160x120 biru-ish: dipakai langsung (bukan
+        // decode gambar utama 400x300 merah-ish), lalu disusut ke 96x72.
+        let data = jpeg_berthumbnail(400, 300, 1, Some((160, 120, [20, 90, 160])), None);
+        let t = decode_thumb(&data).expect("harus jadi thumbnail dari EXIF");
+        assert_eq!((t.width(), t.height()), (96, 72));
+        let px = t.get_pixel(48, 36);
+        assert!(
+            px[2] > px[0] + 40,
+            "piksel harus dari thumbnail EXIF, dapat {px:?}"
+        );
+    }
+
+    #[test]
+    fn thumbnail_png_streaming_susut_dan_grayscale_benar() {
+        // PNG 800x600 hijau solid lewat jalur streaming (sisi kerja 256px).
+        let t = decode_thumb(&png_bytes(800, 600)).expect("png besar harus jadi thumbnail");
+        assert_eq!((t.width(), t.height()), (96, 72));
+        let px = t.get_pixel(48, 36);
+        assert!(px[1] > 150 && px[0] < 80, "hijau solid harus bertahan: {px:?}");
+        // PNG grayscale 400x300 lewat cabang 1 kanal.
+        let gray = image::GrayImage::from_pixel(400, 300, image::Luma([200]));
+        let mut out = Cursor::new(Vec::new());
+        gray.write_to(&mut out, ImageFormat::Png).unwrap();
+        let t = decode_thumb(&out.into_inner()).expect("png grayscale harus jadi thumbnail");
+        assert_eq!((t.width(), t.height()), (96, 72));
+        let px = t.get_pixel(48, 36);
+        assert!(
+            px[0] > 170 && px[1] > 170 && px[2] > 170,
+            "abu-abu harus bertahan: {px:?}"
+        );
+    }
+
+    #[test]
+    fn thumbnail_gagal_untuk_data_rusak() {
+        assert!(decode_thumb(b"bukan-gambar-sama-sekali").is_err());
+        assert!(decode_thumb(&[]).is_err());
     }
 
     #[test]

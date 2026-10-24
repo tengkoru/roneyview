@@ -24,7 +24,7 @@ use crate::i18n::{Lang, tr, tr_fmt, unescape};
 use crate::loader::{self, AnimFrame, AnimMeta, Command, Loaded, Outcome};
 use crate::positions::{PositionStore, key_for};
 use crate::settings::{FitMode, Store};
-use crate::source::Listing;
+use crate::source::{is_image_name, Listing};
 use crate::themes::{self, Theme};
 
 /// Gambar yang disimpan di cache: sekian di belakang dan di depan gambar aktif.
@@ -193,10 +193,17 @@ fn catch_up(
 }
 
 /// Selama sesi edit, pintasan utama dimatikan di `update()` (navigasi dsb.
-/// milik sesi edit) — KECUALI salin: Ctrl+C harus tetap hidup supaya buffer
-/// kerja bisa disalin tanpa menyimpan/menutup sesi dulu.
+/// milik sesi edit) — KECUALI salin, Pengaturan, dan Keluar: Ctrl+C harus
+/// tetap hidup supaya buffer kerja bisa disalin tanpa menyimpan/menutup sesi
+/// dulu, Ctrl+, harus tetap hidup karena dialog Pengaturan sudah didukung
+/// selama edit lewat jalur menu (jalur menu melewati gerbang ini), dan
+/// Ctrl+Q harus tetap hidup karena menu-Keluar dan tombol-X sudah keluar
+/// selama edit dan tidak ada dialog konfirmasi dirty — menutup ketiganya
+/// untuk pintasan adalah efek samping gerbang yang terlalu luas, bukan
+/// keputusan desain (triase Support 0.8.27 temuan 1 untuk salin/Pengaturan;
+/// triase Support 0.8.29 untuk Keluar sebagai mandat terpisah).
 fn action_allowed_while_editing(a: &Action) -> bool {
-    matches!(a, Action::CopyImage)
+    matches!(a, Action::CopyImage | Action::Settings | Action::Quit)
 }
 
 /// Path hasil dialog simpan untuk format tetap (PNG/PDF): dialog GTK (rfd)
@@ -208,6 +215,28 @@ fn ensure_save_ext(path: &Path, ext: &str) -> PathBuf {
     match path.extension() {
         Some(e) if !e.is_empty() => path.to_path_buf(),
         _ => path.with_extension(ext),
+    }
+}
+
+/// Apakah folder `dir` (tempat berkas ditulis) tercakup listing sesi yang
+/// berasal dari `origin`: sama persis, atau — bila pindai rekursif aktif —
+/// sub-folder di bawahnya (berkasnya ikut terdaftar di listing). Pemanggil
+/// mengkanonikalisasi kedua path dulu; fungsi ini murni perbandingan.
+fn save_dir_in_session(origin: &Path, dir: &Path, recursive: bool) -> bool {
+    if dir == origin {
+        return true;
+    }
+    recursive && dir.starts_with(origin)
+}
+
+/// Indeks jangkar di listing baru: posisi nama berkas aktif lama di dalam
+/// daftar nama baru; bila nama itu hilang (mis. berkas aktif ikut
+/// terhapus), jatuh ke indeks lama yang dijepit ke rentang baru. Nama —
+/// bukan nomor mentah — karena penyisipan menggeser nomor.
+fn resolve_anchor(new_names: &[String], anchor: Option<&str>, fallback: usize) -> usize {
+    match anchor.and_then(|a| new_names.iter().position(|n| n == a)) {
+        Some(i) => i,
+        None => fallback.min(new_names.len().saturating_sub(1)),
     }
 }
 
@@ -1104,6 +1133,10 @@ pub struct RoneyApp {
     thumb_cache: HashMap<usize, TextureHandle>,
     /// Indeks yang sedang di-decode di thread latar (jangan kirim duplikat).
     thumb_pending: std::collections::HashSet<usize>,
+    /// Indeks yang thumbnailnya gagal di-decode (negative cache): tidak
+    /// diantre ulang tiap frame; antre ulang hanya bila listing dipasang
+    /// ulang (lihat `install_listing` yang membersihkannya).
+    thumb_failed: std::collections::HashSet<usize>,
     /// Indeks terakhir yang di-follow strip; bila berubah, scroll ke thumbnail aktif.
     strip_last_index: usize,
     /// Channel ke worker thumbnail: kirim (indeks, bytes file).
@@ -1298,6 +1331,7 @@ impl RoneyApp {
             print_status: String::new(),
             thumb_cache: HashMap::new(),
             thumb_pending: std::collections::HashSet::new(),
+            thumb_failed: std::collections::HashSet::new(),
             strip_last_index: usize::MAX,
             thumb_job_tx: None,
             thumb_res_rx: None,
@@ -1378,6 +1412,9 @@ impl RoneyApp {
         self.cache.clear();
         self.thumb_cache.clear();
         self.thumb_pending.clear();
+        // Listing baru -> kegagalan thumbnail lama tidak berlaku lagi;
+        // indeks gagal boleh diantre ulang (satu-satunya jalan antre ulang).
+        self.thumb_failed.clear();
         self.strip_last_index = usize::MAX;
         self.pending.clear();
         self.errors.clear();
@@ -1512,24 +1549,32 @@ impl RoneyApp {
             match self.dialog_kind.take() {
                 Some(DialogKind::SaveImage { index, .. }) => {
                     if let Some(p) = result {
-                        self.extract_page(index, &p);
+                        if self.extract_page(index, &p) {
+                            self.refresh_listing_after_save(ctx, &p);
+                        }
                     }
                 }
                 Some(DialogKind::SaveFrame { index, frame, .. }) => {
                     if let Some(p) = result {
                         let p = ensure_save_ext(&p, "png");
-                        self.save_frame(ctx, index, frame, &p);
+                        if self.save_frame(ctx, index, frame, &p) {
+                            self.refresh_listing_after_save(ctx, &p);
+                        }
                     }
                 }
                 Some(DialogKind::ExportFrames { index }) => {
                     if let Some(dir) = result {
-                        self.export_frames(ctx, index, &dir);
+                        if self.export_frames(ctx, index, &dir) {
+                            self.refresh_listing_after_save(ctx, &dir);
+                        }
                     }
                 }
                 Some(DialogKind::SaveEdit { .. }) => {
                     if let Some(p) = result {
                         let p = ensure_save_ext(&p, "png");
-                        self.save_edit_buffer(&p);
+                        if self.save_edit_buffer(&p) {
+                            self.refresh_listing_after_save(ctx, &p);
+                        }
                     }
                 }
                 Some(DialogKind::SavePdf { .. }) => {
@@ -1569,29 +1614,37 @@ impl RoneyApp {
     }
 
     /// Simpan byte asli halaman ke-`index` ke `dest` (tanpa encode ulang,
-    /// jadi kualitasnya 100% sama dengan sumber).
-    fn extract_page(&mut self, index: usize, dest: &Path) {
+    /// jadi kualitasnya 100% sama dengan sumber). Mengembalikan true bila
+    /// berkas benar-benar tertulis (untuk refresh listing, lihat
+    /// `refresh_listing_after_save`).
+    fn extract_page(&mut self, index: usize, dest: &Path) -> bool {
         let lang = self.lang;
         let Some(listing) = self.listing.clone() else {
-            return;
+            return false;
         };
         let mut reader = match listing.open_reader() {
             Ok(r) => r,
             Err(e) => {
                 self.notify(e);
-                return;
+                return false;
             }
         };
         let bytes = match reader.read(index) {
             Ok(b) => b,
             Err(e) => {
                 self.notify(e);
-                return;
+                return false;
             }
         };
         match std::fs::write(dest, &bytes) {
-            Ok(_) => self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()])),
-            Err(e) => self.notify(format!("{}: {e}", tr(lang, "notify_save_failed"))),
+            Ok(_) => {
+                self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()]));
+                true
+            }
+            Err(e) => {
+                self.notify(format!("{}: {e}", tr(lang, "notify_save_failed")));
+                false
+            }
         }
     }
 
@@ -1620,13 +1673,18 @@ impl RoneyApp {
     /// penyimpanan disimpan langsung; frame GIF streaming yang sudah
     /// terbuang didekode ulang di worker (UI tidak membeku) dan
     /// hasilnya dilaporkan lewat `Outcome::AnimSaved`.
-    fn save_frame(&mut self, ctx: &Context, index: usize, frame: usize, dest: &Path) {
+    /// Simpan satu frame animasi sebagai PNG. Mengembalikan true hanya bila
+    /// berkas benar-benar tertulis di jalur langsung; jalur worker (frame
+    /// streaming) bersifat async dan dilaporkan lewat `Outcome::AnimSaved`,
+    /// yang mengaitkan refresh listing di sana (untuk refresh listing, lihat
+    /// `refresh_listing_after_save`).
+    fn save_frame(&mut self, ctx: &Context, index: usize, frame: usize, dest: &Path) -> bool {
         let lang = self.lang;
         let Some(page) = self.page_for(index) else {
-            return;
+            return false;
         };
         let Some(anim) = &page.anim else {
-            return;
+            return false;
         };
         let (img, streamed) = {
             let st = anim.state.lock().unwrap();
@@ -1634,11 +1692,16 @@ impl RoneyApp {
         };
         if let Some(img) = img {
             let rgba = colorimage_to_rgba(&img);
-            match crate::wallpaper::write_png(&rgba, dest) {
-                Ok(_) => self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()])),
-                Err(e) => self.notify(e),
-            }
-            return;
+            return match crate::wallpaper::write_png(&rgba, dest) {
+                Ok(_) => {
+                    self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()]));
+                    true
+                }
+                Err(e) => {
+                    self.notify(e);
+                    false
+                }
+            };
         }
         if streamed {
             let cmd = Command::SaveAnimFrame {
@@ -1653,23 +1716,27 @@ impl RoneyApp {
                 self.notify(tr(lang, "notify_save_failed"));
             }
         }
+        false
     }
 
     /// Ekspor SEMUA frame animasi halaman `index` sebagai PNG ke `dir`.
     /// Animasi warisan diekspor dari frame tersimpan; GIF streaming
     /// didekode penuh berurutan di worker supaya frame yang sudah
-    /// terbuang dari jendela geser ikut terekspor.
-    fn export_frames(&mut self, ctx: &Context, index: usize, dir: &Path) {
+    /// terbuang dari jendela geser ikut terekspor. Mengembalikan true hanya
+    /// bila jalur langsung menulis SEMUA frame (jalur worker tidak punya
+    /// outcome sukses, jadi ekspor streaming tidak memicu refresh listing —
+    /// keterbatasan yang dicatat, bukan diam-diam).
+    fn export_frames(&mut self, ctx: &Context, index: usize, dir: &Path) -> bool {
         let lang = self.lang;
         // Gagal TIDAK boleh diam: halaman bisa terbuang dari cache selama
         // dialog folder terbuka — user harus tahu ekspornya tidak jalan.
         let Some(page) = self.page_for(index) else {
             self.notify(tr(lang, "notify_save_failed"));
-            return;
+            return false;
         };
         let Some(anim) = &page.anim else {
             self.notify(tr(lang, "notify_save_failed"));
-            return;
+            return false;
         };
         let (streamed, stored) = {
             let st = anim.state.lock().unwrap();
@@ -1692,7 +1759,7 @@ impl RoneyApp {
             if self.cmd_tx_main.send(cmd).is_err() {
                 self.notify(tr(lang, "notify_save_failed"));
             }
-            return;
+            return false;
         }
         let total = stored.len();
         let stem = self.frame_stem(index);
@@ -1707,8 +1774,10 @@ impl RoneyApp {
         }
         if total > 0 && done == total {
             self.notify(tr_fmt(lang, "notify_frames_exported", &[&done, &dir.display()]));
+            true
         } else {
             self.notify(tr(lang, "notify_save_failed"));
+            false
         }
     }
 
@@ -2147,7 +2216,23 @@ impl RoneyApp {
     /// Tampilan edit: area gambar (fit) + panel perkakas kanan.
     fn draw_edit_view(&mut self, ctx: &Context, ui: &mut egui::Ui) {
         let lang = self.lang;
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        // Esc menutup sesi edit — KECUALI bila ada overlay yang memiliki Esc
+        // (dialog Pengaturan, Lompat ke halaman, modal konfirmasi, dialog
+        // Tentang: keempatnya menutup diri sendiri dengan Esc). Tanpa penjaga
+        // ini, satu tekanan menutup dialog DAN sesi edit sekaligus — pola
+        // penjagaan yang sama seperti ExitFullscreen di read_input. Terlihat
+        // saat Pengaturan dibuka lewat Ctrl+, selama edit (M1): Esc harus
+        // menutup dialog saja, sesi edit tetap utuh.
+        // Jendela Cetak SENGAJA tidak ada di daftar ini (KOMENTAR SAJA,
+        // tanpa ekspresi — mandat M-P): eksklusivitas kedap
+        // (open_print_window menutup edit & projector; start_edit menutup
+        // print & projector) membuat edit + Cetak mustahil berdampingan,
+        // jadi penjaga ini tidak pernah bertemu Cetak; bila eksklusivitas
+        // dilonggarkan kelak, print_open wajib ditambahkan ke ekspresi ini
+        // saat itu juga.
+        let overlay_owns_esc =
+            self.show_settings || self.goto_open || self.modal.is_some() || self.about_open;
+        if !overlay_owns_esc && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.close_edit();
             return;
         }
@@ -2600,10 +2685,13 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     }
 
     /// Simpan buffer edit saat ini sebagai PNG (dialog "Simpan").
-    fn save_edit_buffer(&mut self, dest: &Path) {
+    /// Mengembalikan true bila berkas benar-benar tertulis (pemanggil
+    /// memakai ini untuk memutuskan refresh listing, lihat
+    /// `refresh_listing_after_save`).
+    fn save_edit_buffer(&mut self, dest: &Path) -> bool {
         let lang = self.lang;
         let Some(e) = &mut self.edit else {
-            return;
+            return false;
         };
         let img = e.display_image().clone();
         match crate::wallpaper::write_png(&img, dest) {
@@ -2612,8 +2700,12 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     e.dirty = false;
                 }
                 self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()]));
+                true
             }
-            Err(e) => self.notify(e),
+            Err(e) => {
+                self.notify(e);
+                false
+            }
         }
     }
 
@@ -2938,6 +3030,12 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     }
                 });
             });
+        // Esc menutup dialog Tentang (pola Lompat ke halaman; `!close`
+        // supaya tidak menimpa OK yang sudah diklik). Tanpa handler ini,
+        // Esc bocor ke lapisan bawah dan menutup sesi edit di bawah About.
+        if !close && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
         if close {
             open = false;
         }
@@ -2947,6 +3045,14 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
     fn draw_print_window(&mut self, ctx: &Context) {
         let lang = self.lang;
         let mut open = self.print_open;
+        // Apakah ada popup (ComboBox tata letak/kertas, atau menu) yang
+        // terbuka saat frame ini dimulai — ditangkap SEBELUM `.show()`
+        // karena egui menutup popup di dalam pass yang sama saat Esc
+        // ditekan, sehingga pengecekan sesudah `.show()` akan melihat
+        // popup sudah tertutup dan gagal membedakan "Esc untuk popup"
+        // dari "Esc untuk jendela". Keadaan ini dipakai penjaga Esc di
+        // bawah: bila popup terbuka, Esc adalah milik popup.
+        let popup_open = egui::Popup::is_any_open(ctx);
         let total_pages = self.print_page_count().max(1);
         if self.print_page >= total_pages {
             self.print_page = total_pages - 1;
@@ -3053,6 +3159,29 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     ui.label(tr(lang, "print_generating"));
                 }
             });
+        // Esc menutup jendela Cetak (pola Tentang; `!close` supaya tidak
+        // menimpa Tutup yang sudah diklik). Sibuk tidak mengubahnya:
+        // tombol Tutup tetap aktif saat `print_job.is_some()` dan pekerjaan
+        // berjalan tanpa syarat tiap frame, jadi menutup jendela tidak pernah
+        // membatalkan pekerjaan — tanpa handle pembatalan, tanpa dialog
+        // konfirmasi baru. Popup didahulukan lewat `popup_open` di atas:
+        // bila popup ComboBox terbuka saat frame dimulai, Esc menutup popup
+        // saja (egui menutupnya sendiri di dalam `.show()`), jendela tetap
+        // terbuka; Esc berikutnya baru menutup jendela. Dialog native
+        // didahulukan lewat `dialog_busy` (butir verifikasi (c)): bila
+        // dialog Simpan PDF native masih tertunda, Esc yang sampai ke
+        // jendela aplikasi (mis. fokus sempat pindah ke jendela aplikasi
+        // di belakang dialog) TIDAK boleh menutup jendela Cetak — hasil
+        // dialog nanti tetap diproses `poll_dialog`, dan Tutup/X tetap
+        // jalan selama dialog tertunda; `dialog_busy` dibersihkan
+        // `poll_dialog` begitu hasil tiba, jadi penjaga ini tidak lengket.
+        if !close
+            && !popup_open
+            && !self.dialog_busy
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            close = true;
+        }
         self.print_open = open;
         if close {
             self.print_open = false;
@@ -3753,6 +3882,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 }
                 Outcome::AnimSaved { dest } => {
                     self.notify(tr_fmt(lang, "notify_saved", &[&dest.display()]));
+                    self.refresh_listing_after_save(ctx, &dest);
                 }
                 Outcome::AnimJobFailed { message } => {
                     self.notify(message);
@@ -4405,6 +4535,8 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         let goto_open = self.goto_open;
         let modal_open = self.modal.is_some();
         let settings_open = self.show_settings;
+        let about_open = self.about_open;
+        let print_open = self.print_open;
         let projector_open = self.projector_open;
         // Shortcut single-key jangan aktif saat: user mengetik di text field,
         // atau projector (window baru) sedang terbuka.
@@ -4476,13 +4608,15 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 take(none, Key::Delete, Action::Trash, i);
                 take(none, Key::F11, Action::ToggleFullscreen, i);
                 take(none, Key::F1, Action::Help, i);
-                // Esc adalah milik dialog Pengaturan selama ia terbuka: di
-                // sana Esc berarti "tutup dialog" (lihat draw_overlays).
-                // Jangan dicaplok untuk keluar layar penuh, supaya satu
-                // tekanan tidak menutup dialog DAN mengubah jendela utama
-                // pada frame yang sama. Pola penjagaan yang sama seperti
-                // Enter untuk dialog Lompat/modal di atas.
-                if fullscreen && !settings_open {
+                // Esc adalah milik dialog Pengaturan, dialog Tentang, dan
+                // jendela Cetak selama salah satunya terbuka: di sana Esc
+                // berarti "tutup dialog" (lihat draw_overlays,
+                // draw_about_window, dan draw_print_window). Jangan dicaplok
+                // untuk keluar layar penuh, supaya satu tekanan tidak
+                // menutup dialog DAN mengubah jendela utama pada frame
+                // yang sama. Pola penjagaan yang sama seperti Enter untuk
+                // dialog Lompat/modal di atas.
+                if fullscreen && !settings_open && !about_open && !print_open {
                     take(none, Key::Escape, Action::ExitFullscreen, i);
                 }
             }
@@ -4584,6 +4718,19 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                 // Submenu Tema: pilihan tema + pratinjau mini tampilannya.
                 ui.menu_button(tr(lang, "menu_theme"), |ui| {
                     let current = self.store.state.theme;
+                    // Scroll (perintah user 0.8.31): 10 tema × ~68 px
+                    // ≈ 680 px melebihi jendela pendek. Tinggi maksimum
+                    // mengikuti tinggi viewport (dikurangi ruang menu
+                    // atas/bawah) supaya di jendela tinggi semua tema
+                    // tetap tampil tanpa scroll, dan di jendela pendek
+                    // submenu bisa di-scroll. Cakupan = scroll saja; isi
+                    // item tidak berubah.
+                    let win_h = ui.ctx().input(|i| {
+                        i.viewport().inner_rect.map(|r| r.height()).unwrap_or(800.0)
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height((win_h - 60.0).max(200.0))
+                        .show(ui, |ui| {
                     for theme in Theme::all() {
                         let sel = current == theme;
                         // Pratinjau mini di atas, nama tema di bawah.
@@ -4610,6 +4757,7 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                             ui.close_kind(egui::UiKind::Menu);
                         }
                     }
+                        });
                 });
                 ui.separator();
                 item(ui, tr(lang, "menu_quit"), "Ctrl+Q", acts, Action::Quit);
@@ -4849,11 +4997,11 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
             .name("roneyview-thumb".into())
             .spawn(move || {
                 for (idx, bytes) in job_rx {
-                    // Decode berpenjaga loader (batas dimensi/alokasi sama seperti
-                    // jalur utama); hasilnya lalu dikecilkan ke maks 96px.
-                    let thumb = loader::decode_guarded(&bytes)
-                        .ok()
-                        .map(|d| d.thumbnail(96, 96).to_rgba8());
+                    // Dekode thumbnail BERANGGARAN (lihat `decode_thumb`):
+                    // berkas raksasa tidak lagi didekode resolusi penuh dulu,
+                    // dan orientasi EXIF diterapkan supaya seorientasi dengan
+                    // tampilan utama. Gagal -> None, diingat pemanggil.
+                    let thumb = loader::decode_thumb(&bytes).ok();
                     let _ = res_tx.send((idx, thumb));
                 }
             })
@@ -4885,6 +5033,12 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
                     egui::TextureOptions::LINEAR,
                 );
                 self.thumb_cache.insert(idx, tex);
+            } else {
+                // Ingat kegagalan: jangan antre ulang tiap frame (dulu
+                // `prefetch_thumbs` mengantre ulang indeks gagal tanpa henti
+                // sehingga worker berulang kali mendekode berkas yang sama
+                // dan gagal lagi). Dibersihkan saat listing dipasang ulang.
+                self.thumb_failed.insert(idx);
             }
         }
         // Batasi cache: buang yang terjauh dari indeks aktif bila > 240.
@@ -4915,7 +5069,11 @@ fn screen_to_image(rect: Rect, scale: f32, pos: Pos2) -> (f32, f32) {
         // Prioritaskan yang terdekat dari gambar aktif.
         let cur = self.index;
         let mut candidates: Vec<usize> = (lo..=hi)
-            .filter(|&i| !self.thumb_cache.contains_key(&i) && !self.thumb_pending.contains(&i))
+            .filter(|&i| {
+                !self.thumb_cache.contains_key(&i)
+                    && !self.thumb_pending.contains(&i)
+                    && !self.thumb_failed.contains(&i)
+            })
             .collect();
         candidates.sort_by_key(|&i| i.abs_diff(cur));
         // Batasi 4 per frame agar I/O tidak menumpuk.
@@ -5522,7 +5680,25 @@ impl RoneyApp {
                                 SettingsTab::Theme => {
                                     themes::panel_heading(ui, self.store.state.theme, &tr(lang, "settings_theme"));
                                     ui.add_space(6.0);
-                                    // Grid 2x2: pratinjau + nama tema.
+                                    // Scroll (perintah user 0.8.31): grid
+                                    // 5 baris × ~122 px ≈ 610 px terpotong
+                                    // di jendela pendek karena dialog ini
+                                    // non-resizable. Tinggi maksimum
+                                    // mengikuti tinggi viewport (dikurangi
+                                    // ruang judul/bingkai dialog) supaya di
+                                    // jendela tinggi semua kartu tetap
+                                    // tampil tanpa scroll, dan di jendela
+                                    // pendek grid bisa di-scroll. Dialog
+                                    // tetap non-resizable; cakupan = scroll
+                                    // saja; isi kartu tidak berubah.
+                                    let win_h = ui.ctx().input(|i| {
+                                        i.viewport().inner_rect.map(|r| r.height()).unwrap_or(800.0)
+                                    });
+                                    egui::ScrollArea::vertical()
+                                        .max_height((win_h - 120.0).max(200.0))
+                                        .min_scrolled_height((win_h - 120.0).max(200.0))
+                                        .show(ui, |ui| {
+                                    // Grid 2 kolom: pratinjau + nama tema.
                                     egui::Grid::new("theme_grid")
                                         .num_columns(2)
                                         .spacing(vec2(12.0, 10.0))
@@ -5556,6 +5732,7 @@ impl RoneyApp {
                                                     ui.end_row();
                                                 }
                                             }
+                                        });
                                         });
                                 }
                                 SettingsTab::Language => {
@@ -5812,8 +5989,10 @@ impl eframe::App for RoneyApp {
         // Saat kotak konfirmasi/modal atau jendela "Lompat ke halaman" terbuka,
         // pintasan keyboard utama tidak berlaku. Saat mengedit gambar,
         // pintasan navigasi utama juga dimatikan (Esc menutup sesi edit);
-        // satu-satunya pengecualian adalah salin, supaya Ctrl+C tetap bisa
-        // menyalin buffer kerja selama edit (lihat action_allowed_while_editing).
+        // pengecualiannya adalah salin, Pengaturan, dan Keluar, supaya Ctrl+C
+        // tetap bisa menyalin buffer kerja selama edit, Ctrl+, tetap membuka
+        // dialog Pengaturan, dan Ctrl+Q tetap keluar (lihat
+        // action_allowed_while_editing).
         if self.modal.is_none() && !self.goto_open {
             for a in &inp.actions {
                 if self.edit.is_some() && !action_allowed_while_editing(a) {
@@ -5864,7 +6043,32 @@ impl eframe::App for RoneyApp {
                 }
             });
         self.update_title(ctx);
-        if self.edit.is_none() {
+        // Overlay navigasi ditekan selama sesi edit, dan juga selama dialog
+        // Pengaturan terbuka: bar navigasi memakai Area lapisan Foreground
+        // eksplisit sementara dialog Pengaturan adalah Window lapisan Middle
+        // tanpa `.order()`, sehingga bar yang naik saat hover zona bawah
+        // digambar di atas kartu baris bawah dialog dan slider-nya menelan
+        // klik kartu (M-S 0.8.29 — balapan, bukan zona mati tetap: bar sempat
+        // naik penuh pada pola hover-dulu-klik pengguna nyata). Menekan
+        // `draw_nav_overlays` selama `show_settings` menutup perangkap untuk
+        // bar-terkunci maupun bar-karena-hover sekaligus, tanpa mengubah
+        // kode dialog dan tanpa menaikkan order Window Pengaturan (susunan
+        // dua lapisan Foreground rapuh dan tidak menyelesaikan kelas yang
+        // sama untuk dialog lain). Sesudah dialog ditutup, bar kembali
+        // berperilaku lama (muncul saat hover, slider berfungsi).
+        // M-S2 0.8.31 — kelas yang sama untuk jendela Cetak: jendela Cetak
+        // adalah Window lapisan Middle tanpa `.order()` di kiri atas
+        // (x 16–323), sementara baris tombolnya (y ≈ 644–675) bertabrakan
+        // dengan pita bar (y ≈ 654–694); hanya tombol Tutup yang kena
+        // (x 240–308, tengahnya tepat di tombol Prev bar) karena Simpan
+        // PDF/Cetak (x < 250) berada di luar jangkauan bar. Menaikkan
+        // order jendela ditolak dengan alasan yang sama seperti M-S;
+        // menekan `draw_nav_overlays` selama `print_open` menutup
+        // perangkap ini. Eksklusivitas terjaga (Cetak tidak berdampingan
+        // dengan sesi edit), jadi perluasan penjaga ini tidak berinteraksi
+        // dengan sesi edit. Cakupan minimum `print_open`: tanpa
+        // generalisasi ke About/Help/Goto/modal tanpa bukti.
+        if self.edit.is_none() && !self.show_settings && !self.print_open {
             self.draw_nav_overlays(ctx);
         }
         for a in acts {
@@ -6655,6 +6859,56 @@ impl RoneyApp {
         self.notify(format!("Dipindahkan ke Tempat Sampah: {name}"));
     }
 
+    /// Sesudah aplikasi sendiri berhasil menulis berkas gambar ke folder
+    /// sesi, buka ulang listing supaya berkas baru muncul di strip/hitungan
+    /// tanpa restart — pola yang sama seperti `after_trash` (bukan mutasi
+    /// di tempat: listing dibagikan ke worker lewat `Arc`).
+    /// `dest` = berkas yang ditulis, atau folder tujuan (ekspor/batch).
+    /// Sengaja TIDAK mencakup perubahan eksternal (berkas ditulis aplikasi
+    /// lain): itu fitur refresh folder live yang terpisah dan belum
+    /// dimandatkan. Sesi arsip tidak tersentuh; simpan ke folder lain
+    /// tidak mengubah listing sesi.
+    /// Sesi edit yang terbuka tidak diganggu: buffer edit independen dari
+    /// listing, dan jangkar membuat Batal kembali ke berkas asal yang sama.
+    fn refresh_listing_after_save(&mut self, ctx: &Context, dest: &Path) {
+        let Some(listing) = self.listing.clone() else {
+            return;
+        };
+        if listing.is_archive() {
+            return;
+        }
+        // Folder tempat berkas ditulis: berkas -> induknya; folder tujuan
+        // (ekspor/batch) -> dirinya sendiri. Berkas bukan-gambar tidak
+        // pernah masuk listing, jadi tidak memicu refresh.
+        let dir: PathBuf = if dest.is_dir() {
+            dest.to_path_buf()
+        } else {
+            match dest.file_name().map(|n| n.to_string_lossy().into_owned()) {
+                Some(n) if is_image_name(&n) => match dest.parent() {
+                    Some(p) => p.to_path_buf(),
+                    None => return,
+                },
+                _ => return,
+            }
+        };
+        // Bandingkan sesudah kanonikalisasi (dialog bisa mengembalikan
+        // ejaan path yang berbeda dari `origin`, mis. lewat symlink).
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let origin = canon(&listing.origin);
+        let dir = canon(&dir);
+        if !save_dir_in_session(&origin, &dir, self.store.state.scan_subfolders) {
+            return;
+        }
+        // Jangkar berdasarkan NAMA (relatif terhadap folder sesi), bukan
+        // nomor mentah: penyisipan berkas baru menggeser nomor indeks.
+        let anchor = listing.names.get(self.index).cloned();
+        let scan = self.store.state.scan_subfolders;
+        if let Ok((l, _)) = Listing::open(&listing.origin, scan) {
+            let start = resolve_anchor(&l.names, anchor.as_deref(), self.index);
+            self.install_listing(ctx, l, Some(start));
+        }
+    }
+
     /// Dialog batch convert/resize: proses semua gambar di listing.
     fn draw_batch_dialog(&mut self, ctx: &Context) {
         let lang = self.lang;
@@ -6857,20 +7111,27 @@ impl RoneyApp {
         if let Some(choice) = overwrite_choice {
             self.batch_overwrite = Some(choice);
             self.batch_done_msg = None;
-            self.run_batch_convert();
+            if let Some(dir) = self.run_batch_convert() {
+                self.refresh_listing_after_save(ctx, &dir);
+            }
         }
         if start {
             // Reset pilihan timpa setiap klik Mulai baru.
             self.batch_overwrite = None;
-            self.run_batch_convert();
+            if let Some(dir) = self.run_batch_convert() {
+                self.refresh_listing_after_save(ctx, &dir);
+            }
         }
     }
 
     /// Jalankan batch convert: resize + simpan semua gambar ke folder output.
-    fn run_batch_convert(&mut self) {
-        let Some(listing) = &self.listing else { return };
+    /// Mengembalikan folder output bila ada ≥1 berkas yang tertulis
+    /// (pemanggil memakai ini untuk refresh listing, lihat
+    /// `refresh_listing_after_save`); None bila tidak ada yang tertulis.
+    fn run_batch_convert(&mut self) -> Option<std::path::PathBuf> {
+        let Some(listing) = &self.listing else { return None };
         let count = listing.len();
-        if count == 0 { return; }
+        if count == 0 { return None; }
         // Daftar indeks yang diproses: yang dipilih user, atau semua bila kosong.
         let targets: Vec<usize> = if self.batch_selected.is_empty() {
             (0..count).collect()
@@ -6879,12 +7140,12 @@ impl RoneyApp {
         };
         if targets.is_empty() {
             self.batch_done_msg = Some("Tidak ada file dipilih.".to_string());
-            return;
+            return None;
         }
         let out_dir = std::path::PathBuf::from(&self.batch_output);
         if let Err(e) = std::fs::create_dir_all(&out_dir) {
             self.batch_done_msg = Some(format!("Gagal buat folder: {e}"));
-            return;
+            return None;
         }
         // Cek apakah ada file output yang sudah ada.
         let overwrite = self.batch_overwrite.unwrap_or(false);
@@ -6905,7 +7166,7 @@ impl RoneyApp {
                 // Minta konfirmasi dulu; dialog akan tampilkan pilihan.
                 self.batch_overwrite = Some(false); // sementara: tandai sudah dicek
                 self.batch_done_msg = Some(format!("OVERWRITE_ASK:{existing}"));
-                return;
+                return None;
             }
         }
         let total = targets.len();
@@ -6915,7 +7176,7 @@ impl RoneyApp {
             Err(e) => {
                 self.batch_done_msg = Some(e);
                 self.batch_progress = None;
-                return;
+                return None;
             }
         };
         let mut ok = 0;
@@ -6995,6 +7256,7 @@ impl RoneyApp {
             msg.push_str(&format!("\nGagal {}: {}", failed.len(), failed.join(", ")));
         }
         self.batch_done_msg = Some(msg);
+        if ok > 0 { Some(out_dir) } else { None }
     }
 
     /// Dialog input password untuk arsip terenkripsi.
@@ -7756,15 +8018,50 @@ mod tests {
     }
 
     #[test]
-    fn saat_edit_hanya_salin_yang_boleh_jalan() {
-        // Ctrl+C selama edit menyalin buffer kerja; pintasan lihat lain
-        // tetap dimatikan selama sesi edit.
+    fn saat_edit_hanya_salin_pengaturan_dan_keluar_yang_boleh_jalan() {
+        // Ctrl+C selama edit menyalin buffer kerja; Ctrl+, selama edit
+        // membuka dialog Pengaturan (sudah didukung lewat jalur menu);
+        // Ctrl+Q selama edit keluar (menu-Keluar dan tombol-X sudah keluar
+        // selama edit; tidak ada dialog konfirmasi dirty — triase Support
+        // 0.8.29 sebagai mandat terpisah). Pintasan lain tetap dimatikan
+        // selama sesi edit, dan gerbang ini tidak diperluas ke Buka tanpa
+        // mandat.
         assert!(action_allowed_while_editing(&Action::CopyImage));
+        assert!(action_allowed_while_editing(&Action::Settings));
+        assert!(action_allowed_while_editing(&Action::Quit));
         assert!(!action_allowed_while_editing(&Action::Next));
         assert!(!action_allowed_while_editing(&Action::Prev));
         assert!(!action_allowed_while_editing(&Action::FrameNext));
         assert!(!action_allowed_while_editing(&Action::ToggleSlideshow));
         assert!(!action_allowed_while_editing(&Action::Trash));
+        assert!(!action_allowed_while_editing(&Action::OpenFile));
+    }
+
+    #[test]
+    fn jangkar_refresh_pakai_nama_bukan_nomor() {
+        // Berkas aktif lama "b.jpg" (indeks 1) bergeser ke 2 karena berkas
+        // baru "baru.png" tersisip di depannya — jangkar harus ikut nama.
+        let baru = vec![
+            "a.jpg".to_string(),
+            "baru.png".to_string(),
+            "b.jpg".to_string(),
+        ];
+        assert_eq!(resolve_anchor(&baru, Some("b.jpg"), 1), 2);
+        // Nama hilang (berkas aktif ikut terhapus) -> fallback dijepit.
+        assert_eq!(resolve_anchor(&baru, Some("hilang.jpg"), 5), 2);
+        assert_eq!(resolve_anchor(&baru, None, 1), 1);
+        assert_eq!(resolve_anchor(&[], Some("a.jpg"), 3), 0);
+    }
+
+    #[test]
+    fn folder_simpan_harus_dalam_sesi() {
+        let origin = Path::new("/tmp/sesi");
+        assert!(save_dir_in_session(origin, Path::new("/tmp/sesi"), false));
+        assert!(!save_dir_in_session(origin, Path::new("/tmp/sesi/sub"), false));
+        assert!(save_dir_in_session(origin, Path::new("/tmp/sesi/sub"), true));
+        assert!(!save_dir_in_session(origin, Path::new("/tmp/lain"), true));
+        // Awalan nama yang menipu ("sesi2") bukan sub-folder sesi.
+        assert!(!save_dir_in_session(origin, Path::new("/tmp/sesi2"), true));
     }
 
     #[test]
@@ -8227,6 +8524,7 @@ mod tests {
             print_status: String::new(),
             thumb_cache: HashMap::new(),
             thumb_pending: std::collections::HashSet::new(),
+            thumb_failed: std::collections::HashSet::new(),
             strip_last_index: usize::MAX,
             thumb_job_tx: None,
             thumb_res_rx: None,
@@ -8639,6 +8937,94 @@ mod tests {
         assert!(
             !inp.actions.contains(&Action::ExitFullscreen),
             "Esc saat Pengaturan terbuka tidak boleh bocor ke jendela utama"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item M-A: Esc saat dialog Tentang terbuka adalah milik dialog
+    /// (tutup dialog), BUKAN keluar layar penuh — cerminan pola M1 untuk
+    /// Pengaturan. Diuji lewat `read_input` dengan masukan mentah berisi
+    /// tekanan Esc.
+    #[test]
+    fn esc_di_tentang_tidak_keluar_layar_penuh() {
+        let (mut app, ctx, dir) = aplikasi_uji("esc-tentang", &["1.jpg"]);
+        app.fullscreen = true;
+        let tekan_esc = |app: &RoneyApp| {
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: Some(egui::Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let mut inp = None;
+            let _ = ctx.run(raw, |ctx| {
+                inp = Some(app.read_input(ctx));
+            });
+            inp.unwrap()
+        };
+
+        // Dialog tertutup: perilaku lama utuh (Esc -> keluar layar penuh).
+        app.about_open = false;
+        let inp = tekan_esc(&app);
+        assert!(
+            inp.actions.contains(&Action::ExitFullscreen),
+            "tanpa dialog, Esc harus tetap keluar layar penuh"
+        );
+
+        // Dialog terbuka: Esc tidak boleh menjadi aksi jendela utama.
+        app.about_open = true;
+        let inp = tekan_esc(&app);
+        assert!(
+            !inp.actions.contains(&Action::ExitFullscreen),
+            "Esc saat Tentang terbuka tidak boleh bocor ke jendela utama"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item M-P: Esc saat jendela Cetak terbuka adalah milik jendela
+    /// (tutup jendela), BUKAN keluar layar penuh — cerminan pola M1/M-A
+    /// untuk Pengaturan dan Tentang. Diuji lewat `read_input` dengan
+    /// masukan mentah berisi tekanan Esc.
+    #[test]
+    fn esc_di_cetak_tidak_keluar_layar_penuh() {
+        let (mut app, ctx, dir) = aplikasi_uji("esc-cetak", &["1.jpg"]);
+        app.fullscreen = true;
+        let tekan_esc = |app: &RoneyApp| {
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: Some(egui::Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let mut inp = None;
+            let _ = ctx.run(raw, |ctx| {
+                inp = Some(app.read_input(ctx));
+            });
+            inp.unwrap()
+        };
+
+        // Jendela tertutup: perilaku lama utuh (Esc -> keluar layar penuh).
+        app.print_open = false;
+        let inp = tekan_esc(&app);
+        assert!(
+            inp.actions.contains(&Action::ExitFullscreen),
+            "tanpa jendela Cetak, Esc harus tetap keluar layar penuh"
+        );
+
+        // Jendela terbuka: Esc tidak boleh menjadi aksi jendela utama.
+        app.print_open = true;
+        let inp = tekan_esc(&app);
+        assert!(
+            !inp.actions.contains(&Action::ExitFullscreen),
+            "Esc saat Cetak terbuka tidak boleh bocor ke jendela utama"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

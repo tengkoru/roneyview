@@ -1,4 +1,4 @@
-# Roneyview (version 0.8.26)
+# Roneyview (version 0.8.31)
 ###### README.md berbahasa Inggris ada [di sini](README.md)
 
 Alternatif Honeyview; penampil gambar untuk Linux; ditulis dalam bahasa pemrograman Rust (menggunakan egui/eframe).
