@@ -30,7 +30,7 @@ You can download at Releases place (location below "about" on repository github 
     </td>
   </tr>
 </table>
-More screenshot [klik this](tests).
+More screenshot [klik this]("tests/").
 
 More themes in Roneyview show at [klik this](tests/03-settings-tema-en.png).
 
