@@ -30,7 +30,7 @@ Kamu bisa mengunduh di tempat Releases (lokasi di bawah "about" pada repositori 
     </td>
   </tr>
 </table>
-Tangkapan layar yang lain [klik disini](tests/).
+Tangkapan layar yang lain [klik disini](tests).
 
 Pilihan tema lainnya didalam Roneyview diperlihatkan di [klik disini](tests/03-settings-tema-en.png).
 
