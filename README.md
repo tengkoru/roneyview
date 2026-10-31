@@ -9,17 +9,17 @@ You can download at Releases place (location below "about" on repository github 
 ## Screenshot
 <table>
   <tr>
-    <td><img src="tests/01-main-darknavy-en.png" width="320" alt="Main view, DarkNavy"></td>
-    <td><img src="tests/02-edit-tone-en.png" width="320" alt="Tone edit panel"></td>
-    <td><img src="tests/03-settings-tema-en.png" width="320" alt="Settings, all 10 themes"></td>
-    <td><img src="tests/04-menu-tema-en.png" width="320" alt="Theme submenu"></td>
-    <td><img src="tests/05-tema-neon-en.png" width="320" alt="Neon theme"></td>
-    <td><img src="tests/06-tema-sakura-en.png" width="320" alt="Sakura theme"></td>
-    <td><img src="tests/07-tema-terminal-en.png" width="320" alt="Terminal theme"></td>
-    <td><img src="tests/08-print-en.png" width="320" alt="Print window"></td>
-    <td><img src="tests/09-about-en.png" width="320" alt="About dialog"></td>
-    <td><img src="tests/10-fullscreen-en.png" width="320" alt="Fullscreen view"></td>
-    <td><img src="tests/11-goto-en.png" width="320" alt="Go to page dialog"></td>
+    <td><img src="tests/01-main-darknavy-en.png" alt="Main view, DarkNavy"></td>
+    <td><img src="tests/02-edit-tone-en.png" alt="Tone edit panel"></td>
+    <td><img src="tests/03-settings-tema-en.png" alt="Settings, all 10 themes"></td>
+    <td><img src="tests/04-menu-tema-en.png" alt="Theme submenu"></td>
+    <td><img src="tests/05-tema-neon-en.png" alt="Neon theme"></td>
+    <td><img src="tests/06-tema-sakura-en.png" alt="Sakura theme"></td>
+    <td><img src="tests/07-tema-terminal-en.png" alt="Terminal theme"></td>
+    <td><img src="tests/08-print-en.png" alt="Print window"></td>
+    <td><img src="tests/09-about-en.png" alt="About dialog"></td>
+    <td><img src="tests/10-fullscreen-en.png" alt="Fullscreen view"></td>
+    <td><img src="tests/11-goto-en.png" alt="Go to page dialog"></td>
   </tr>
 </table>
 
