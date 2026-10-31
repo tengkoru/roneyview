@@ -7,21 +7,32 @@ Alternatif Honeyview; penampil gambar untuk Linux; ditulis dalam bahasa pemrogra
 Kamu bisa mengunduh di tempat Releases (lokasi di bawah "about" pada repositori github roneyview) atau cukup [klik ini](https://github.com/tengkoru/roneyview/releases) untuk menuju halaman unduhan, gulir lalu klik menu dropdown bernama "Assets".
 
 ## Screenshot
+
 <table>
   <tr>
-    <td><img src="tests/01-main-darknavy-en.png" width="320" alt="Main view, DarkNavy"></td>
-    <td><img src="tests/02-edit-tone-en.png" width="320" alt="Tone edit panel"></td>
-    <td><img src="tests/03-settings-tema-en.png" width="320" alt="Settings, all 10 themes"></td>
-    <td><img src="tests/04-menu-tema-en.png" width="320" alt="Theme submenu"></td>
-    <td><img src="tests/05-tema-neon-en.png" width="320" alt="Neon theme"></td>
-    <td><img src="tests/06-tema-sakura-en.png" width="320" alt="Sakura theme"></td>
-    <td><img src="tests/07-tema-terminal-en.png" width="320" alt="Terminal theme"></td>
-    <td><img src="tests/08-print-en.png" width="320" alt="Print window"></td>
-    <td><img src="tests/09-about-en.png" width="320" alt="About dialog"></td>
-    <td><img src="tests/10-fullscreen-en.png" width="320" alt="Fullscreen view"></td>
-    <td><img src="tests/11-goto-en.png" width="320" alt="Go to page dialog"></td>
+    <td>
+      <img src="tests/01-main-darknavy-en.png" width="400" alt="DarkNavy theme">
+      <br>DarkNavy theme
+    </td>
+    <td>
+      <img src="tests/05-tema-neon-en.png" width="400" alt="Neon theme">
+      <br>Neon theme (default)
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <img src="tests/06-tema-sakura-en.png" width="400" alt="Sakura theme">
+      <br>Sakura theme
+    </td>
+    <td>
+      <img src="tests/07-tema-terminal-en.png" width="400" alt="Terminal theme">
+      <br>Terminal theme
+    </td>
   </tr>
 </table>
+Tangkapan layar yang lain [klik disini](tests/).
+
+Pilihan tema lainnya didalam Roneyview diperlihatkan di [klik disini](tests/03-settings-tema-en.png).
 
 ## Apa yang bisa dilakukan Roneyview?
 - **Membuka gambar**, **folder**, dan **arsip**

@@ -7,21 +7,32 @@ An alternative to Honeyview; an image viewer for Linux; written in the Rust prog
 You can download at Releases place (location below "about" on repository github roneyview) or you just [klik this](https://github.com/tengkoru/roneyview/releases) to go to download page, scroll and klik dropdown menu named "Assets".
 
 ## Screenshot
+
 <table>
   <tr>
-    <td><img src="tests/01-main-darknavy-en.png" alt="Main view, DarkNavy"></td>
-    <td><img src="tests/02-edit-tone-en.png" alt="Tone edit panel"></td>
-    <td><img src="tests/03-settings-tema-en.png" alt="Settings, all 10 themes"></td>
-    <td><img src="tests/04-menu-tema-en.png" alt="Theme submenu"></td>
-    <td><img src="tests/05-tema-neon-en.png" alt="Neon theme"></td>
-    <td><img src="tests/06-tema-sakura-en.png" alt="Sakura theme"></td>
-    <td><img src="tests/07-tema-terminal-en.png" alt="Terminal theme"></td>
-    <td><img src="tests/08-print-en.png" alt="Print window"></td>
-    <td><img src="tests/09-about-en.png" alt="About dialog"></td>
-    <td><img src="tests/10-fullscreen-en.png" alt="Fullscreen view"></td>
-    <td><img src="tests/11-goto-en.png" alt="Go to page dialog"></td>
+    <td>
+      <img src="tests/01-main-darknavy-en.png" width="400" alt="DarkNavy theme">
+      <br>DarkNavy theme
+    </td>
+    <td>
+      <img src="tests/05-tema-neon-en.png" width="400" alt="Neon theme">
+      <br>Neon theme (default)
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <img src="tests/06-tema-sakura-en.png" width="400" alt="Sakura theme">
+      <br>Sakura theme
+    </td>
+    <td>
+      <img src="tests/07-tema-terminal-en.png" width="400" alt="Terminal theme">
+      <br>Terminal theme
+    </td>
   </tr>
 </table>
+More screenshot [klik this](tests/).
+
+More themes in Roneyview show at [klik this](tests/03-settings-tema-en.png).
 
 ## What can Roneyview do?
 - **Open images**, **folders**, and **archives**
